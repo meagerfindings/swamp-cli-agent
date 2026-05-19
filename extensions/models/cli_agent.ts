@@ -27,6 +27,7 @@ const GlobalArgsSchema: z.ZodObject<{
   defaultProvider: z.ZodDefault<typeof ProviderEnum>;
   defaultModel: z.ZodDefault<z.ZodString>;
   commandsDir: z.ZodDefault<z.ZodString>;
+  commandSubdirs: z.ZodDefault<z.ZodArray<z.ZodString>>;
   claudePath: z.ZodDefault<z.ZodString>;
   opencodePath: z.ZodDefault<z.ZodString>;
   ampPath: z.ZodDefault<z.ZodString>;
@@ -38,6 +39,9 @@ const GlobalArgsSchema: z.ZodObject<{
   defaultProvider: ProviderEnum.default("claude"),
   defaultModel: z.string().default("opus"),
   commandsDir: z.string().default(".claude/commands"),
+  commandSubdirs: z.array(z.string()).default([]).describe(
+    "Additional subdirectories under commandsDir to search for slash commands",
+  ),
   claudePath: z.string().default("claude"),
   opencodePath: z.string().default("opencode"),
   ampPath: z.string().default("amp"),
@@ -132,6 +136,7 @@ function uuid(): string {
 async function resolveSlashCommand(
   prompt: string,
   commandsDir: string,
+  commandSubdirs: string[],
   cwd: string,
 ): Promise<{ resolved: string; slashCommand?: string }> {
   if (!prompt.startsWith("/")) return { resolved: prompt };
@@ -143,6 +148,7 @@ async function resolveSlashCommand(
   const candidates: string[] = [
     `${commandsDir}/${commandName}.md`,
     `${commandsDir}/${commandName.replace(/-/g, "/")}.md`,
+    ...commandSubdirs.map((sub) => `${commandsDir}/${sub}/${commandName}.md`),
   ];
 
   for (const candidate of candidates) {
@@ -387,7 +393,7 @@ type MethodContext = {
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.05.19.1",
+  version: "2026.05.19.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -441,10 +447,12 @@ export const model = {
           context.globalArgs.wallTimeoutMs;
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
+        const commandSubdirs = context.globalArgs.commandSubdirs;
 
         const { resolved, slashCommand } = await resolveSlashCommand(
           args.prompt,
           commandsDir,
+          commandSubdirs,
           cwd,
         );
         const promptHash = hashPrompt(resolved);
@@ -583,10 +591,12 @@ export const model = {
           context.globalArgs.wallTimeoutMs;
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
+        const commandSubdirs = context.globalArgs.commandSubdirs;
 
         const { resolved, slashCommand } = await resolveSlashCommand(
           args.prompt,
           commandsDir,
+          commandSubdirs,
           cwd,
         );
         const promptHash = hashPrompt(resolved);
