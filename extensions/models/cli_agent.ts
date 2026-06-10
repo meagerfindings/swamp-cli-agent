@@ -110,6 +110,34 @@ const InvocationSchema: z.ZodObject<{
   tags: z.record(z.string(), z.string()).optional(),
 }).passthrough();
 
+/**
+ * Schema for the untruncated companion record to an invocation: the full
+ * original prompt and the full extracted output, neither subject to the
+ * preview caps on the invocation record itself.
+ */
+const TranscriptSchema: z.ZodObject<{
+  invocationId: z.ZodString;
+  prompt: z.ZodString;
+  output: z.ZodString;
+}> = z.object({
+  invocationId: z.string(),
+  prompt: z.string(),
+  output: z.string(),
+}).passthrough();
+
+/** Schema for the result of enumerating a provider's available models. */
+const ModelListSchema: z.ZodObject<{
+  provider: typeof ProviderEnum;
+  models: z.ZodArray<z.ZodString>;
+  count: z.ZodNumber;
+  listedAt: z.ZodString;
+}> = z.object({
+  provider: ProviderEnum,
+  models: z.array(z.string()),
+  count: z.number(),
+  listedAt: z.string(),
+}).passthrough();
+
 /** Exit codes that indicate a transient failure eligible for retry. */
 const TRANSIENT_EXIT_CODES: Set<number> = new Set([137, 143]);
 
@@ -388,13 +416,14 @@ type MethodContext = {
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
  *
- * Provides two methods:
+ * Provides three methods:
  * - `invoke` — run a CLI agent and record structured results
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
+ * - `listModels` — enumerate the models available to a provider's CLI
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.05.19.2",
+  version: "2026.06.09.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -403,6 +432,19 @@ export const model = {
       schema: InvocationSchema,
       lifetime: "30d" as const,
       garbageCollection: 100,
+    },
+    transcript: {
+      description:
+        "Full untruncated prompt and output for an invocation (companion to the invocation record)",
+      schema: TranscriptSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 100,
+    },
+    modelList: {
+      description: "Models available to a provider's CLI",
+      schema: ModelListSchema,
+      lifetime: "7d" as const,
+      garbageCollection: 5,
     },
   },
   methods: {
@@ -543,6 +585,11 @@ export const model = {
           `invocation-${invocationId}`,
           invocation as unknown as Record<string, unknown>,
         );
+        const transcriptHandle = await context.writeResource(
+          "transcript",
+          `transcript-${invocationId}`,
+          { invocationId, prompt: args.prompt, output: extractedText },
+        );
 
         context.logger.info(
           "{provider}/{model}: {status} ({ms}ms, {bytes}b, {retries} retries)",
@@ -556,7 +603,7 @@ export const model = {
           },
         );
 
-        return { dataHandles: [handle] };
+        return { dataHandles: [handle, transcriptHandle] };
       },
     },
 
@@ -692,6 +739,11 @@ export const model = {
           `invocation-${invocationId}`,
           invocation as unknown as Record<string, unknown>,
         );
+        const transcriptHandle = await context.writeResource(
+          "transcript",
+          `transcript-${invocationId}`,
+          { invocationId, prompt: args.prompt, output: extractedText },
+        );
 
         if (!result.success) {
           throw new Error(
@@ -713,6 +765,66 @@ export const model = {
             retries,
           },
         );
+
+        return { dataHandles: [handle, transcriptHandle] };
+      },
+    },
+
+    listModels: {
+      description:
+        "List the model identifiers available to a provider's CLI (currently opencode only)",
+      arguments: z.object({
+        provider: ProviderEnum.optional().describe(
+          "Provider to enumerate (defaults to the configured defaultProvider)",
+        ),
+      }),
+      execute: async (
+        args: { provider?: string },
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const provider =
+          (args.provider || context.globalArgs.defaultProvider) as z.infer<
+            typeof ProviderEnum
+          >;
+
+        if (provider !== "opencode") {
+          throw new Error(
+            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command. Use provider 'opencode'.`,
+          );
+        }
+
+        const result = await runCli(
+          [context.globalArgs.opencodePath, "models"],
+          { wallTimeoutMs: 60_000 },
+        );
+        if (!result.success) {
+          throw new Error(
+            `opencode models failed (exit ${result.code}): ${
+              result.stderr.slice(0, 200)
+            }`,
+          );
+        }
+
+        const models = result.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+
+        const handle = await context.writeResource(
+          "modelList",
+          `models-${provider}`,
+          {
+            provider,
+            models,
+            count: models.length,
+            listedAt: new Date().toISOString(),
+          },
+        );
+
+        context.logger.info("{provider}: {count} models available", {
+          provider,
+          count: models.length,
+        });
 
         return { dataHandles: [handle] };
       },

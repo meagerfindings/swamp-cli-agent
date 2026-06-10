@@ -77,6 +77,22 @@ swamp model method run my-agent invokeAndParse \
 
 Takes the same arguments as `invoke`.
 
+### `listModels`
+
+List the model identifiers available to a provider's CLI. Currently supported
+for `opencode` only (the other provider CLIs have no model-listing command).
+Results are persisted as a `modelList` resource named `models-<provider>`.
+
+```sh
+swamp model method run my-agent listModels --input provider=opencode
+```
+
+Arguments:
+
+| Name       | Type | Required | Description                                          |
+| ---------- | ---- | -------- | ---------------------------------------------------- |
+| `provider` | enum | no       | Provider to enumerate (defaults to `defaultProvider`) |
+
 ## How It Works
 
 1. **Slash command resolution** — prompts starting with `/` are resolved
@@ -86,7 +102,11 @@ Takes the same arguments as `invoke`.
 
 2. **Provider dispatch** — each provider has a dedicated command builder that
    maps the prompt and model to the correct CLI flags. Amp receives prompts
-   via stdin; others use positional arguments.
+   via stdin; others use positional arguments. All providers run with their
+   permission-bypass flag (`--dangerously-skip-permissions` for Claude,
+   `--dangerously-allow-all` for Amp, `--yolo` for Gemini) since headless
+   invocations cannot answer interactive approval prompts — only point this
+   extension at working directories you trust it to modify.
 
 3. **Retry logic** — transient failures (exit codes 137, 143 — typically
    OOM-killed or SIGTERM) trigger automatic retries with exponential backoff.
@@ -119,6 +139,14 @@ Each invocation is persisted with these fields:
 | `tokens`        | object  | Token counts (input, output, cache, etc) |
 | `costUsd`       | number  | Estimated cost in USD                    |
 | `tags`          | object  | User-supplied key-value tags             |
+
+The `prompt` and `outputPreview` fields are truncated for queryability. The
+full untruncated prompt and extracted output are persisted alongside every
+invocation as a `transcript` resource named `transcript-<invocationId>`:
+
+```sh
+swamp data get my-agent transcript-<invocationId> --json
+```
 
 ## License
 
