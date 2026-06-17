@@ -299,14 +299,20 @@ function buildOpencodeCommand(
   };
 }
 
-/** Build the command array for the Amp CLI. */
+/**
+ * Build the command array for the Amp CLI.
+ *
+ * `--stream-json` makes amp emit Claude-Code-compatible stream JSON (one event
+ * per line) instead of plain text, so token usage can be parsed from the
+ * `assistant` events. The prompt is fed on stdin in execute mode (`-x`).
+ */
 function buildAmpCommand(
   cliPath: string,
   _model: string,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
-    cmd: [cliPath, "--dangerously-allow-all", "-x", "-"],
+    cmd: [cliPath, "--dangerously-allow-all", "-x", "--stream-json"],
     stdin: resolvedPrompt,
   };
 }
@@ -326,7 +332,7 @@ function buildGeminiCommand(
  * Extract human-readable text from a provider's raw CLI output, handling
  * provider-specific JSON streaming formats.
  */
-function extractTextFromOutput(
+export function extractTextFromOutput(
   provider: string,
   rawOutput: string,
 ): string {
@@ -352,6 +358,17 @@ function extractTextFromOutput(
     }
     return parts.length > 0 ? parts.join("") : rawOutput;
   }
+  if (provider === "amp") {
+    // Amp's stream JSON mirrors Claude's: the terminal `result` event carries
+    // the final assistant text in a `result` field.
+    for (const line of rawOutput.split("\n").reverse()) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type === "result") return event.result || rawOutput;
+      } catch { /* not JSON */ }
+    }
+    return rawOutput;
+  }
   if (provider === "gemini") {
     try {
       const data = JSON.parse(rawOutput);
@@ -364,7 +381,7 @@ function extractTextFromOutput(
 }
 
 /** Token and cost usage data extracted from provider output. */
-interface UsageData {
+export interface UsageData {
   input?: number;
   output?: number;
   cacheRead?: number;
@@ -377,30 +394,106 @@ interface UsageData {
 /**
  * Extract token usage and cost information from a provider's raw output.
  *
- * Claude emits one terminal `result` event with a `usage` object. Opencode
- * (the path used for local Ollama models) emits one `step_finish` event per
- * turn, each carrying a `part.tokens` object — so its usage is the SUM across
- * all such events. Other providers are not yet parsed and return `{}`.
+ * Each provider reports usage in a different shape; this normalizes them to a
+ * common {@link UsageData}. Token accounting matches the ADW Ruby
+ * `usage_extractor` so the two systems stay consistent: cache-read tokens fold
+ * into `input` (the model still attends to them) and `total` includes both
+ * cache reads and writes.
+ *
+ * - `claude`: one terminal `result` event with a `usage` object; cost lives in
+ *   `total_cost_usd` (NOT `cost_usd`, which the CLI always emits as null).
+ * - `opencode`: one `step_finish` event per turn, each with a `part.tokens`
+ *   object and `part.cost` — usage is the SUM across all such events. This is
+ *   opencode's own event schema, identical for the Ollama and Copilot backends
+ *   (only the values differ; local models report `cost: 0`).
+ * - `amp`: Claude-Code-compatible stream JSON. Usage lives on `assistant`
+ *   events at `message.usage` (Claude field names), summed across turns. Amp
+ *   does not report cost, so `costUsd` is left undefined.
+ * - `gemini`: a single JSON document with `stats.models.<name>.tokens`. No cost.
  */
-function extractUsage(provider: string, rawOutput: string): UsageData {
+export function extractUsage(provider: string, rawOutput: string): UsageData {
   if (provider === "claude") {
     for (const line of rawOutput.split("\n").reverse()) {
       try {
         const event = JSON.parse(line);
         if (event.type === "result" && event.usage) {
+          const u = event.usage;
+          const input = Number(u.input_tokens) || 0;
+          const output = Number(u.output_tokens) || 0;
+          const cacheRead = Number(u.cache_read_input_tokens) || 0;
+          const cacheWrite = Number(u.cache_creation_input_tokens) || 0;
           return {
-            input: event.usage.input_tokens,
-            output: event.usage.output_tokens,
-            cacheRead: event.usage.cache_read_input_tokens ||
-              event.usage.cache_creation_input_tokens,
-            total: (event.usage.input_tokens || 0) +
-              (event.usage.output_tokens || 0),
-            costUsd: event.cost_usd,
+            // Fold cache reads into input to match the Ruby usage_extractor.
+            input: input + cacheRead,
+            output,
+            cacheRead,
+            cacheWrite,
+            total: input + output + cacheRead + cacheWrite,
+            // The Claude CLI reports cost in `total_cost_usd`; `cost_usd` is
+            // always null.
+            costUsd: event.total_cost_usd,
           };
         }
       } catch { /* skip */ }
     }
     return {};
+  }
+
+  if (provider === "amp") {
+    let input = 0;
+    let output = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let sawUsage = false;
+
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type !== "assistant") continue;
+        const u = event.message?.usage;
+        if (!u) continue;
+        input += Number(u.input_tokens) || 0;
+        output += Number(u.output_tokens) || 0;
+        cacheRead += Number(u.cache_read_input_tokens) || 0;
+        cacheWrite += Number(u.cache_creation_input_tokens) || 0;
+        sawUsage = true;
+      } catch { /* skip */ }
+    }
+
+    if (!sawUsage) return {};
+    return {
+      // Fold cache reads into input to match the Ruby usage_extractor.
+      input: input + cacheRead,
+      output,
+      cacheRead,
+      cacheWrite,
+      total: input + output + cacheRead + cacheWrite,
+      // Amp does not report per-invocation cost.
+    };
+  }
+
+  if (provider === "gemini") {
+    try {
+      const data = JSON.parse(rawOutput);
+      const models = data.stats?.models ?? {};
+      const modelName = Object.keys(models)[0];
+      if (!modelName) return {};
+      const tokens = models[modelName]?.tokens ?? {};
+      const input = Number(tokens.input) || 0;
+      const cached = Number(tokens.cached) || 0;
+      return {
+        // Fold cached tokens into input, mirroring the Ruby gemini extractor.
+        input: input + cached,
+        output: Number(tokens.candidates) || 0,
+        cacheRead: cached,
+        cacheWrite: 0,
+        reasoning: Number(tokens.thoughts) || 0,
+        total: Number(tokens.total) || 0,
+        // Gemini does not report cost.
+      };
+    } catch {
+      return {};
+    }
   }
 
   if (provider === "opencode") {
@@ -469,7 +562,7 @@ type MethodContext = {
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.06.14.1",
+  version: "2026.06.17.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
