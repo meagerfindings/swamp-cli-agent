@@ -7,7 +7,11 @@
  */
 
 import { assertEquals } from "jsr:@std/assert@1";
-import { extractTextFromOutput, extractUsage } from "./cli_agent.ts";
+import {
+  extractError,
+  extractTextFromOutput,
+  extractUsage,
+} from "./cli_agent.ts";
 
 // --- Fixtures ---------------------------------------------------------------
 
@@ -205,4 +209,83 @@ Deno.test("extractTextFromOutput: gemini reads response field", () => {
 Deno.test("extractTextFromOutput: falls back to raw output when unparseable", () => {
   assertEquals(extractTextFromOutput("amp", "plain text"), "plain text");
   assertEquals(extractTextFromOutput("claude", "plain text"), "plain text");
+});
+
+// --- extractError -----------------------------------------------------------
+
+// Real opencode capture (trimmed) when the GitHub Copilot monthly quota is
+// exhausted: a single `type:"error"` event, no assistant text, exit 1.
+const OPENCODE_QUOTA_ERROR = JSON.stringify({
+  type: "error",
+  timestamp: 1782327054427,
+  sessionID: "ses_x",
+  error: {
+    name: "APIError",
+    data: {
+      message:
+        'Payment Required: {"error":{"message":"You have exceeded your monthly quota","code":"quota_exceeded"}}',
+      statusCode: 402,
+      isRetryable: false,
+      metadata: { url: "https://api.githubcopilot.com/v1/messages" },
+    },
+  },
+});
+
+Deno.test("extractError: opencode quota error is detected and fails fast (honors isRetryable:false)", () => {
+  const err = extractError("opencode", OPENCODE_QUOTA_ERROR);
+  assertEquals(err?.code, "402");
+  // quota_exceeded reports isRetryable:false (monthly reset, retry-after days
+  // away) — we honor that verbatim so it fails fast instead of burning backoff.
+  assertEquals(err?.retryable, false);
+  assertEquals(err?.message.includes("exceeded your monthly quota"), true);
+});
+
+Deno.test("extractError: opencode honors isRetryable:true for a genuine transient", () => {
+  const transient = JSON.stringify({
+    type: "error",
+    error: {
+      name: "APIError",
+      data: { message: "Too Many Requests", statusCode: 429, isRetryable: true },
+    },
+  });
+  const err = extractError("opencode", transient);
+  assertEquals(err?.retryable, true);
+  assertEquals(err?.code, "429");
+});
+
+Deno.test("extractError: opencode returns null when output is a normal run", () => {
+  assertEquals(extractError("opencode", OPENCODE_OUTPUT), null);
+});
+
+Deno.test("extractTextFromOutput: opencode surfaces the error message, not raw JSON", () => {
+  const text = extractTextFromOutput("opencode", OPENCODE_QUOTA_ERROR);
+  assertEquals(text.includes("exceeded your monthly quota"), true);
+  // Must NOT be the raw JSON blob.
+  assertEquals(text.startsWith("{"), false);
+});
+
+Deno.test("extractError: claude/amp detect is_error result events", () => {
+  const claudeErr = JSON.stringify({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    result: "Overloaded: please retry",
+  });
+  const err = extractError("claude", claudeErr);
+  assertEquals(err?.retryable, true); // "overloaded" hint
+  assertEquals(err?.code, "error_during_execution");
+
+  // A successful result must NOT be flagged as an error.
+  assertEquals(extractError("claude", CLAUDE_OUTPUT), null);
+  assertEquals(extractError("amp", AMP_OUTPUT), null);
+});
+
+Deno.test("extractError: gemini detects a top-level error field", () => {
+  const geminiErr = JSON.stringify({
+    error: { message: "Resource exhausted (429)", code: 429 },
+  });
+  const err = extractError("gemini", geminiErr);
+  assertEquals(err?.code, "429");
+  assertEquals(err?.retryable, true);
+  assertEquals(extractError("gemini", GEMINI_OUTPUT), null);
 });

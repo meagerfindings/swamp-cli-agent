@@ -69,6 +69,7 @@ const InvocationSchema: z.ZodObject<{
   retries: z.ZodNumber;
   timedOut: z.ZodBoolean;
   timeoutReason: z.ZodOptional<z.ZodString>;
+  failureReason: z.ZodOptional<z.ZodString>;
   invokedAt: z.ZodString;
   tokens: z.ZodOptional<
     z.ZodObject<{
@@ -99,6 +100,9 @@ const InvocationSchema: z.ZodObject<{
   retries: z.number(),
   timedOut: z.boolean(),
   timeoutReason: z.string().optional(),
+  failureReason: z.string().optional().describe(
+    "Why the invocation failed: provider_error:<code>, exit_<n>, or a timeout reason. Absent on success.",
+  ),
   invokedAt: z.string(),
   tokens: z.object({
     input: z.number().optional(),
@@ -218,9 +222,24 @@ type CmdResult = {
   durationMs: number;
 };
 
+/** How long to wait for a SIGTERM'd child to exit before escalating to SIGKILL. */
+const SIGKILL_GRACE_MS = 5_000;
+
 /**
- * Spawn a CLI subprocess with optional stdin and a wall-clock timeout.
- * Returns structured output including whether the process was killed.
+ * Spawn a CLI subprocess with optional stdin and two independent timeouts:
+ *
+ * - **wall timeout** — a hard ceiling on total runtime.
+ * - **idle timeout** — kills the process if it produces NO new stdout/stderr
+ *   bytes for `idleTimeoutMs`. This is the defense against a provider that
+ *   silently stalls (e.g. an agent CLI stuck retrying a rate-limited request):
+ *   it never trips the wall clock for an hour, but it also never makes
+ *   progress, so the idle timer catches it in minutes instead.
+ *
+ * Output streams are drained incrementally so the timers observe real progress
+ * — `child.output()` would block until exit and defeat idle detection. On
+ * timeout the child is SIGTERM'd, then SIGKILL'd if it ignores SIGTERM, so a
+ * wedged process can never hold the caller (and the swamp model lock) open
+ * indefinitely.
  */
 async function runCli(
   cmd: string[],
@@ -228,6 +247,7 @@ async function runCli(
     cwd?: string;
     stdin?: string;
     wallTimeoutMs: number;
+    idleTimeoutMs?: number;
   },
 ): Promise<CmdResult> {
   const start = performance.now();
@@ -246,26 +266,120 @@ async function runCli(
     await writer.close();
   }
 
-  const timeoutId = setTimeout(() => {
+  let lastOutputAt = performance.now();
+  let timeoutReason: string | undefined;
+  let killed = false;
+
+  // Cancel the output streams so the drain loops below terminate even when a
+  // SURVIVING GRANDCHILD still holds the pipe's write end open. Killing the
+  // direct child does NOT close pipes inherited by its descendants, so without
+  // this `for await … of child.stdout` would block forever and the caller (and
+  // the swamp model lock) would hang despite the kill — the exact wedge this
+  // function exists to prevent.
+  const cancelStreams = () => {
+    child.stdout.cancel().catch(() => {});
+    child.stderr.cancel().catch(() => {});
+  };
+
+  // Escalating kill: SIGTERM, then SIGKILL if the child doesn't exit promptly,
+  // then cancel the streams to unblock the drains regardless of grandchildren.
+  const killChild = async (reason: string) => {
+    if (killed) return;
+    killed = true;
+    timeoutReason = reason;
     try {
       child.kill("SIGTERM");
     } catch { /* already dead */ }
-  }, opts.wallTimeoutMs);
+    await new Promise((r) => setTimeout(r, SIGKILL_GRACE_MS));
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already dead */ }
+    cancelStreams();
+  };
 
-  const output = await child.output();
-  clearTimeout(timeoutId);
+  // Drain a stream into a buffer, stamping lastOutputAt on every chunk so the
+  // idle watchdog sees progress. A cancelled stream throws here; swallow it.
+  const chunks: Uint8Array[] = [];
+  const errChunks: Uint8Array[] = [];
+  const drain = async (
+    stream: ReadableStream<Uint8Array>,
+    sink: Uint8Array[],
+  ) => {
+    try {
+      for await (const chunk of stream) {
+        lastOutputAt = performance.now();
+        sink.push(chunk);
+      }
+    } catch { /* stream cancelled on kill */ }
+  };
+  const drains = Promise.all([
+    drain(child.stdout, chunks),
+    drain(child.stderr, errChunks),
+  ]);
+
+  // Watchdog: poll for wall/idle timeouts on a 1s tick. `done` stops the loop
+  // the moment the child exits so we don't leave a dangling timer keeping the
+  // isolate alive.
+  let done = false;
+  const watch = (async () => {
+    const idleMs = opts.idleTimeoutMs;
+    while (!done) {
+      await new Promise((r) => setTimeout(r, 1_000));
+      if (done) return;
+      const now = performance.now();
+      if (now - start >= opts.wallTimeoutMs) {
+        await killChild("wall_time_exceeded");
+        return;
+      }
+      if (idleMs && idleMs > 0 && now - lastOutputAt >= idleMs) {
+        await killChild("idle_time_exceeded");
+        return;
+      }
+    }
+  })();
+
+  // child.status resolves when the DIRECT child exits, even if grandchildren
+  // survive. On a normal exit the pipes close and the drains EOF on their own;
+  // on a kill, cancelStreams() (in killChild) forces them to finish. As a final
+  // backstop, cancel the streams if the drains haven't settled shortly after
+  // the child exits — so a wedged drain can never outlive the process.
+  const status = await child.status;
+  done = true;
+  await Promise.race([
+    drains,
+    new Promise<void>((resolve) =>
+      setTimeout(() => {
+        cancelStreams();
+        resolve();
+      }, 2_000)
+    ),
+  ]);
+  await watch;
+
   const durationMs = Math.round(performance.now() - start);
-  const timedOut = durationMs >= opts.wallTimeoutMs - 100;
 
   return {
-    stdout: new TextDecoder().decode(output.stdout),
-    stderr: new TextDecoder().decode(output.stderr),
-    code: output.code,
-    success: output.success,
-    timedOut,
-    timeoutReason: timedOut ? "wall_time_exceeded" : undefined,
+    stdout: new TextDecoder().decode(concatChunks(chunks)),
+    stderr: new TextDecoder().decode(concatChunks(errChunks)),
+    code: status.code,
+    success: status.success && !killed,
+    timedOut: killed,
+    timeoutReason,
     durationMs,
   };
+}
+
+/** Concatenate an array of byte chunks into a single Uint8Array. */
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
 }
 
 /** Build the command array for the Claude CLI. */
@@ -356,7 +470,11 @@ export function extractTextFromOutput(
         }
       } catch { /* skip */ }
     }
-    return parts.length > 0 ? parts.join("") : rawOutput;
+    if (parts.length > 0) return parts.join("");
+    // No assistant text — surface the structured error message if there is one
+    // (e.g. a quota/rate-limit `type:"error"` event) rather than the raw JSON.
+    const err = extractError(provider, rawOutput);
+    return err ? err.message : rawOutput;
   }
   if (provider === "amp") {
     // Amp's stream JSON mirrors Claude's: the terminal `result` event carries
@@ -378,6 +496,120 @@ export function extractTextFromOutput(
     }
   }
   return rawOutput;
+}
+
+/** A provider-reported API/agent error surfaced in the CLI's output stream. */
+export interface ProviderError {
+  /** Human-readable message (e.g. "Payment Required: You have exceeded your monthly quota"). */
+  message: string;
+  /** Provider/HTTP error code when available (e.g. "quota_exceeded", 402, "rate_limit"). */
+  code?: string;
+  /** True when the provider marks the error as retryable (rate limits, 429, 5xx). */
+  retryable: boolean;
+}
+
+/** Substrings (lowercased) in an error message that signal a rate-limit / quota condition. */
+const RATE_LIMIT_HINTS: string[] = [
+  "rate limit",
+  "rate_limit",
+  "ratelimit",
+  "quota",
+  "too many requests",
+  "overloaded",
+  "payment required",
+  "insufficient_quota",
+  "429",
+];
+
+/** True when an error message/code looks like a rate-limit or quota exhaustion. */
+function looksRateLimited(message: string, code?: string | number): boolean {
+  const hay = `${message} ${code ?? ""}`.toLowerCase();
+  return RATE_LIMIT_HINTS.some((h) => hay.includes(h));
+}
+
+/**
+ * Detect a provider-reported API/agent error in a CLI's output stream.
+ *
+ * Providers signal failure differently, and a fast-failing rate-limit/quota
+ * error frequently exits 0 (or 1) with NO assistant text — only an error
+ * payload. Without this, the invocation would be recorded as a silent success
+ * with a JSON error blob as its "output". Returns null when no error is found.
+ *
+ * - `opencode`: a `{type:"error", error:{name, data:{message, statusCode,
+ *   isRetryable, ...}}}` event (this is the observed quota_exceeded shape).
+ * - `claude`/`amp`: a terminal `result` event with `is_error: true` / `subtype:
+ *   "error_*"`, the message in `result`.
+ * - `gemini`: a single JSON doc with a top-level `error` field.
+ */
+export function extractError(
+  provider: string,
+  rawOutput: string,
+): ProviderError | null {
+  if (provider === "opencode") {
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type !== "error") continue;
+        const data = event.error?.data ?? {};
+        const message: string = data.message ?? event.error?.message ??
+          event.error?.name ?? "opencode reported an error";
+        const code = data.statusCode ?? event.error?.name;
+        return {
+          message,
+          code: code !== undefined ? String(code) : undefined,
+          // Honor opencode's own flag verbatim. A quota_exceeded (monthly reset,
+          // retry-after days away) reports isRetryable:false and must fail fast
+          // — retrying it just burns ~18s of backoff during an outage. A genuine
+          // transient (429/5xx) reports isRetryable:true and gets retried.
+          retryable: data.isRetryable === true,
+        };
+      } catch { /* not JSON */ }
+    }
+    return null;
+  }
+
+  if (provider === "claude" || provider === "amp") {
+    for (const line of rawOutput.split("\n").reverse()) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type !== "result") continue;
+        const isError = event.is_error === true ||
+          (typeof event.subtype === "string" &&
+            event.subtype.startsWith("error"));
+        if (!isError) return null;
+        const message: string = event.result ?? event.error ??
+          `${provider} reported an error (${event.subtype ?? "unknown"})`;
+        return {
+          message,
+          code: event.subtype,
+          retryable: looksRateLimited(message, event.subtype),
+        };
+      } catch { /* not JSON */ }
+    }
+    return null;
+  }
+
+  if (provider === "gemini") {
+    try {
+      const data = JSON.parse(rawOutput);
+      if (!data.error) return null;
+      const message: string = typeof data.error === "string"
+        ? data.error
+        : data.error.message ?? "gemini reported an error";
+      const code = typeof data.error === "object"
+        ? data.error.code ?? data.error.status
+        : undefined;
+      return {
+        message,
+        code: code !== undefined ? String(code) : undefined,
+        retryable: looksRateLimited(message, code),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 /** Token and cost usage data extracted from provider output. */
@@ -537,6 +769,182 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
   return {};
 }
 
+/** The supported provider names as a string-literal union. */
+type Provider = "claude" | "opencode" | "amp" | "gemini";
+
+/** A command-builder for a provider's CLI. */
+type CommandBuilder = (
+  cliPath: string,
+  model: string,
+  resolvedPrompt: string,
+) => { cmd: string[]; stdin?: string };
+
+/** Provider CLI path lookup, keyed by provider name. */
+function cliPathFor(
+  provider: Provider,
+  g: z.infer<typeof GlobalArgsSchema>,
+): string {
+  const paths: Record<Provider, string> = {
+    claude: g.claudePath,
+    opencode: g.opencodePath,
+    amp: g.ampPath,
+    gemini: g.geminiPath,
+  };
+  return paths[provider];
+}
+
+/** Command-builder lookup, keyed by provider name. */
+function builderFor(provider: Provider): CommandBuilder {
+  const builders: Record<Provider, CommandBuilder> = {
+    claude: buildClaudeCommand,
+    opencode: buildOpencodeCommand,
+    amp: buildAmpCommand,
+    gemini: buildGeminiCommand,
+  };
+  return builders[provider];
+}
+
+/** The fully-resolved outcome of running a provider CLI (with retries). */
+type RunOutcome = {
+  result: CmdResult;
+  retries: number;
+  /** Detected provider-level API/agent error, if any. */
+  providerError: ProviderError | null;
+  /** Text extracted from the output (or the error message on a provider error). */
+  extractedText: string;
+  usage: UsageData;
+  /** True when the CLI exited cleanly AND no provider error was reported. */
+  ok: boolean;
+};
+
+/**
+ * Run a provider CLI with retries, then detect provider-reported errors.
+ *
+ * Retries cover two distinct transient failure modes:
+ * - a transient *exit code* (137/143 — killed by signal), and
+ * - a *retryable provider error* surfaced in the output stream (rate limit /
+ *   quota / overloaded / 429), which the CLI itself does not retry and which
+ *   typically exits non-transiently (e.g. 1) with zero assistant text.
+ *
+ * The second is the case that previously slipped through as a silent success:
+ * the subprocess "succeeded" enough to exit, but the model never answered.
+ */
+async function runWithRetries(
+  provider: Provider,
+  cliPath: string,
+  modelName: string,
+  resolved: string,
+  opts: {
+    cwd: string;
+    wallTimeoutMs: number;
+    idleTimeoutMs: number;
+    maxRetries: number;
+  },
+  logger?: MethodContext["logger"],
+): Promise<RunOutcome> {
+  const buildCommand = builderFor(provider);
+  let lastResult: CmdResult | undefined;
+  let providerError: ProviderError | null = null;
+  let retries = 0;
+
+  while (retries <= opts.maxRetries) {
+    const { cmd, stdin } = buildCommand(cliPath, modelName, resolved);
+    lastResult = await runCli(cmd, {
+      cwd: opts.cwd,
+      stdin,
+      wallTimeoutMs: opts.wallTimeoutMs,
+      idleTimeoutMs: opts.idleTimeoutMs,
+    });
+    providerError = extractError(provider, lastResult.stdout);
+
+    const transientExit = !lastResult.success &&
+      TRANSIENT_EXIT_CODES.has(lastResult.code);
+    const retryableProviderError = providerError?.retryable === true;
+
+    if (!transientExit && !retryableProviderError) break;
+
+    retries++;
+    if (retries <= opts.maxRetries) {
+      logger?.warning(
+        "Transient failure ({reason}), retrying ({retries}/{max})",
+        {
+          reason: retryableProviderError
+            ? `provider:${providerError?.code ?? "rate_limit"}`
+            : `exit ${lastResult.code}`,
+          retries,
+          max: opts.maxRetries,
+        },
+      );
+      await new Promise((r) => setTimeout(r, 5000 * retries));
+    }
+  }
+
+  const result = lastResult!;
+  const extractedText = extractTextFromOutput(provider, result.stdout);
+  const usage = extractUsage(provider, result.stdout);
+  const ok = result.success && providerError === null;
+
+  return { result, retries, providerError, extractedText, usage, ok };
+}
+
+/** Build the common invocation record fields shared by invoke/invokeAndParse. */
+function buildInvocationBase(
+  invocationId: string,
+  provider: string,
+  modelName: string,
+  args: { prompt: string; tags?: Record<string, string> },
+  promptHash: string,
+  slashCommand: string | undefined,
+  cwd: string,
+  outcome: RunOutcome,
+): Record<string, unknown> {
+  const { result, usage, providerError, extractedText } = outcome;
+  const outputTokensPerSecond = usage.output && result.durationMs > 0
+    ? Math.round((usage.output / (result.durationMs / 1000)) * 100) / 100
+    : undefined;
+
+  return {
+    invocationId,
+    provider,
+    model: modelName,
+    prompt: args.prompt.slice(0, 500),
+    promptHash,
+    slashCommand,
+    cwd,
+    exitCode: result.code,
+    // A provider error (quota/rate-limit) is a failure even when the CLI
+    // exited 0 — the model never produced an answer.
+    success: outcome.ok,
+    durationMs: result.durationMs,
+    outputBytes: result.stdout.length,
+    outputPreview: extractedText.slice(0, 1000),
+    outputTokensPerSecond,
+    retries: outcome.retries,
+    timedOut: result.timedOut,
+    timeoutReason: result.timeoutReason,
+    failureReason: providerError
+      ? `provider_error:${providerError.code ?? "unknown"}`
+      : result.timedOut
+      ? result.timeoutReason
+      : !result.success
+      ? `exit_${result.code}`
+      : undefined,
+    invokedAt: new Date().toISOString(),
+    tokens: usage.total
+      ? {
+        input: usage.input,
+        output: usage.output,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
+        total: usage.total,
+        reasoning: usage.reasoning,
+      }
+      : undefined,
+    costUsd: usage.costUsd,
+    tags: args.tags,
+  };
+}
+
 /** Execution context provided by swamp to each method invocation. */
 type MethodContext = {
   globalArgs: z.infer<typeof GlobalArgsSchema>;
@@ -562,7 +970,7 @@ type MethodContext = {
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.06.17.1",
+  version: "2026.06.24.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -620,13 +1028,12 @@ export const model = {
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
         const provider =
-          (args.provider || context.globalArgs.defaultProvider) as z.infer<
-            typeof ProviderEnum
-          >;
+          (args.provider || context.globalArgs.defaultProvider) as Provider;
         const modelName = args.model || context.globalArgs.defaultModel;
         const cwd = args.cwd || Deno.cwd();
         const wallTimeoutMs = args.wallTimeoutMs ||
           context.globalArgs.wallTimeoutMs;
+        const idleTimeoutMs = context.globalArgs.idleTimeoutMs;
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;
@@ -638,114 +1045,85 @@ export const model = {
           cwd,
         );
         const promptHash = hashPrompt(resolved);
+        const cliPath = cliPathFor(provider, context.globalArgs);
 
-        const cliPath: string = {
-          claude: context.globalArgs.claudePath,
-          opencode: context.globalArgs.opencodePath,
-          amp: context.globalArgs.ampPath,
-          gemini: context.globalArgs.geminiPath,
-        }[provider];
+        const outcome = await runWithRetries(
+          provider,
+          cliPath,
+          modelName,
+          resolved,
+          { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
+          context.logger,
+        );
 
-        const buildCommand: (
-          cliPath: string,
-          model: string,
-          resolvedPrompt: string,
-        ) => { cmd: string[]; stdin?: string } = {
-          claude: buildClaudeCommand,
-          opencode: buildOpencodeCommand,
-          amp: buildAmpCommand,
-          gemini: buildGeminiCommand,
-        }[provider];
-
-        let lastResult: CmdResult | undefined;
-        let retries = 0;
-
-        while (retries <= maxRetries) {
-          const { cmd, stdin } = buildCommand(cliPath, modelName, resolved);
-          lastResult = await runCli(cmd, { cwd, stdin, wallTimeoutMs });
-
-          if (
-            lastResult.success || !TRANSIENT_EXIT_CODES.has(lastResult.code)
-          ) {
-            break;
-          }
-
-          retries++;
-          if (retries <= maxRetries) {
-            context.logger.warning(
-              "Transient failure, retrying ({retries}/{max})",
-              {
-                retries,
-                max: maxRetries,
-              },
-            );
-            await new Promise((r) => setTimeout(r, 5000 * retries));
-          }
-        }
-
-        const result = lastResult!;
-        const rawOutput = result.stdout;
-        const extractedText = extractTextFromOutput(provider, rawOutput);
-        const usage = extractUsage(provider, rawOutput);
         const invocationId = uuid();
-        const outputTokensPerSecond = usage.output && result.durationMs > 0
-          ? Math.round((usage.output / (result.durationMs / 1000)) * 100) / 100
-          : undefined;
-
-        const invocation = {
+        const invocation = buildInvocationBase(
           invocationId,
           provider,
-          model: modelName,
-          prompt: args.prompt.slice(0, 500),
+          modelName,
+          args,
           promptHash,
           slashCommand,
           cwd,
-          exitCode: result.code,
-          success: result.success,
-          durationMs: result.durationMs,
-          outputBytes: rawOutput.length,
-          outputPreview: extractedText.slice(0, 1000),
-          outputTokensPerSecond,
-          retries,
-          timedOut: result.timedOut,
-          timeoutReason: result.timeoutReason,
-          invokedAt: new Date().toISOString(),
-          tokens: usage.total
-            ? {
-              input: usage.input,
-              output: usage.output,
-              cacheRead: usage.cacheRead,
-              cacheWrite: usage.cacheWrite,
-              total: usage.total,
-              reasoning: usage.reasoning,
-            }
-            : undefined,
-          costUsd: usage.costUsd,
-          tags: args.tags,
-        };
+          outcome,
+        );
 
         const handle = await context.writeResource(
           "invocation",
           `invocation-${invocationId}`,
-          invocation as unknown as Record<string, unknown>,
+          invocation,
         );
         const transcriptHandle = await context.writeResource(
           "transcript",
           `transcript-${invocationId}`,
-          { invocationId, prompt: args.prompt, output: extractedText },
+          {
+            invocationId,
+            prompt: args.prompt,
+            output: outcome.extractedText,
+          },
         );
 
+        const { result, providerError } = outcome;
         context.logger.info(
           "{provider}/{model}: {status} ({ms}ms, {bytes}b, {retries} retries)",
           {
             provider,
             model: modelName,
-            status: result.success ? "ok" : `exit ${result.code}`,
+            status: outcome.ok
+              ? "ok"
+              : providerError
+              ? `provider_error ${providerError.code ?? ""}`
+              : result.timedOut
+              ? result.timeoutReason
+              : `exit ${result.code}`,
             ms: result.durationMs,
-            bytes: rawOutput.length,
-            retries,
+            bytes: result.stdout.length,
+            retries: outcome.retries,
           },
         );
+
+        // Surface failure to the caller: a provider error (quota/rate-limit), a
+        // timeout, or a non-zero exit. The artifacts above are already
+        // persisted for audit/telemetry before we throw.
+        if (!outcome.ok) {
+          if (providerError) {
+            throw new Error(
+              `${provider} provider error${
+                providerError.code ? ` (${providerError.code})` : ""
+              }: ${providerError.message.slice(0, 300)}`,
+            );
+          }
+          if (result.timedOut) {
+            throw new Error(
+              `${provider} CLI ${result.timeoutReason} after ${result.durationMs}ms (no answer produced)`,
+            );
+          }
+          throw new Error(
+            `${provider} CLI failed (exit ${result.code}): ${
+              result.stderr.slice(0, 200)
+            }`,
+          );
+        }
 
         return { dataHandles: [handle, transcriptHandle] };
       },
@@ -774,13 +1152,12 @@ export const model = {
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
         const provider =
-          (args.provider || context.globalArgs.defaultProvider) as z.infer<
-            typeof ProviderEnum
-          >;
+          (args.provider || context.globalArgs.defaultProvider) as Provider;
         const modelName = args.model || context.globalArgs.defaultModel;
         const cwd = args.cwd || Deno.cwd();
         const wallTimeoutMs = args.wallTimeoutMs ||
           context.globalArgs.wallTimeoutMs;
+        const idleTimeoutMs = context.globalArgs.idleTimeoutMs;
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;
@@ -792,49 +1169,17 @@ export const model = {
           cwd,
         );
         const promptHash = hashPrompt(resolved);
+        const cliPath = cliPathFor(provider, context.globalArgs);
 
-        const cliPath: string = {
-          claude: context.globalArgs.claudePath,
-          opencode: context.globalArgs.opencodePath,
-          amp: context.globalArgs.ampPath,
-          gemini: context.globalArgs.geminiPath,
-        }[provider];
-
-        const buildCommand: (
-          cliPath: string,
-          model: string,
-          resolvedPrompt: string,
-        ) => { cmd: string[]; stdin?: string } = {
-          claude: buildClaudeCommand,
-          opencode: buildOpencodeCommand,
-          amp: buildAmpCommand,
-          gemini: buildGeminiCommand,
-        }[provider];
-
-        let lastResult: CmdResult | undefined;
-        let retries = 0;
-
-        while (retries <= maxRetries) {
-          const { cmd, stdin } = buildCommand(cliPath, modelName, resolved);
-          lastResult = await runCli(cmd, { cwd, stdin, wallTimeoutMs });
-
-          if (
-            lastResult.success || !TRANSIENT_EXIT_CODES.has(lastResult.code)
-          ) break;
-          retries++;
-          if (retries <= maxRetries) {
-            await new Promise((r) => setTimeout(r, 5000 * retries));
-          }
-        }
-
-        const result = lastResult!;
-        const rawOutput = result.stdout;
-        const extractedText = extractTextFromOutput(provider, rawOutput);
-        const usage = extractUsage(provider, rawOutput);
-        const invocationId = uuid();
-        const outputTokensPerSecond = usage.output && result.durationMs > 0
-          ? Math.round((usage.output / (result.durationMs / 1000)) * 100) / 100
-          : undefined;
+        const outcome = await runWithRetries(
+          provider,
+          cliPath,
+          modelName,
+          resolved,
+          { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
+          context.logger,
+        );
+        const { result, extractedText, providerError } = outcome;
 
         // Parse JSON from extracted text
         let parsedJson: Record<string, unknown> | null = null;
@@ -850,43 +1195,27 @@ export const model = {
           } catch { /* not valid JSON */ }
         }
 
+        const invocationId = uuid();
         const invocation = {
-          invocationId,
-          provider,
-          model: modelName,
-          prompt: args.prompt.slice(0, 500),
-          promptHash,
-          slashCommand,
-          cwd,
-          exitCode: result.code,
-          success: result.success && parsedJson !== null,
-          durationMs: result.durationMs,
-          outputBytes: rawOutput.length,
-          outputPreview: extractedText.slice(0, 1000),
-          outputTokensPerSecond,
-          retries,
-          timedOut: result.timedOut,
-          timeoutReason: result.timeoutReason,
-          invokedAt: new Date().toISOString(),
-          tokens: usage.total
-            ? {
-              input: usage.input,
-              output: usage.output,
-              cacheRead: usage.cacheRead,
-              cacheWrite: usage.cacheWrite,
-              total: usage.total,
-              reasoning: usage.reasoning,
-            }
-            : undefined,
-          costUsd: usage.costUsd,
-          tags: args.tags,
+          ...buildInvocationBase(
+            invocationId,
+            provider,
+            modelName,
+            args,
+            promptHash,
+            slashCommand,
+            cwd,
+            outcome,
+          ),
+          // invokeAndParse additionally requires a parseable JSON payload.
+          success: outcome.ok && parsedJson !== null,
           parsedResponse: parsedJson,
         };
 
         const handle = await context.writeResource(
           "invocation",
           `invocation-${invocationId}`,
-          invocation as unknown as Record<string, unknown>,
+          invocation,
         );
         const transcriptHandle = await context.writeResource(
           "transcript",
@@ -894,7 +1223,19 @@ export const model = {
           { invocationId, prompt: args.prompt, output: extractedText },
         );
 
-        if (!result.success) {
+        if (!outcome.ok) {
+          if (providerError) {
+            throw new Error(
+              `${provider} provider error${
+                providerError.code ? ` (${providerError.code})` : ""
+              }: ${providerError.message.slice(0, 300)}`,
+            );
+          }
+          if (result.timedOut) {
+            throw new Error(
+              `${provider} CLI ${result.timeoutReason} after ${result.durationMs}ms (no answer produced)`,
+            );
+          }
           throw new Error(
             `CLI failed (exit ${result.code}): ${result.stderr.slice(0, 200)}`,
           );
@@ -911,7 +1252,7 @@ export const model = {
             provider,
             model: modelName,
             ms: result.durationMs,
-            retries,
+            retries: outcome.retries,
           },
         );
 
@@ -932,9 +1273,7 @@ export const model = {
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
         const provider =
-          (args.provider || context.globalArgs.defaultProvider) as z.infer<
-            typeof ProviderEnum
-          >;
+          (args.provider || context.globalArgs.defaultProvider) as Provider;
 
         if (provider !== "opencode") {
           throw new Error(
