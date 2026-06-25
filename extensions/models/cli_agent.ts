@@ -409,7 +409,16 @@ function buildCodexCommand(
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
-    cmd: [cliPath, "exec", "--json", "--color", "never", "-m", model, resolvedPrompt],
+    cmd: [
+      cliPath,
+      "exec",
+      "--json",
+      "--color",
+      "never",
+      "-m",
+      model,
+      resolvedPrompt,
+    ],
   };
 }
 
