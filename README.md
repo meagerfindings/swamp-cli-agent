@@ -1,8 +1,8 @@
 # swamp-cli-agent
 
 [swamp](https://swamp.club) extension `@mgreten/cli-agent` — invoke CLI coding
-agents (claude, opencode, amp, gemini) with typed inputs and capture structured
-outputs including tokens, cost, duration, retries, and exit code.
+agents (claude, opencode, amp, gemini, codex) with typed inputs and capture
+structured outputs including tokens, cost, duration, retries, and exit code.
 
 ## Extension documentation
 

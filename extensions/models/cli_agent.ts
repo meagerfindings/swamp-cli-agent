@@ -1,7 +1,7 @@
 /**
  * Multi-provider CLI agent invoker for swamp.
  *
- * Runs coding-agent CLI tools (claude, opencode, amp, gemini) with typed
+ * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex) with typed
  * inputs, captures structured outputs including token counts, cost, duration,
  * exit code, and automatic retries on transient failures. Supports slash
  * command resolution from a configurable commands directory and optional JSON
@@ -23,6 +23,7 @@ const ProviderEnum = z.enum([
   "opencode",
   "amp",
   "gemini",
+  "codex",
 ]);
 
 /** Global configuration arguments shared across all method invocations. */
@@ -37,6 +38,7 @@ const GlobalArgsSchema = z.object({
   opencodePath: z.string().default("opencode"),
   ampPath: z.string().default("amp"),
   geminiPath: z.string().default("gemini"),
+  codexPath: z.string().default("codex"),
   idleTimeoutMs: z.number().default(600_000),
   wallTimeoutMs: z.number().default(3_600_000),
   maxRetries: z.number().default(2),
@@ -394,6 +396,24 @@ function buildGeminiCommand(
 }
 
 /**
+ * Build the command array for the OpenAI Codex CLI.
+ *
+ * `codex exec --json` runs non-interactively and emits one JSON event per line
+ * (JSONL). The prompt is the final positional argument — codex reads from stdin
+ * only when no prompt arg is given, so we must NOT pipe it on stdin. `--color
+ * never` keeps ANSI codes out of the captured stream.
+ */
+function buildCodexCommand(
+  cliPath: string,
+  model: string,
+  resolvedPrompt: string,
+): { cmd: string[]; stdin?: string } {
+  return {
+    cmd: [cliPath, "exec", "--json", "--color", "never", "-m", model, resolvedPrompt],
+  };
+}
+
+/**
  * Extract human-readable text from a provider's raw CLI output, handling
  * provider-specific JSON streaming formats.
  */
@@ -446,6 +466,28 @@ export function extractTextFromOutput(
       return rawOutput;
     }
   }
+  if (provider === "codex") {
+    // codex exec --json emits JSONL; the answer is the LAST item.completed
+    // event whose item is an `agent_message`. Forward-scan and keep the last.
+    let text: string | undefined;
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (
+          event.type === "item.completed" &&
+          event.item?.type === "agent_message" &&
+          typeof event.item?.text === "string"
+        ) {
+          text = event.item.text;
+        }
+      } catch { /* not JSON */ }
+    }
+    if (text !== undefined) return text;
+    // No agent message — surface the error message if codex reported one
+    // (e.g. a bad model id), rather than the raw JSONL blob. Mirrors opencode.
+    const err = extractError(provider, rawOutput);
+    return err ? err.message : rawOutput;
+  }
   return rawOutput;
 }
 
@@ -491,6 +533,11 @@ function looksRateLimited(message: string, code?: string | number): boolean {
  * - `claude`/`amp`: a terminal `result` event with `is_error: true` / `subtype:
  *   "error_*"`, the message in `result`.
  * - `gemini`: a single JSON doc with a top-level `error` field.
+ * - `codex`: a top-level `{type:"error", message}` event or a
+ *   `{type:"turn.failed", error:{message}}` event; the message is often itself
+ *   a nested JSON blob (`{status, error:{message}}`) which is unwrapped. A
+ *   soft `{type:"item.completed", item:{type:"error"}}` notice (e.g. fallback
+ *   model metadata) is NOT a failure and is ignored.
  */
 export function extractError(
   provider: string,
@@ -560,6 +607,36 @@ export function extractError(
     }
   }
 
+  if (provider === "codex") {
+    // Forward-scan so an EARLY hard error wins over later events; stop on the
+    // first top-level `error` or `turn.failed`. (Unlike claude/amp, codex does
+    // not put its error in a terminal `result`, so a reverse scan would miss it.)
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        // `item.completed` carrying an `error` item is a soft degradation
+        // notice (e.g. fallback model metadata), not a turn failure — skip it.
+        if (event.type !== "error" && event.type !== "turn.failed") continue;
+        let message: string = event.type === "turn.failed"
+          ? event.error?.message ?? "codex turn failed"
+          : event.message ?? "codex reported an error";
+        let code: string | number | undefined;
+        // The message is frequently a nested JSON blob; unwrap it.
+        try {
+          const inner = JSON.parse(message);
+          code = inner.status ?? inner.error?.code ?? inner.error?.type;
+          message = inner.error?.message ?? inner.message ?? message;
+        } catch { /* message is plain text */ }
+        return {
+          message,
+          code: code !== undefined ? String(code) : undefined,
+          retryable: looksRateLimited(message, code),
+        };
+      } catch { /* not JSON */ }
+    }
+    return null;
+  }
+
   return null;
 }
 
@@ -593,6 +670,10 @@ export interface UsageData {
  *   events at `message.usage` (Claude field names), summed across turns. Amp
  *   does not report cost, so `costUsd` is left undefined.
  * - `gemini`: a single JSON document with `stats.models.<name>.tokens`. No cost.
+ * - `codex`: the terminal `turn.completed` event carries a `usage` object
+ *   (`input_tokens`, `cached_input_tokens`, `output_tokens`,
+ *   `reasoning_output_tokens`). No cost. Cached input folds into `input` like
+ *   the other providers.
  */
 export function extractUsage(provider: string, rawOutput: string): UsageData {
   if (provider === "claude") {
@@ -717,11 +798,53 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
     };
   }
 
+  if (provider === "codex") {
+    // codex emits one `turn.completed` per turn; sum usage across all of them
+    // (like amp/opencode) rather than reading a single event, so a multi-turn
+    // run is not undercounted.
+    let input = 0;
+    let output = 0;
+    let cacheRead = 0;
+    // codex reports no cache writes, so this stays 0 — but it is a named
+    // counter (not a literal) so the four-term `total` below reads identically
+    // to the sibling providers.
+    const cacheWrite = 0;
+    let reasoning = 0;
+    let sawUsage = false;
+
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type !== "turn.completed" || !event.usage) continue;
+        const u = event.usage;
+        input += Number(u.input_tokens) || 0;
+        cacheRead += Number(u.cached_input_tokens) || 0;
+        output += Number(u.output_tokens) || 0;
+        reasoning += Number(u.reasoning_output_tokens) || 0;
+        sawUsage = true;
+      } catch { /* skip */ }
+    }
+
+    if (!sawUsage) return {};
+    return {
+      // Raw input is the basis for `total`; the returned `input` field folds
+      // cache reads in (matching the other providers). Using the folded value
+      // in `total` would double-count cached_input_tokens.
+      input: input + cacheRead,
+      output,
+      cacheRead,
+      cacheWrite,
+      reasoning,
+      total: input + output + cacheRead + cacheWrite,
+      // codex does not report per-invocation cost.
+    };
+  }
+
   return {};
 }
 
 /** The supported provider names as a string-literal union. */
-type Provider = "claude" | "opencode" | "amp" | "gemini";
+type Provider = "claude" | "opencode" | "amp" | "gemini" | "codex";
 
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
@@ -740,6 +863,7 @@ function cliPathFor(
     opencode: g.opencodePath,
     amp: g.ampPath,
     gemini: g.geminiPath,
+    codex: g.codexPath,
   };
   return paths[provider];
 }
@@ -751,6 +875,7 @@ function builderFor(provider: Provider): CommandBuilder {
     opencode: buildOpencodeCommand,
     amp: buildAmpCommand,
     gemini: buildGeminiCommand,
+    codex: buildCodexCommand,
   };
   return builders[provider];
 }
@@ -921,7 +1046,7 @@ type MethodContext = {
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.06.24.1",
+  version: "2026.06.25.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -948,7 +1073,7 @@ export const model = {
   methods: {
     invoke: {
       description:
-        "Run a CLI agent tool (claude, opencode, amp, gemini) with a prompt and record structured results",
+        "Run a CLI agent tool (claude, opencode, amp, gemini, codex) with a prompt and record structured results",
       arguments: z.object({
         prompt: z.string().describe("The prompt or slash command to execute"),
         provider: ProviderEnum.optional().describe(
