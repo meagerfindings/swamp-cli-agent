@@ -130,6 +130,78 @@ const OPENCODE_OUTPUT = [
   }),
 ].join("\n");
 
+// Codex `exec --json`: JSONL. The answer is the last item.completed
+// agent_message; usage is on the terminal turn.completed event. Real capture
+// trimmed to the fields the extractors read.
+const CODEX_OUTPUT = [
+  JSON.stringify({ type: "thread.started", thread_id: "t_x" }),
+  JSON.stringify({ type: "turn.started" }),
+  JSON.stringify({
+    type: "item.completed",
+    item: { id: "item_0", type: "agent_message", text: "hi" },
+  }),
+  JSON.stringify({
+    type: "turn.completed",
+    usage: {
+      input_tokens: 13742,
+      cached_input_tokens: 4992,
+      output_tokens: 22,
+      reasoning_output_tokens: 14,
+    },
+  }),
+].join("\n");
+
+// Codex multi-turn run: two turn.completed events. Usage must be SUMMED across
+// both turns, not read from the first one only.
+const CODEX_MULTITURN = [
+  JSON.stringify({ type: "turn.started" }),
+  JSON.stringify({
+    type: "turn.completed",
+    usage: {
+      input_tokens: 100,
+      cached_input_tokens: 10,
+      output_tokens: 5,
+      reasoning_output_tokens: 2,
+    },
+  }),
+  JSON.stringify({ type: "turn.started" }),
+  JSON.stringify({
+    type: "turn.completed",
+    usage: {
+      input_tokens: 200,
+      cached_input_tokens: 20,
+      output_tokens: 8,
+      reasoning_output_tokens: 3,
+    },
+  }),
+].join("\n");
+
+// Codex turn failure: a soft item.completed error notice (which must be
+// ignored) followed by a turn.failed carrying a nested-JSON message. Real
+// capture from a bad `-m` model id.
+const CODEX_TURN_FAILED = [
+  JSON.stringify({ type: "thread.started", thread_id: "t_x" }),
+  // Soft degradation notice — must NOT be treated as a failure.
+  JSON.stringify({
+    type: "item.completed",
+    item: { id: "item_0", type: "error", message: "fallback model metadata" },
+  }),
+  JSON.stringify({ type: "turn.started" }),
+  JSON.stringify({
+    type: "turn.failed",
+    error: {
+      message:
+        '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The model is not supported."}}',
+    },
+  }),
+].join("\n");
+
+// Codex top-level rate-limit error event (no turn.failed, no agent_message).
+const CODEX_RATE_LIMIT = JSON.stringify({
+  type: "error",
+  message: '{"status":429,"error":{"message":"Rate limit exceeded"}}',
+});
+
 // --- extractUsage -----------------------------------------------------------
 
 Deno.test("extractUsage: claude reads total_cost_usd and folds cache read into input", () => {
@@ -184,6 +256,39 @@ Deno.test("extractUsage: opencode sums step_finish tokens and cost", () => {
   assertEquals(Math.round((u.costUsd ?? 0) * 10000), 20);
 });
 
+Deno.test("extractUsage: codex reads turn.completed usage, folds cached into input, no double-count, no cost", () => {
+  const u = extractUsage("codex", CODEX_OUTPUT);
+  // input(13742) + cached(4992) folded into the input field
+  assertEquals(u.input, 18734);
+  assertEquals(u.output, 22);
+  assertEquals(u.cacheRead, 4992);
+  assertEquals(u.cacheWrite, 0);
+  assertEquals(u.reasoning, 14);
+  // total uses RAW input: 13742 + 22 + 4992 — NOT the folded 18734 (which
+  // would be 23748 and double-count the cached tokens).
+  assertEquals(u.total, 18756);
+  // codex does not report cost.
+  assertEquals(u.costUsd, undefined);
+});
+
+Deno.test("extractUsage: codex sums usage across multiple turn.completed events", () => {
+  const u = extractUsage("codex", CODEX_MULTITURN);
+  // raw input 100+200=300, cached 10+20=30 → input field folds: 330
+  assertEquals(u.input, 330);
+  assertEquals(u.output, 13); // 5 + 8
+  assertEquals(u.cacheRead, 30);
+  assertEquals(u.reasoning, 5); // 2 + 3
+  // total = rawInput(300) + output(13) + cacheRead(30). Reading only the first
+  // turn would give input 110 / total 135 — this guards the multi-turn sum.
+  assertEquals(u.total, 343);
+  assertEquals(u.costUsd, undefined);
+});
+
+Deno.test("extractUsage: codex returns {} when no turn.completed event present", () => {
+  assertEquals(extractUsage("codex", CODEX_TURN_FAILED), {});
+  assertEquals(extractUsage("codex", "not json\n{}"), {});
+});
+
 Deno.test("extractUsage: returns empty object when no usage events present", () => {
   assertEquals(extractUsage("claude", "not json\n{}"), {});
   assertEquals(extractUsage("amp", "not json\n{}"), {});
@@ -206,9 +311,21 @@ Deno.test("extractTextFromOutput: gemini reads response field", () => {
   assertEquals(extractTextFromOutput("gemini", GEMINI_OUTPUT), "hi");
 });
 
+Deno.test("extractTextFromOutput: codex reads the last agent_message text", () => {
+  assertEquals(extractTextFromOutput("codex", CODEX_OUTPUT), "hi");
+});
+
+Deno.test("extractTextFromOutput: codex surfaces the error message when no agent_message", () => {
+  const text = extractTextFromOutput("codex", CODEX_RATE_LIMIT);
+  assertEquals(text.includes("Rate limit exceeded"), true);
+  // Must be the human message, not the raw JSONL blob.
+  assertEquals(text.startsWith("{"), false);
+});
+
 Deno.test("extractTextFromOutput: falls back to raw output when unparseable", () => {
   assertEquals(extractTextFromOutput("amp", "plain text"), "plain text");
   assertEquals(extractTextFromOutput("claude", "plain text"), "plain text");
+  assertEquals(extractTextFromOutput("codex", "plain text"), "plain text");
 });
 
 // --- extractError -----------------------------------------------------------
@@ -288,4 +405,29 @@ Deno.test("extractError: gemini detects a top-level error field", () => {
   assertEquals(err?.code, "429");
   assertEquals(err?.retryable, true);
   assertEquals(extractError("gemini", GEMINI_OUTPUT), null);
+});
+
+Deno.test("extractError: codex unwraps a turn.failed nested-JSON message", () => {
+  const err = extractError("codex", CODEX_TURN_FAILED);
+  assertEquals(err?.code, "400");
+  assertEquals(err?.message, "The model is not supported.");
+  assertEquals(err?.retryable, false);
+});
+
+Deno.test("extractError: codex flags a top-level rate-limit error as retryable", () => {
+  const err = extractError("codex", CODEX_RATE_LIMIT);
+  assertEquals(err?.code, "429");
+  assertEquals(err?.message, "Rate limit exceeded");
+  assertEquals(err?.retryable, true);
+});
+
+Deno.test("extractError: codex ignores item.completed error notices and clean runs", () => {
+  // A soft item.completed error notice on its own is not a turn failure.
+  const softNotice = JSON.stringify({
+    type: "item.completed",
+    item: { type: "error", message: "fallback model metadata" },
+  });
+  assertEquals(extractError("codex", softNotice), null);
+  // A clean run has no error.
+  assertEquals(extractError("codex", CODEX_OUTPUT), null);
 });

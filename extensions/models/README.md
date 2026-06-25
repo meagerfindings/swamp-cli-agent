@@ -1,8 +1,9 @@
 # @mgreten/cli-agent
 
 A multi-provider CLI agent invoker for [swamp](https://swamp.club). Runs
-coding-agent CLI tools — Claude Code, OpenCode, Amp, or Gemini CLI — with
-typed inputs and captures structured outputs including token counts, estimated
+coding-agent CLI tools — Claude Code, OpenCode, Amp, Gemini CLI, or OpenAI
+Codex CLI — with typed inputs and captures structured outputs including token
+counts, estimated
 cost, wall-clock duration, exit codes, and automatic retries on transient
 failures. Every invocation is persisted as a swamp resource with a 30-day
 lifetime and automatic garbage collection, giving you a queryable history of
@@ -30,16 +31,16 @@ models:
   my-agent:
     type: "@mgreten/cli-agent"
     globalArgs:
-      defaultProvider: claude     # claude | opencode | amp | gemini
+      defaultProvider: claude     # claude | opencode | amp | gemini | codex
       defaultModel: opus          # model name passed to the CLI
       commandsDir: .claude/commands  # where slash commands live
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
       maxRetries: 2               # retry count for transient failures
 ```
 
-CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`) default to
-the bare binary name, relying on `$PATH` resolution. Override them if your
-binaries live in a non-standard location.
+CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`)
+default to the bare binary name, relying on `$PATH` resolution. Override them
+if your binaries live in a non-standard location.
 
 ## Methods
 
@@ -102,22 +103,24 @@ Arguments:
 
 2. **Provider dispatch** — each provider has a dedicated command builder that
    maps the prompt and model to the correct CLI flags. Amp receives prompts
-   via stdin; others use positional arguments. All providers run with their
-   permission-bypass flag (`--dangerously-skip-permissions` for Claude,
-   `--dangerously-allow-all` for Amp, `--yolo` for Gemini) since headless
-   invocations cannot answer interactive approval prompts — only point this
-   extension at working directories you trust it to modify.
+   via stdin; others (including Codex, via `codex exec --json`) use positional
+   arguments. The interactive agents run with their permission-bypass flag
+   (`--dangerously-skip-permissions` for Claude, `--dangerously-allow-all` for
+   Amp, `--yolo` for Gemini) since headless invocations cannot answer
+   interactive approval prompts — only point this extension at working
+   directories you trust it to modify.
 
 3. **Retry logic** — transient failures (exit codes 137, 143 — typically
    OOM-killed or SIGTERM) trigger automatic retries with exponential backoff.
 
 4. **Output extraction** — provider-specific parsers extract human-readable
    text from streaming JSON formats (Claude stream-json, OpenCode JSON lines,
-   Gemini JSON envelope).
+   Gemini JSON envelope, Codex JSONL `agent_message` items).
 
 5. **Usage tracking** — token counts and cost are extracted from Claude's
    result events. Other providers return usage data as it becomes available
-   in their output formats.
+   in their output formats; Codex reports token usage (no cost) on its
+   terminal `turn.completed` event.
 
 ## Invocation Resource Schema
 
