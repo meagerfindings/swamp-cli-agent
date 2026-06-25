@@ -12,30 +12,21 @@
 
 import { z } from "npm:zod@4";
 
+// Schemas below are written without explicit z.Zod* type annotations: zod 4's
+// inferred types are the source of truth, and pinning them by hand (e.g.
+// `z.ZodEnum<["claude", ...]>`) both drifts from zod 4's actual generic shapes
+// (which fails `deno check`) and forces a same-edit update on every change.
+
 /** Supported CLI agent providers. */
-const ProviderEnum: z.ZodEnum<["claude", "opencode", "amp", "gemini"]> = z.enum(
-  [
-    "claude",
-    "opencode",
-    "amp",
-    "gemini",
-  ],
-);
+const ProviderEnum = z.enum([
+  "claude",
+  "opencode",
+  "amp",
+  "gemini",
+]);
 
 /** Global configuration arguments shared across all method invocations. */
-const GlobalArgsSchema: z.ZodObject<{
-  defaultProvider: z.ZodDefault<typeof ProviderEnum>;
-  defaultModel: z.ZodDefault<z.ZodString>;
-  commandsDir: z.ZodDefault<z.ZodString>;
-  commandSubdirs: z.ZodDefault<z.ZodArray<z.ZodString>>;
-  claudePath: z.ZodDefault<z.ZodString>;
-  opencodePath: z.ZodDefault<z.ZodString>;
-  ampPath: z.ZodDefault<z.ZodString>;
-  geminiPath: z.ZodDefault<z.ZodString>;
-  idleTimeoutMs: z.ZodDefault<z.ZodNumber>;
-  wallTimeoutMs: z.ZodDefault<z.ZodNumber>;
-  maxRetries: z.ZodDefault<z.ZodNumber>;
-}> = z.object({
+const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
   defaultModel: z.string().default("opus"),
   commandsDir: z.string().default(".claude/commands"),
@@ -52,38 +43,7 @@ const GlobalArgsSchema: z.ZodObject<{
 });
 
 /** Schema for a structured invocation record persisted as a swamp resource. */
-const InvocationSchema: z.ZodObject<{
-  invocationId: z.ZodString;
-  provider: typeof ProviderEnum;
-  model: z.ZodString;
-  prompt: z.ZodString;
-  promptHash: z.ZodString;
-  slashCommand: z.ZodOptional<z.ZodString>;
-  cwd: z.ZodString;
-  exitCode: z.ZodNumber;
-  success: z.ZodBoolean;
-  durationMs: z.ZodNumber;
-  outputBytes: z.ZodNumber;
-  outputPreview: z.ZodString;
-  outputTokensPerSecond: z.ZodOptional<z.ZodNumber>;
-  retries: z.ZodNumber;
-  timedOut: z.ZodBoolean;
-  timeoutReason: z.ZodOptional<z.ZodString>;
-  failureReason: z.ZodOptional<z.ZodString>;
-  invokedAt: z.ZodString;
-  tokens: z.ZodOptional<
-    z.ZodObject<{
-      input: z.ZodOptional<z.ZodNumber>;
-      output: z.ZodOptional<z.ZodNumber>;
-      cacheRead: z.ZodOptional<z.ZodNumber>;
-      cacheWrite: z.ZodOptional<z.ZodNumber>;
-      total: z.ZodOptional<z.ZodNumber>;
-      reasoning: z.ZodOptional<z.ZodNumber>;
-    }>
-  >;
-  costUsd: z.ZodOptional<z.ZodNumber>;
-  tags: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodString>>;
-}> = z.object({
+const InvocationSchema = z.object({
   invocationId: z.string(),
   provider: ProviderEnum,
   model: z.string(),
@@ -121,23 +81,14 @@ const InvocationSchema: z.ZodObject<{
  * original prompt and the full extracted output, neither subject to the
  * preview caps on the invocation record itself.
  */
-const TranscriptSchema: z.ZodObject<{
-  invocationId: z.ZodString;
-  prompt: z.ZodString;
-  output: z.ZodString;
-}> = z.object({
+const TranscriptSchema = z.object({
   invocationId: z.string(),
   prompt: z.string(),
   output: z.string(),
 }).passthrough();
 
 /** Schema for the result of enumerating a provider's available models. */
-const ModelListSchema: z.ZodObject<{
-  provider: typeof ProviderEnum;
-  models: z.ZodArray<z.ZodString>;
-  count: z.ZodNumber;
-  listedAt: z.ZodString;
-}> = z.object({
+const ModelListSchema = z.object({
   provider: ProviderEnum,
   models: z.array(z.string()),
   count: z.number(),
