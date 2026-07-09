@@ -405,6 +405,15 @@ function buildGeminiCommand(
  * (JSONL). The prompt is the final positional argument — codex reads from stdin
  * only when no prompt arg is given, so we must NOT pipe it on stdin. `--color
  * never` keeps ANSI codes out of the captured stream.
+ *
+ * `--skip-git-repo-check` disables codex's per-directory trust gate. Without it,
+ * codex refuses to run from any cwd not marked `trust_level = "trusted"` in
+ * `~/.codex/config.toml` — printing a plain-text refusal ("Not inside a trusted
+ * directory and --skip-git-repo-check was not specified.") to stdout INSTEAD of
+ * the JSONL stream. That refusal then breaks any downstream JSON parse (e.g.
+ * invokeAndParse). Batch/non-interactive callers legitimately run from arbitrary
+ * working directories (nested `swamp model method run` inherits whatever cwd the
+ * parent had), so the trust gate is inappropriate here — we always skip it.
  */
 function buildCodexCommand(
   cliPath: string,
@@ -418,6 +427,7 @@ function buildCodexCommand(
       "--json",
       "--color",
       "never",
+      "--skip-git-repo-check",
       "-m",
       model,
       resolvedPrompt,
@@ -1058,7 +1068,7 @@ type MethodContext = {
  */
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.06.27.2",
+  version: "2026.07.09.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
