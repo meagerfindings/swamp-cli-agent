@@ -129,6 +129,9 @@ const ProviderInfoSchema = z.object({
   ),
 });
 
+/** Domain provider-catalog entry — derived from schema (IDIOM-1; no hand-dup). */
+export type ProviderInfo = z.infer<typeof ProviderInfoSchema>;
+
 /** Schema for the result of listing supported CLI providers. */
 const ProviderListSchema = z.object({
   providers: z.array(ProviderInfoSchema),
@@ -1195,13 +1198,6 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
   },
 };
 
-/** Registry snapshot for one provider (listProviders discovery). */
-export type ProviderInfo = {
-  id: Provider;
-  defaultModel?: string;
-  supportsListModels: boolean;
-};
-
 /**
  * List providers from the closed PROVIDERS registry (pure; no CLI).
  *
@@ -1469,7 +1465,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.11.6",
+  version: "2026.07.11.7",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
