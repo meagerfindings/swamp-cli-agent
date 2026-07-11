@@ -8,9 +8,14 @@
 
 import { assertEquals } from "jsr:@std/assert@1";
 import {
+  buildGrokCommand,
   extractError,
   extractTextFromOutput,
   extractUsage,
+  isProvider,
+  parseGrokModelsList,
+  PROVIDERS,
+  resolveModel,
 } from "./cli_agent.ts";
 
 // --- Fixtures ---------------------------------------------------------------
@@ -430,4 +435,193 @@ Deno.test("extractError: codex ignores item.completed error notices and clean ru
   assertEquals(extractError("codex", softNotice), null);
   // A clean run has no error.
   assertEquals(extractError("codex", CODEX_OUTPUT), null);
+});
+
+// --- Grok Build CLI ---------------------------------------------------------
+
+// Real headless streaming-json capture (trivial "reply with hi" prompt).
+const GROK_STREAM_OK = [
+  JSON.stringify({ type: "thought", data: "The user wants only hi." }),
+  JSON.stringify({ type: "text", data: "hi" }),
+  JSON.stringify({
+    type: "end",
+    stopReason: "EndTurn",
+    sessionId: "s_x",
+    requestId: "r_x",
+  }),
+].join("\n");
+
+// Multiple text chunks must concatenate.
+const GROK_STREAM_MULTI_TEXT = [
+  JSON.stringify({ type: "thought", data: "thinking" }),
+  JSON.stringify({ type: "text", data: "hel" }),
+  JSON.stringify({ type: "text", data: "lo" }),
+  JSON.stringify({ type: "end", stopReason: "EndTurn" }),
+].join("\n");
+
+// Exact real capture for an invalid model id (Grok exits 0 with this on stdout).
+const GROK_BAD_MODEL = JSON.stringify({
+  type: "error",
+  message:
+    "Couldn't set model 'totally-invalid-model-xyz': Invalid params: \"unknown model id\". Run 'grok models' to see available models.",
+});
+
+// Combined stream: stderr plain Error line + stdout JSON error (real dual-channel shape).
+const GROK_COMBINED_STDERR_PREFIX =
+  `Error: Couldn't set model 'totally-invalid-model-xyz': Invalid params: "unknown model id". Run 'grok models' to see available models.\n${GROK_BAD_MODEL}`;
+
+const GROK_RATE_LIMIT = JSON.stringify({
+  type: "error",
+  message: "Rate limit exceeded (429). Please retry later.",
+});
+
+// Real `grok models` stdout (trimmed to the listing section + noise headers).
+const GROK_MODELS_STDOUT = `You are logged in with grok.com.
+
+Default model: grok-4.5
+
+Available models:
+  * grok-4.5 (default)
+  - grok-composer-2.5-fast
+`;
+
+Deno.test("buildGrokCommand: exact argv contract, no stdin, no --no-auto-update", () => {
+  const { cmd, stdin } = buildGrokCommand(
+    "grok",
+    "grok-4.5",
+    "Reply with only: hi",
+  );
+  assertEquals(cmd, [
+    "grok",
+    "-p",
+    "Reply with only: hi",
+    "-m",
+    "grok-4.5",
+    "--output-format",
+    "streaming-json",
+    "--always-approve",
+    "--permission-mode",
+    "bypassPermissions",
+  ]);
+  assertEquals(stdin, undefined);
+  assertEquals(cmd.includes("--no-auto-update"), false);
+});
+
+Deno.test("extractTextFromOutput: grok joins type:text data chunks, ignores thought", () => {
+  assertEquals(extractTextFromOutput("grok", GROK_STREAM_OK), "hi");
+  assertEquals(extractTextFromOutput("grok", GROK_STREAM_MULTI_TEXT), "hello");
+});
+
+Deno.test("extractTextFromOutput: grok surfaces error message when no text", () => {
+  const text = extractTextFromOutput("grok", GROK_BAD_MODEL);
+  assertEquals(text.includes("unknown model id"), true);
+  assertEquals(text.startsWith("{"), false);
+});
+
+Deno.test("extractError: grok real bad-model capture is non-retryable", () => {
+  const err = extractError("grok", GROK_BAD_MODEL);
+  assertEquals(err !== null, true);
+  assertEquals(err?.retryable, false);
+  assertEquals(err?.message.includes("unknown model id"), true);
+});
+
+Deno.test("extractError: grok finds error after stderr Error: prefix (combined stream)", () => {
+  const err = extractError("grok", GROK_COMBINED_STDERR_PREFIX);
+  assertEquals(err !== null, true);
+  assertEquals(err?.retryable, false);
+  assertEquals(err?.message.includes("unknown model id"), true);
+});
+
+// CODE-1: stderr-only exit-0 failure (no JSON on stdout) must still be detected.
+const GROK_STDERR_ONLY =
+  `Error: Couldn't set model 'totally-invalid-model-xyz': Invalid params: "unknown model id". Run 'grok models' to see available models.`;
+
+Deno.test("extractError: grok detects plain Error: line with no JSON (stderr-only)", () => {
+  const err = extractError("grok", GROK_STDERR_ONLY);
+  assertEquals(err !== null, true);
+  assertEquals(err?.retryable, false);
+  assertEquals(err?.message.includes("unknown model id"), true);
+  // Message is the body after "Error: ", not the raw prefix alone.
+  assertEquals(err?.message.startsWith("Error:"), false);
+});
+
+Deno.test("extractTextFromOutput: grok surfaces plain Error: when no text chunks", () => {
+  const text = extractTextFromOutput("grok", GROK_STDERR_ONLY);
+  assertEquals(text.includes("unknown model id"), true);
+});
+
+Deno.test("extractError: grok rate-limit message is retryable", () => {
+  const err = extractError("grok", GROK_RATE_LIMIT);
+  assertEquals(err?.retryable, true);
+  assertEquals(err?.message.includes("Rate limit"), true);
+});
+
+Deno.test("extractError: grok clean stream is not an error", () => {
+  assertEquals(extractError("grok", GROK_STREAM_OK), null);
+});
+
+Deno.test("extractUsage: grok returns empty (no tokens/cost on headless stdout)", () => {
+  assertEquals(extractUsage("grok", GROK_STREAM_OK), {});
+  assertEquals(extractUsage("grok", GROK_BAD_MODEL), {});
+});
+
+Deno.test("parseGrokModelsList: strips bullets, (default), headers, blanks, unicode bullet", () => {
+  assertEquals(parseGrokModelsList(GROK_MODELS_STDOUT), [
+    "grok-4.5",
+    "grok-composer-2.5-fast",
+  ]);
+  assertEquals(parseGrokModelsList(""), []);
+  assertEquals(parseGrokModelsList("Available models:\n"), []);
+  assertEquals(
+    parseGrokModelsList("Available models:\n  • grok-4.5 (default)\n"),
+    ["grok-4.5"],
+  );
+});
+
+// --- Provider registry / model resolution (IDIOM-1, ARCH-1, ARCH-2) ---------
+
+Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→provider default", () => {
+  // Explicit always wins.
+  assertEquals(resolveModel("grok", "custom-id", "opus"), "custom-id");
+  assertEquals(resolveModel("claude", "sonnet", "opus"), "sonnet");
+  // Configured global default wins (CORR-2): user set defaultModel=sonnet.
+  assertEquals(resolveModel("claude", undefined, "sonnet"), "sonnet");
+  // Configured Grok model wins over registry default.
+  assertEquals(resolveModel("grok", undefined, "grok-4.6"), "grok-4.6");
+  // Unconfigured Claude schema default + non-Claude provider → provider default (ARCH-2).
+  assertEquals(resolveModel("grok", undefined, "opus"), "grok-4.5");
+  assertEquals(resolveModel("grok", "", "opus"), "grok-4.5");
+  // Claude with schema default stays opus.
+  assertEquals(resolveModel("claude", undefined, "opus"), "opus");
+  // Provider without registry default uses global as-is.
+  assertEquals(resolveModel("codex", undefined, "gpt-5.5"), "gpt-5.5");
+});
+
+Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on adapters", () => {
+  const keys = Object.keys(PROVIDERS).sort();
+  assertEquals(keys, [
+    "amp",
+    "claude",
+    "codex",
+    "gemini",
+    "grok",
+    "opencode",
+  ]);
+  assertEquals(PROVIDERS.grok.combineStreams, true);
+  assertEquals(PROVIDERS.claude.combineStreams, false);
+  assertEquals(typeof PROVIDERS.grok.parseModelsList, "function");
+  assertEquals(typeof PROVIDERS.opencode.parseModelsList, "function");
+  assertEquals(PROVIDERS.claude.parseModelsList, undefined);
+  assertEquals(PROVIDERS.grok.defaultModel, "grok-4.5");
+  // Adapter extractors match free functions (ARCH-1).
+  assertEquals(
+    PROVIDERS.grok.extractText(GROK_STREAM_OK),
+    extractTextFromOutput("grok", GROK_STREAM_OK),
+  );
+  assertEquals(
+    PROVIDERS.grok.extractError(GROK_BAD_MODEL)?.message,
+    extractError("grok", GROK_BAD_MODEL)?.message,
+  );
+  assertEquals(isProvider("grok"), true);
+  assertEquals(isProvider("not-a-provider"), false);
 });

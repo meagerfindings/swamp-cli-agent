@@ -1,11 +1,11 @@
 /**
  * Multi-provider CLI agent invoker for swamp.
  *
- * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex) with typed
- * inputs, captures structured outputs including token counts, cost, duration,
- * exit code, and automatic retries on transient failures. Supports slash
- * command resolution from a configurable commands directory and optional JSON
- * response parsing.
+ * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex, grok) with
+ * typed inputs, captures structured outputs including token counts, cost,
+ * duration, exit code, and automatic retries on transient failures. Supports
+ * slash command resolution from a configurable commands directory and optional
+ * JSON response parsing.
  *
  * @module
  */
@@ -24,11 +24,26 @@ const ProviderEnum = z.enum([
   "amp",
   "gemini",
   "codex",
+  "grok",
 ]);
+
+/**
+ * Domain provider id — derived from the schema (IDIOM-1). Do not hand-duplicate
+ * the string union; adding a ProviderEnum member updates this automatically.
+ */
+type Provider = z.infer<typeof ProviderEnum>;
+
+/** True when `p` is a known ProviderEnum member. */
+export function isProvider(p: string): p is Provider {
+  return ProviderEnum.safeParse(p).success;
+}
 
 /** Global configuration arguments shared across all method invocations. */
 const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
+  // Fallback when a provider has no entry-level default in PROVIDERS.
+  // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
+  // (ARCH-2: avoids defaultProvider=grok silently using Claude's "opus").
   defaultModel: z.string().default("opus"),
   commandsDir: z.string().default(".claude/commands"),
   commandSubdirs: z.array(z.string()).default([]).describe(
@@ -39,10 +54,13 @@ const GlobalArgsSchema = z.object({
   ampPath: z.string().default("amp"),
   geminiPath: z.string().default("gemini"),
   codexPath: z.string().default("codex"),
+  grokPath: z.string().default("grok"),
   idleTimeoutMs: z.number().default(600_000),
   wallTimeoutMs: z.number().default(3_600_000),
   maxRetries: z.number().default(2),
 });
+
+type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
 /** Schema for a structured invocation record persisted as a swamp resource. */
 const InvocationSchema = z.object({
@@ -216,11 +234,6 @@ async function runCli(
   });
 
   const child = command.spawn();
-  if (opts.stdin && child.stdin) {
-    const writer = child.stdin.getWriter();
-    await writer.write(new TextEncoder().encode(opts.stdin));
-    await writer.close();
-  }
 
   let lastOutputAt = performance.now();
   let timeoutReason: string | undefined;
@@ -268,6 +281,10 @@ async function runCli(
       }
     } catch { /* stream cancelled on kill */ }
   };
+
+  // CORR-4: start drains + watchdog BEFORE writing stdin. Writing a large
+  // prompt while the child already emits on stdout/stderr can fill the OS pipe
+  // buffers and deadlock if nobody is reading yet.
   const drains = Promise.all([
     drain(child.stdout, chunks),
     drain(child.stderr, errChunks),
@@ -293,6 +310,12 @@ async function runCli(
       }
     }
   })();
+
+  if (opts.stdin && child.stdin) {
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode(opts.stdin));
+    await writer.close();
+  }
 
   // child.status resolves when the DIRECT child exits, even if grandchildren
   // survive. On a normal exit the pipes close and the drains EOF on their own;
@@ -436,81 +459,174 @@ function buildCodexCommand(
 }
 
 /**
- * Extract human-readable text from a provider's raw CLI output, handling
- * provider-specific JSON streaming formats.
+ * Build the command array for the xAI Grok Build CLI.
+ *
+ * Headless mode (`-p` / `--single`) prints to stdout and exits. We use
+ * `--output-format streaming-json` so the idle-timeout watchdog sees progress
+ * during long tool runs (a single end-of-run `json` blob would look idle).
+ * `--always-approve` + `--permission-mode bypassPermissions` mirror other
+ * providers' non-interactive permission bypasses — only point this at trusted
+ * working directories.
+ *
+ * Always pass `-m`: callers using Grok must set `model` / `defaultModel` to a
+ * Grok id (e.g. `grok-4.5`). Do not pass Claude defaults like `opus`.
+ *
+ * Exported for unit tests that assert the exact argv contract.
  */
+export function buildGrokCommand(
+  cliPath: string,
+  model: string,
+  resolvedPrompt: string,
+): { cmd: string[]; stdin?: string } {
+  return {
+    cmd: [
+      cliPath,
+      "-p",
+      resolvedPrompt,
+      "-m",
+      model,
+      "--output-format",
+      "streaming-json",
+      "--always-approve",
+      "--permission-mode",
+      "bypassPermissions",
+    ],
+  };
+}
+
+/**
+ * Parse `grok models` human-readable stdout into bare model ids.
+ *
+ * Real capture shape:
+ * ```
+ * You are logged in with grok.com.
+ * Default model: grok-4.5
+ * Available models:
+ *   * grok-4.5 (default)
+ *   - grok-composer-2.5-fast
+ * ```
+ * Strips bullets (`*` / `-`), optional `(default)` suffix, headers, and blanks.
+ */
+/**
+ * Parse `grok models` human-readable stdout into bare model ids.
+ *
+ * Strips bullets (`*` / `-` / `•`), optional `(default)` suffix, headers, and
+ * blanks. Returns `[]` only when no bullet lines are present — callers that
+ * need to distinguish format drift from an empty catalog should check whether
+ * stdout looked non-empty (see listModels / CORR-5).
+ */
+export function parseGrokModelsList(stdout: string): string[] {
+  const models: string[] = [];
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    // Bullet lines: `* id (default)`, `- id`, or `• id` (unicode bullet).
+    const m = line.match(/^[*\-\u2022]\s+(\S+)/);
+    if (!m) continue;
+    let id = m[1];
+    // Drop a trailing `(default)` glued without space (defensive); the capture
+    // has a space before `(default)` so `\S+` already excludes it.
+    id = id.replace(/\(default\)$/i, "").replace(/,$/, "");
+    if (id) models.push(id);
+  }
+  return models;
+}
+
+function assertNever(x: never): never {
+  throw new Error(`unexpected provider: ${String(x)}`);
+}
+
+/**
+ * Provider-typed text extraction (wire shapes). Called only via PROVIDERS
+ * adapter methods so call sites never switch on provider strings (ARCH-1).
+ */
+function extractTextImpl(provider: Provider, rawOutput: string): string {
+  switch (provider) {
+    case "claude": {
+      for (const line of rawOutput.split("\n").reverse()) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "result") return event.result || rawOutput;
+        } catch { /* not JSON */ }
+      }
+      return rawOutput;
+    }
+    case "opencode": {
+      const parts: string[] = [];
+      for (const line of rawOutput.split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "text") {
+            const text = event.part?.text || event.part?.content;
+            if (text) parts.push(text);
+          }
+        } catch { /* skip */ }
+      }
+      if (parts.length > 0) return parts.join("");
+      const err = extractErrorImpl(provider, rawOutput);
+      return err ? err.message : rawOutput;
+    }
+    case "amp": {
+      for (const line of rawOutput.split("\n").reverse()) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "result") return event.result || rawOutput;
+        } catch { /* not JSON */ }
+      }
+      return rawOutput;
+    }
+    case "gemini": {
+      try {
+        const data = JSON.parse(rawOutput);
+        return data.response || rawOutput;
+      } catch {
+        return rawOutput;
+      }
+    }
+    case "codex": {
+      let text: string | undefined;
+      for (const line of rawOutput.split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (
+            event.type === "item.completed" &&
+            event.item?.type === "agent_message" &&
+            typeof event.item?.text === "string"
+          ) {
+            text = event.item.text;
+          }
+        } catch { /* not JSON */ }
+      }
+      if (text !== undefined) return text;
+      const err = extractErrorImpl(provider, rawOutput);
+      return err ? err.message : rawOutput;
+    }
+    case "grok": {
+      const parts: string[] = [];
+      for (const line of rawOutput.split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "text" && typeof event.data === "string") {
+            parts.push(event.data);
+          }
+        } catch { /* not JSON */ }
+      }
+      if (parts.length > 0) return parts.join("");
+      const err = extractErrorImpl(provider, rawOutput);
+      return err ? err.message : rawOutput;
+    }
+    default:
+      return assertNever(provider);
+  }
+}
+
+/** Public extractor — dispatches through the closed PROVIDERS adapter. */
 export function extractTextFromOutput(
   provider: string,
   rawOutput: string,
 ): string {
-  if (provider === "claude") {
-    for (const line of rawOutput.split("\n").reverse()) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "result") return event.result || rawOutput;
-      } catch { /* not JSON */ }
-    }
-    return rawOutput;
-  }
-  if (provider === "opencode") {
-    const parts: string[] = [];
-    for (const line of rawOutput.split("\n")) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "text") {
-          const text = event.part?.text || event.part?.content;
-          if (text) parts.push(text);
-        }
-      } catch { /* skip */ }
-    }
-    if (parts.length > 0) return parts.join("");
-    // No assistant text — surface the structured error message if there is one
-    // (e.g. a quota/rate-limit `type:"error"` event) rather than the raw JSON.
-    const err = extractError(provider, rawOutput);
-    return err ? err.message : rawOutput;
-  }
-  if (provider === "amp") {
-    // Amp's stream JSON mirrors Claude's: the terminal `result` event carries
-    // the final assistant text in a `result` field.
-    for (const line of rawOutput.split("\n").reverse()) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "result") return event.result || rawOutput;
-      } catch { /* not JSON */ }
-    }
-    return rawOutput;
-  }
-  if (provider === "gemini") {
-    try {
-      const data = JSON.parse(rawOutput);
-      return data.response || rawOutput;
-    } catch {
-      return rawOutput;
-    }
-  }
-  if (provider === "codex") {
-    // codex exec --json emits JSONL; the answer is the LAST item.completed
-    // event whose item is an `agent_message`. Forward-scan and keep the last.
-    let text: string | undefined;
-    for (const line of rawOutput.split("\n")) {
-      try {
-        const event = JSON.parse(line);
-        if (
-          event.type === "item.completed" &&
-          event.item?.type === "agent_message" &&
-          typeof event.item?.text === "string"
-        ) {
-          text = event.item.text;
-        }
-      } catch { /* not JSON */ }
-    }
-    if (text !== undefined) return text;
-    // No agent message — surface the error message if codex reported one
-    // (e.g. a bad model id), rather than the raw JSONL blob. Mirrors opencode.
-    const err = extractError(provider, rawOutput);
-    return err ? err.message : rawOutput;
-  }
-  return rawOutput;
+  if (!isProvider(provider)) return rawOutput;
+  return PROVIDERS[provider].extractText(rawOutput);
 }
 
 /** A provider-reported API/agent error surfaced in the CLI's output stream. */
@@ -560,11 +676,29 @@ function looksRateLimited(message: string, code?: string | number): boolean {
  *   a nested JSON blob (`{status, error:{message}}`) which is unwrapped. A
  *   soft `{type:"item.completed", item:{type:"error"}}` notice (e.g. fallback
  *   model metadata) is NOT a failure and is ignored.
+ * - `grok`: a `{type:"error", message}` event (JSONL streaming-json or a
+ *   single JSON document). Grok often exits 0 on failure and may mirror a
+ *   plain-text Error line on stderr; callers pass combined stdout+stderr so
+ *   either channel is seen. Unknown-model messages are non-retryable.
  */
-export function extractError(
-  provider: string,
+function extractErrorImpl(
+  provider: Provider,
   rawOutput: string,
 ): ProviderError | null {
+  // Exhaustiveness gate (IDIOM-2): a new ProviderEnum member fails compile here
+  // until a branch below handles it (or this switch is updated).
+  switch (provider) {
+    case "claude":
+    case "opencode":
+    case "amp":
+    case "gemini":
+    case "codex":
+    case "grok":
+      break;
+    default:
+      return assertNever(provider);
+  }
+
   if (provider === "opencode") {
     for (const line of rawOutput.split("\n")) {
       try {
@@ -659,7 +793,74 @@ export function extractError(
     return null;
   }
 
-  return null;
+  if (provider === "grok") {
+    // Grok frequently exits 0 on failure. Errors appear as:
+    // 1) JSON `{type:"error", message}` on stdout (streaming-json / json), and/or
+    // 2) a plain `Error: …` line on stderr.
+    // Callers pass combined stdout+stderr. Prefer structured JSON when present;
+    // fall back to plain Error: lines so stderr-only exit-0 cases cannot
+    // silent-succeed (CODE-1).
+    const tryParseJson = (s: string): ProviderError | null => {
+      try {
+        const event = JSON.parse(s);
+        if (event.type !== "error") return null;
+        const message: string = typeof event.message === "string"
+          ? event.message
+          : "grok reported an error";
+        return {
+          message,
+          code: undefined,
+          // unknown model id / invalid params are permanent; rate limits retry.
+          retryable: looksRateLimited(message),
+        };
+      } catch {
+        return null;
+      }
+    };
+    const tryPlainError = (line: string): ProviderError | null => {
+      const trimmed = line.trim();
+      // Match `Error: …` (Grok CLI) and `error: …` variants; require a body.
+      const m = trimmed.match(/^error:\s+(.+)$/i);
+      if (!m) return null;
+      const message = m[1].trim();
+      if (!message) return null;
+      return {
+        message,
+        code: undefined,
+        retryable: looksRateLimited(message),
+      };
+    };
+    for (const line of rawOutput.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("{")) {
+        const err = tryParseJson(trimmed);
+        if (err) return err;
+      }
+    }
+    // Single-document fallback (non-streaming json format).
+    const whole = tryParseJson(rawOutput.trim());
+    if (whole) return whole;
+    // Plain-text stderr-only path (after JSON scan so JSON wins when both exist).
+    for (const line of rawOutput.split("\n")) {
+      const err = tryPlainError(line);
+      if (err) return err;
+    }
+    return null;
+  }
+
+  // Unreachable when the exhaustiveness switch above is complete.
+  return assertNever(provider);
+}
+
+
+/** Public error extractor — dispatches through PROVIDERS. */
+export function extractError(
+  provider: string,
+  rawOutput: string,
+): ProviderError | null {
+  if (!isProvider(provider)) return null;
+  return PROVIDERS[provider].extractError(rawOutput);
 }
 
 /** Token and cost usage data extracted from provider output. */
@@ -696,8 +897,23 @@ export interface UsageData {
  *   (`input_tokens`, `cached_input_tokens`, `output_tokens`,
  *   `reasoning_output_tokens`). No cost. Cached input folds into `input` like
  *   the other providers.
+ * - `grok`: headless streaming-json / json currently emit no token or cost
+ *   fields on stdout. Return {}. Do not scrape `~/.grok/sessions`.
  */
-export function extractUsage(provider: string, rawOutput: string): UsageData {
+function extractUsageImpl(provider: Provider, rawOutput: string): UsageData {
+  // Exhaustiveness gate (IDIOM-2) — see extractErrorImpl.
+  switch (provider) {
+    case "claude":
+    case "opencode":
+    case "amp":
+    case "gemini":
+    case "codex":
+    case "grok":
+      break;
+    default:
+      return assertNever(provider);
+  }
+
   if (provider === "claude") {
     for (const line of rawOutput.split("\n").reverse()) {
       try {
@@ -862,11 +1078,20 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
     };
   }
 
-  return {};
+  if (provider === "grok") {
+    // Headless stdout has no usage/cost fields today.
+    return {};
+  }
+
+  return assertNever(provider);
 }
 
-/** The supported provider names as a string-literal union. */
-type Provider = "claude" | "opencode" | "amp" | "gemini" | "codex";
+
+/** Public usage extractor — dispatches through PROVIDERS. */
+export function extractUsage(provider: string, rawOutput: string): UsageData {
+  if (!isProvider(provider)) return {};
+  return PROVIDERS[provider].extractUsage(rawOutput);
+}
 
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
@@ -875,31 +1100,136 @@ type CommandBuilder = (
   resolvedPrompt: string,
 ) => { cmd: string[]; stdin?: string };
 
-/** Provider CLI path lookup, keyed by provider name. */
-function cliPathFor(
+/**
+ * Closed per-provider capability record (ARCH-1 / IDIOM-1).
+ *
+ * Adding a provider means extending ProviderEnum **and** this registry (and the
+ * pure extract* cases that each adapter method calls) — TypeScript exhaustiveness
+ * on the extract switches forces wire-shape handlers to stay in sync.
+ */
+type ProviderCapabilities = {
+  buildCommand: CommandBuilder;
+  cliPath: (g: GlobalArgs) => string;
+  /**
+   * Suggested model when the global default is still the unconfigured Claude
+   * schema default (`opus`) and this provider is not Claude (see resolveModel).
+   */
+  defaultModel?: string;
+  /**
+   * When true, extractError / extractText see stdout+stderr combined so
+   * stderr-only exit-0 failures cannot silent-succeed (Grok).
+   */
+  combineStreams: boolean;
+  /**
+   * When set, listModels is supported: run `<cliPath> models` and parse stdout.
+   * Absent → listModels rejects that provider.
+   */
+  parseModelsList?: (stdout: string) => string[];
+  extractText: (raw: string) => string;
+  extractError: (raw: string) => ProviderError | null;
+  extractUsage: (raw: string) => UsageData;
+};
+
+/**
+ * Schema-level default for `defaultModel` on GlobalArgsSchema (Claude-first
+ * installs). Used by resolveModel to detect "user never set a model default".
+ */
+export const CLAUDE_SCHEMA_DEFAULT_MODEL = "opus";
+
+/** Exhaustive provider registry — TypeScript errors if a Provider is missing. */
+export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
+  claude: {
+    buildCommand: buildClaudeCommand,
+    cliPath: (g) => g.claudePath,
+    defaultModel: "opus",
+    combineStreams: false,
+    extractText: (raw) => extractTextImpl("claude", raw),
+    extractError: (raw) => extractErrorImpl("claude", raw),
+    extractUsage: (raw) => extractUsageImpl("claude", raw),
+  },
+  opencode: {
+    buildCommand: buildOpencodeCommand,
+    cliPath: (g) => g.opencodePath,
+    combineStreams: false,
+    parseModelsList: (stdout) =>
+      stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0),
+    extractText: (raw) => extractTextImpl("opencode", raw),
+    extractError: (raw) => extractErrorImpl("opencode", raw),
+    extractUsage: (raw) => extractUsageImpl("opencode", raw),
+  },
+  amp: {
+    buildCommand: buildAmpCommand,
+    cliPath: (g) => g.ampPath,
+    combineStreams: false,
+    extractText: (raw) => extractTextImpl("amp", raw),
+    extractError: (raw) => extractErrorImpl("amp", raw),
+    extractUsage: (raw) => extractUsageImpl("amp", raw),
+  },
+  gemini: {
+    buildCommand: buildGeminiCommand,
+    cliPath: (g) => g.geminiPath,
+    combineStreams: false,
+    extractText: (raw) => extractTextImpl("gemini", raw),
+    extractError: (raw) => extractErrorImpl("gemini", raw),
+    extractUsage: (raw) => extractUsageImpl("gemini", raw),
+  },
+  codex: {
+    buildCommand: buildCodexCommand,
+    cliPath: (g) => g.codexPath,
+    combineStreams: false,
+    extractText: (raw) => extractTextImpl("codex", raw),
+    extractError: (raw) => extractErrorImpl("codex", raw),
+    extractUsage: (raw) => extractUsageImpl("codex", raw),
+  },
+  grok: {
+    buildCommand: buildGrokCommand,
+    cliPath: (g) => g.grokPath,
+    defaultModel: "grok-4.5",
+    combineStreams: true,
+    parseModelsList: parseGrokModelsList,
+    extractText: (raw) => extractTextImpl("grok", raw),
+    extractError: (raw) => extractErrorImpl("grok", raw),
+    extractUsage: (raw) => extractUsageImpl("grok", raw),
+  },
+};
+
+/**
+ * Resolve the model id for an invocation (ARCH-2 + CORR-2).
+ *
+ * Priority:
+ * 1. explicit method arg
+ * 2. configured global `defaultModel` (user/instance config always wins when set
+ *    to something other than the unconfigured Claude schema default)
+ * 3. provider registry default — only when global is still `"opus"` and the
+ *    active provider is not Claude (so `defaultProvider: grok` does not
+ *    silently run Claude's model)
+ */
+export function resolveModel(
   provider: Provider,
-  g: z.infer<typeof GlobalArgsSchema>,
+  explicit: string | undefined,
+  globalDefault: string,
 ): string {
-  const paths: Record<Provider, string> = {
-    claude: g.claudePath,
-    opencode: g.opencodePath,
-    amp: g.ampPath,
-    gemini: g.geminiPath,
-    codex: g.codexPath,
-  };
-  return paths[provider];
+  if (explicit !== undefined && explicit !== "") return explicit;
+  const providerDefault = PROVIDERS[provider].defaultModel;
+  if (
+    provider !== "claude" &&
+    globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL &&
+    providerDefault
+  ) {
+    return providerDefault;
+  }
+  return globalDefault;
 }
 
-/** Command-builder lookup, keyed by provider name. */
+function cliPathFor(provider: Provider, g: GlobalArgs): string {
+  return PROVIDERS[provider].cliPath(g);
+}
+
 function builderFor(provider: Provider): CommandBuilder {
-  const builders: Record<Provider, CommandBuilder> = {
-    claude: buildClaudeCommand,
-    opencode: buildOpencodeCommand,
-    amp: buildAmpCommand,
-    gemini: buildGeminiCommand,
-    codex: buildCodexCommand,
-  };
-  return builders[provider];
+  return PROVIDERS[provider].buildCommand;
 }
 
 /** The fully-resolved outcome of running a provider CLI (with retries). */
@@ -940,7 +1270,8 @@ async function runWithRetries(
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
-  const buildCommand = builderFor(provider);
+  const caps = PROVIDERS[provider];
+  const buildCommand = caps.buildCommand;
   let lastResult: CmdResult | undefined;
   let providerError: ProviderError | null = null;
   let retries = 0;
@@ -953,7 +1284,13 @@ async function runWithRetries(
       wallTimeoutMs: opts.wallTimeoutMs,
       idleTimeoutMs: opts.idleTimeoutMs,
     });
-    providerError = extractError(provider, lastResult.stdout);
+    // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
+    // cannot silent-succeed. Policy lives on the provider registry (ARCH-1).
+    const errorSource = caps.combineStreams
+      ? [lastResult.stdout, lastResult.stderr].filter(Boolean).join("\n")
+      : lastResult.stdout;
+    // Dispatch via adapter methods (ARCH-1 closed capability record).
+    providerError = caps.extractError(errorSource);
 
     const transientExit = !lastResult.success &&
       TRANSIENT_EXIT_CODES.has(lastResult.code);
@@ -978,8 +1315,16 @@ async function runWithRetries(
   }
 
   const result = lastResult!;
-  const extractedText = extractTextFromOutput(provider, result.stdout);
-  const usage = extractUsage(provider, result.stdout);
+  const textSource = caps.combineStreams
+    ? [result.stdout, result.stderr].filter(Boolean).join("\n")
+    : result.stdout;
+  let extractedText = caps.extractText(textSource);
+  // When a provider error was detected but extractors left an empty preview,
+  // surface the human message for transcripts/outputPreview.
+  if (providerError && !extractedText.trim()) {
+    extractedText = providerError.message;
+  }
+  const usage = caps.extractUsage(result.stdout);
   const ok = result.success && providerError === null;
 
   return { result, retries, providerError, extractedText, usage, ok };
@@ -1066,9 +1411,38 @@ type MethodContext = {
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
  * - `listModels` — enumerate the models available to a provider's CLI
  */
+/** Shared invoke / invokeAndParse argument schema (IDIOM-1: single source). */
+const InvokeArgsSchema = z.object({
+  prompt: z.string().describe("The prompt or slash command to execute"),
+  provider: ProviderEnum.optional().describe(
+    "Override the default provider",
+  ),
+  model: z.string().optional().describe(
+    "Override the default model (e.g. 'opus', 'sonnet', 'grok-4.5'). " +
+      "When omitted, uses the provider's defaultModel from PROVIDERS, then global defaultModel.",
+  ),
+  cwd: z.string().optional().describe(
+    "Working directory for the CLI (defaults to Deno.cwd())",
+  ),
+  tags: z.record(z.string(), z.string()).optional().describe(
+    "Arbitrary key-value tags for grouping/filtering invocations",
+  ),
+  wallTimeoutMs: z.number().optional().describe(
+    "Override wall timeout in milliseconds",
+  ),
+});
+type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
+
+const ListModelsArgsSchema = z.object({
+  provider: ProviderEnum.optional().describe(
+    "Provider to enumerate (defaults to the configured defaultProvider)",
+  ),
+});
+type ListModelsArgs = z.infer<typeof ListModelsArgsSchema>;
+
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.09.1",
+  version: "2026.07.11.5",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -1095,39 +1469,18 @@ export const model = {
   methods: {
     invoke: {
       description:
-        "Run a CLI agent tool (claude, opencode, amp, gemini, codex) with a prompt and record structured results",
-      arguments: z.object({
-        prompt: z.string().describe("The prompt or slash command to execute"),
-        provider: ProviderEnum.optional().describe(
-          "Override the default provider",
-        ),
-        model: z.string().optional().describe(
-          "Override the default model (e.g. 'opus', 'sonnet', 'ollama/qwen3.6:35b')",
-        ),
-        cwd: z.string().optional().describe(
-          "Working directory for the CLI (defaults to Deno.cwd())",
-        ),
-        tags: z.record(z.string(), z.string()).optional().describe(
-          "Arbitrary key-value tags for grouping/filtering invocations",
-        ),
-        wallTimeoutMs: z.number().optional().describe(
-          "Override wall timeout in milliseconds",
-        ),
-      }),
+        "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok) with a prompt and record structured results",
+      arguments: InvokeArgsSchema,
       execute: async (
-        args: {
-          prompt: string;
-          provider?: string;
-          model?: string;
-          cwd?: string;
-          tags?: Record<string, string>;
-          wallTimeoutMs?: number;
-        },
+        args: InvokeArgs,
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
-        const provider =
-          (args.provider || context.globalArgs.defaultProvider) as Provider;
-        const modelName = args.model || context.globalArgs.defaultModel;
+        const provider = args.provider ?? context.globalArgs.defaultProvider;
+        const modelName = resolveModel(
+          provider,
+          args.model,
+          context.globalArgs.defaultModel,
+        );
         const cwd = args.cwd || Deno.cwd();
         const wallTimeoutMs = args.wallTimeoutMs ||
           context.globalArgs.wallTimeoutMs;
@@ -1230,28 +1583,17 @@ export const model = {
     invokeAndParse: {
       description:
         "Run a CLI agent and parse the JSON response from the output. Returns the parsed data alongside the invocation record.",
-      arguments: z.object({
-        prompt: z.string(),
-        provider: ProviderEnum.optional(),
-        model: z.string().optional(),
-        cwd: z.string().optional(),
-        tags: z.record(z.string(), z.string()).optional(),
-        wallTimeoutMs: z.number().optional(),
-      }),
+      arguments: InvokeArgsSchema,
       execute: async (
-        args: {
-          prompt: string;
-          provider?: string;
-          model?: string;
-          cwd?: string;
-          tags?: Record<string, string>;
-          wallTimeoutMs?: number;
-        },
+        args: InvokeArgs,
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
-        const provider =
-          (args.provider || context.globalArgs.defaultProvider) as Provider;
-        const modelName = args.model || context.globalArgs.defaultModel;
+        const provider = args.provider ?? context.globalArgs.defaultProvider;
+        const modelName = resolveModel(
+          provider,
+          args.model,
+          context.globalArgs.defaultModel,
+        );
         const cwd = args.cwd || Deno.cwd();
         const wallTimeoutMs = args.wallTimeoutMs ||
           context.globalArgs.wallTimeoutMs;
@@ -1360,41 +1702,59 @@ export const model = {
 
     listModels: {
       description:
-        "List the model identifiers available to a provider's CLI (currently opencode only)",
-      arguments: z.object({
-        provider: ProviderEnum.optional().describe(
-          "Provider to enumerate (defaults to the configured defaultProvider)",
-        ),
-      }),
+        "List the model identifiers available to a provider's CLI (any provider with parseModelsList in PROVIDERS — currently opencode and grok)",
+      arguments: ListModelsArgsSchema,
       execute: async (
-        args: { provider?: string },
+        args: ListModelsArgs,
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
-        const provider =
-          (args.provider || context.globalArgs.defaultProvider) as Provider;
-
-        if (provider !== "opencode") {
+        const provider = args.provider ?? context.globalArgs.defaultProvider;
+        const caps = PROVIDERS[provider];
+        if (!caps.parseModelsList) {
           throw new Error(
-            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command. Use provider 'opencode'.`,
+            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command (no parseModelsList in PROVIDERS). Use a provider that declares one (e.g. opencode, grok).`,
           );
         }
 
+        const cliPath = caps.cliPath(context.globalArgs);
         const result = await runCli(
-          [context.globalArgs.opencodePath, "models"],
+          [cliPath, "models"],
           { wallTimeoutMs: 60_000 },
         );
         if (!result.success) {
           throw new Error(
-            `opencode models failed (exit ${result.code}): ${
+            `${provider} models failed (exit ${result.code}): ${
               result.stderr.slice(0, 200)
             }`,
           );
         }
 
-        const models = result.stdout
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0);
+        // Same exit-0 provider-error class as invoke (CORR-3): do not treat an
+        // empty/error stream as a successful empty catalog.
+        const errSource = caps.combineStreams
+          ? [result.stdout, result.stderr].filter(Boolean).join("\n")
+          : result.stdout;
+        const providerError = caps.extractError(errSource);
+        if (providerError) {
+          throw new Error(
+            `${provider} models provider error: ${
+              providerError.message.slice(0, 300)
+            }`,
+          );
+        }
+
+        const models = caps.parseModelsList(result.stdout);
+        // CORR-5: non-empty stdout with zero parsed ids is format drift / failure,
+        // not a legitimate empty catalog — fail loud instead of persisting [].
+        const stdoutLooksSubstantial = result.stdout.trim().length > 0 &&
+          /model/i.test(result.stdout);
+        if (models.length === 0 && stdoutLooksSubstantial) {
+          throw new Error(
+            `${provider} models produced no parseable model ids (stdout may have changed format). First 200 chars: ${
+              result.stdout.trim().slice(0, 200)
+            }`,
+          );
+        }
 
         const handle = await context.writeResource(
           "modelList",
