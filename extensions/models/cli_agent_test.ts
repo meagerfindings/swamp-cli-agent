@@ -13,6 +13,7 @@ import {
   extractTextFromOutput,
   extractUsage,
   isProvider,
+  listProvidersFromRegistry,
   parseGrokModelsList,
   PROVIDERS,
   resolveModel,
@@ -367,7 +368,11 @@ Deno.test("extractError: opencode honors isRetryable:true for a genuine transien
     type: "error",
     error: {
       name: "APIError",
-      data: { message: "Too Many Requests", statusCode: 429, isRetryable: true },
+      data: {
+        message: "Too Many Requests",
+        statusCode: 429,
+        isRetryable: true,
+      },
     },
   });
   const err = extractError("opencode", transient);
@@ -646,4 +651,23 @@ Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on
   );
   assertEquals(isProvider("grok"), true);
   assertEquals(isProvider("not-a-provider"), false);
+});
+
+Deno.test("listProvidersFromRegistry: closed catalog with listModels capability flags", () => {
+  const listed = listProvidersFromRegistry();
+  assertEquals(
+    listed.map((p) => p.id),
+    ["amp", "claude", "codex", "gemini", "grok", "opencode"],
+  );
+  assertEquals(listed.length, Object.keys(PROVIDERS).length);
+
+  const byId = Object.fromEntries(listed.map((p) => [p.id, p]));
+  assertEquals(byId.claude.defaultModel, "opus");
+  assertEquals(byId.claude.supportsListModels, false);
+  assertEquals(byId.grok.defaultModel, "grok-4.5");
+  assertEquals(byId.grok.supportsListModels, true);
+  assertEquals(byId.opencode.supportsListModels, true);
+  assertEquals(byId.opencode.defaultModel, undefined);
+  assertEquals(byId.codex.supportsListModels, false);
+  assertEquals(byId.codex.defaultModel, undefined);
 });

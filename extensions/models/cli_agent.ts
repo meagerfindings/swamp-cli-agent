@@ -118,6 +118,24 @@ const ModelListSchema = z.object({
   listedAt: z.string(),
 });
 
+/** One entry in the closed PROVIDERS registry (for listProviders discovery). */
+const ProviderInfoSchema = z.object({
+  id: ProviderEnum,
+  defaultModel: z.string().optional().describe(
+    "Registry default model id when invoke omits model and global defaultModel is still the unconfigured Claude schema default",
+  ),
+  supportsListModels: z.boolean().describe(
+    "True when this provider's CLI can be enumerated via listModels",
+  ),
+});
+
+/** Schema for the result of listing supported CLI providers. */
+const ProviderListSchema = z.object({
+  providers: z.array(ProviderInfoSchema),
+  count: z.number(),
+  listedAt: z.string(),
+});
+
 /** Exit codes that indicate a transient failure eligible for retry. */
 const TRANSIENT_EXIT_CODES: Set<number> = new Set([137, 143]);
 
@@ -1177,6 +1195,35 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
   },
 };
 
+/** Registry snapshot for one provider (listProviders discovery). */
+export type ProviderInfo = {
+  id: Provider;
+  defaultModel?: string;
+  supportsListModels: boolean;
+};
+
+/**
+ * List providers from the closed PROVIDERS registry (pure; no CLI).
+ *
+ * Prefer this over scraping JSON Schema when agents or scripts need a typed
+ * catalog of what this installed extension version supports.
+ */
+export function listProvidersFromRegistry(): ProviderInfo[] {
+  return (Object.keys(PROVIDERS) as Provider[])
+    .sort()
+    .map((id) => {
+      const caps = PROVIDERS[id];
+      const info: ProviderInfo = {
+        id,
+        supportsListModels: caps.parseModelsList !== undefined,
+      };
+      if (caps.defaultModel !== undefined) {
+        info.defaultModel = caps.defaultModel;
+      }
+      return info;
+    });
+}
+
 /**
  * Resolve the model id for an invocation.
  *
@@ -1382,9 +1429,10 @@ type MethodContext = {
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
  *
- * Provides three methods:
+ * Provides four methods:
  * - `invoke` — run a CLI agent and record structured results
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
+ * - `listProviders` — list providers from the closed PROVIDERS registry
  * - `listModels` — enumerate the models available to a provider's CLI
  */
 /** Shared invoke / invokeAndParse argument schema (single source for both). */
@@ -1416,9 +1464,12 @@ const ListModelsArgsSchema = z.object({
 });
 type ListModelsArgs = z.infer<typeof ListModelsArgsSchema>;
 
+const ListProvidersArgsSchema = z.object({});
+type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
+
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.11.5",
+  version: "2026.07.11.6",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -1438,6 +1489,13 @@ export const model = {
     modelList: {
       description: "Models available to a provider's CLI",
       schema: ModelListSchema,
+      lifetime: "7d" as const,
+      garbageCollection: 5,
+    },
+    providerList: {
+      description:
+        "CLI providers supported by this extension version (from PROVIDERS registry)",
+      schema: ProviderListSchema,
       lifetime: "7d" as const,
       garbageCollection: 5,
     },
@@ -1676,9 +1734,36 @@ export const model = {
       },
     },
 
+    listProviders: {
+      description:
+        "List CLI providers supported by this extension (from the closed PROVIDERS registry). Pure — does not shell out. Use listModels to enumerate model ids for a provider that supports it.",
+      arguments: ListProvidersArgsSchema,
+      execute: async (
+        _args: ListProvidersArgs,
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const providers = listProvidersFromRegistry();
+        const handle = await context.writeResource(
+          "providerList",
+          "providers",
+          {
+            providers,
+            count: providers.length,
+            listedAt: new Date().toISOString(),
+          },
+        );
+
+        context.logger.info("{count} providers available", {
+          count: providers.length,
+        });
+
+        return { dataHandles: [handle] };
+      },
+    },
+
     listModels: {
       description:
-        "List the model identifiers available to a provider's CLI (any provider with parseModelsList in PROVIDERS — currently opencode and grok)",
+        "List the model identifiers available to a provider's CLI (any provider with parseModelsList in PROVIDERS — currently opencode and grok). Prefer listProviders to see which providers support enumeration.",
       arguments: ListModelsArgsSchema,
       execute: async (
         args: ListModelsArgs,
@@ -1688,7 +1773,7 @@ export const model = {
         const caps = PROVIDERS[provider];
         if (!caps.parseModelsList) {
           throw new Error(
-            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command (no parseModelsList in PROVIDERS). Use a provider that declares one (e.g. opencode, grok).`,
+            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command (no parseModelsList in PROVIDERS). Run listProviders to see which providers set supportsListModels, or use a provider that declares one (e.g. opencode, grok).`,
           );
         }
 

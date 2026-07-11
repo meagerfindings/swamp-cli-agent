@@ -99,11 +99,29 @@ swamp model method run my-agent invokeAndParse \
 
 Takes the same arguments as `invoke`.
 
+### `listProviders`
+
+List the CLI providers this **installed extension version** supports, with
+registry defaults and whether `listModels` can enumerate model ids. Pure — does
+not shell out. Results are persisted as a `providerList` resource named
+`providers`.
+
+```sh
+swamp model method run my-agent listProviders
+# → attributes.providers: [{ id, defaultModel?, supportsListModels }, ...]
+```
+
+Prefer this over hardcoding provider names in downstream docs or tooling. The
+JSON Schema enum on `defaultProvider` (`swamp model type describe
+@mgreten/cli-agent --json`) is equivalent for validation; this method is the
+typed runtime catalog.
+
 ### `listModels`
 
-List the model identifiers available to a provider's CLI. Supported for
-`opencode` and `grok` (other provider CLIs have no model-listing command).
-Results are persisted as a `modelList` resource named `models-<provider>`.
+List the model identifiers available to a provider's CLI. Only providers with
+`supportsListModels: true` from `listProviders` (currently `opencode` and
+`grok`) work — others have no model-listing CLI command. Results are persisted
+as a `modelList` resource named `models-<provider>`.
 
 ```sh
 swamp model method run my-agent listModels --input provider=opencode
