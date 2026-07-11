@@ -849,7 +849,6 @@ function extractErrorImpl(
   return assertNever(provider);
 }
 
-
 /** Public error extractor — dispatches through PROVIDERS. */
 export function extractError(
   provider: string,
@@ -1069,7 +1068,6 @@ function extractUsageImpl(provider: Provider, rawOutput: string): UsageData {
   return assertNever(provider);
 }
 
-
 /** Public usage extractor — dispatches through PROVIDERS. */
 export function extractUsage(provider: string, rawOutput: string): UsageData {
   if (!isProvider(provider)) return {};
@@ -1209,10 +1207,6 @@ export function resolveModel(
 
 function cliPathFor(provider: Provider, g: GlobalArgs): string {
   return PROVIDERS[provider].cliPath(g);
-}
-
-function builderFor(provider: Provider): CommandBuilder {
-  return PROVIDERS[provider].buildCommand;
 }
 
 /** The fully-resolved outcome of running a provider CLI (with retries). */
