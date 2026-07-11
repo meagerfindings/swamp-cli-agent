@@ -1,10 +1,11 @@
 manifestVersion: 1
 name: "@mgreten/cli-agent"
-version: "2026.07.09.1"
+version: "2026.07.11.5"
 description: >
-  Invoke CLI coding agents (claude, opencode, amp, gemini, codex) with typed
-  inputs and capture structured outputs — tokens, cost, duration, retries, and
-  exit code. Supports slash command resolution and JSON response parsing.
+  Invoke CLI coding agents (claude, opencode, amp, gemini, codex, grok) with
+  typed inputs and capture structured outputs — tokens, cost, duration,
+  retries, and exit code. Supports slash command resolution and JSON response
+  parsing.
 
 repository: https://github.com/meagerfindings/swamp-cli-agent
 

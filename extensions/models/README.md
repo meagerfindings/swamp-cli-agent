@@ -1,13 +1,12 @@
 # @mgreten/cli-agent
 
 A multi-provider CLI agent invoker for [swamp](https://swamp.club). Runs
-coding-agent CLI tools — Claude Code, OpenCode, Amp, Gemini CLI, or OpenAI
-Codex CLI — with typed inputs and captures structured outputs including token
-counts, estimated
-cost, wall-clock duration, exit codes, and automatic retries on transient
-failures. Every invocation is persisted as a swamp resource with a 30-day
-lifetime and automatic garbage collection, giving you a queryable history of
-all agent runs across providers.
+coding-agent CLI tools — Claude Code, OpenCode, Amp, Gemini CLI, OpenAI
+Codex CLI, or xAI Grok Build CLI — with typed inputs and captures structured
+outputs including token counts, estimated cost, wall-clock duration, exit
+codes, and automatic retries on transient failures. Every invocation is
+persisted as a swamp resource with a 30-day lifetime and automatic garbage
+collection, giving you a queryable history of all agent runs across providers.
 
 ## Installation
 
@@ -31,16 +30,34 @@ models:
   my-agent:
     type: "@mgreten/cli-agent"
     globalArgs:
-      defaultProvider: claude     # claude | opencode | amp | gemini | codex
-      defaultModel: opus          # model name passed to the CLI
+      defaultProvider: claude     # claude | opencode | amp | gemini | codex | grok
+      defaultModel: opus          # schema default (Claude-first); see model resolution below
       commandsDir: .claude/commands  # where slash commands live
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
       maxRetries: 2               # retry count for transient failures
 ```
 
-CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`)
-default to the bare binary name, relying on `$PATH` resolution. Override them
-if your binaries live in a non-standard location.
+CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
+`grokPath`) default to the bare binary name, relying on `$PATH` resolution.
+Override them if your binaries live in a non-standard location.
+
+**Auth:** each provider CLI must already be installed and authenticated on the
+host (this extension only shells out). For Grok Build: run `grok login` or set
+`XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
+env credentials.
+
+**Model resolution** when `invoke` omits `model`:
+
+1. explicit `model` argument, else  
+2. configured global `defaultModel`, else  
+3. only if global is still the unconfigured Claude schema default (`opus`) **and**
+   the provider is not Claude — the provider registry default (e.g. Grok →
+   `grok-4.5`)
+
+So a user who set `defaultModel: sonnet` always gets sonnet. A config with
+`defaultProvider: grok` and an untouched `defaultModel: opus` resolves to
+`grok-4.5` instead of silently calling Claude's model. Prefer setting
+`defaultModel` explicitly when you change `defaultProvider`.
 
 ## Methods
 
@@ -52,6 +69,10 @@ record captures everything needed for cost tracking and debugging.
 ```sh
 swamp model method run my-agent invoke \
   --args '{"prompt": "Explain this codebase", "provider": "claude", "model": "sonnet"}'
+
+# Grok Build CLI (requires grok on PATH + grok login / XAI_API_KEY)
+swamp model method run my-agent invoke \
+  --args '{"prompt": "Explain this codebase", "provider": "grok", "model": "grok-4.5"}'
 ```
 
 Arguments:
@@ -80,12 +101,13 @@ Takes the same arguments as `invoke`.
 
 ### `listModels`
 
-List the model identifiers available to a provider's CLI. Currently supported
-for `opencode` only (the other provider CLIs have no model-listing command).
+List the model identifiers available to a provider's CLI. Supported for
+`opencode` and `grok` (other provider CLIs have no model-listing command).
 Results are persisted as a `modelList` resource named `models-<provider>`.
 
 ```sh
 swamp model method run my-agent listModels --input provider=opencode
+swamp model method run my-agent listModels --input provider=grok
 ```
 
 Arguments:
@@ -103,24 +125,31 @@ Arguments:
 
 2. **Provider dispatch** — each provider has a dedicated command builder that
    maps the prompt and model to the correct CLI flags. Amp receives prompts
-   via stdin; others (including Codex, via `codex exec --json`) use positional
-   arguments. The interactive agents run with their permission-bypass flag
+   via stdin; others (including Codex via `codex exec --json`, and Grok via
+   `grok -p … --output-format streaming-json`) pass the prompt on the argv.
+   Interactive agents run with their permission-bypass flag
    (`--dangerously-skip-permissions` for Claude, `--dangerously-allow-all` for
-   Amp, `--yolo` for Gemini) since headless invocations cannot answer
-   interactive approval prompts — only point this extension at working
-   directories you trust it to modify.
+   Amp, `--yolo` for Gemini, `--always-approve` +
+   `--permission-mode bypassPermissions` for Grok) since headless invocations
+   cannot answer interactive approval prompts — only point this extension at
+   working directories you trust it to modify.
 
 3. **Retry logic** — transient failures (exit codes 137, 143 — typically
-   OOM-killed or SIGTERM) trigger automatic retries with exponential backoff.
+   OOM-killed or SIGTERM) and retryable provider errors (rate limits) trigger
+   automatic retries with exponential backoff. Grok often exits 0 on API
+   errors; error events are still detected in the output stream (stdout+stderr
+   combined for Grok).
 
 4. **Output extraction** — provider-specific parsers extract human-readable
    text from streaming JSON formats (Claude stream-json, OpenCode JSON lines,
-   Gemini JSON envelope, Codex JSONL `agent_message` items).
+   Gemini JSON envelope, Codex JSONL `agent_message` items, Grok
+   streaming-json `type:text` chunks).
 
 5. **Usage tracking** — token counts and cost are extracted from Claude's
    result events. Other providers return usage data as it becomes available
    in their output formats; Codex reports token usage (no cost) on its
-   terminal `turn.completed` event.
+   terminal `turn.completed` event. Grok headless output currently reports
+   neither tokens nor cost.
 
 ## Invocation Resource Schema
 
