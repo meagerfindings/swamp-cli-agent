@@ -532,7 +532,7 @@ Deno.test("extractError: grok finds error after stderr Error: prefix (combined s
   assertEquals(err?.message.includes("unknown model id"), true);
 });
 
-// CODE-1: stderr-only exit-0 failure (no JSON on stdout) must still be detected.
+// Stderr-only exit-0 failure (no JSON on stdout) must still be detected.
 const GROK_STDERR_ONLY =
   `Error: Couldn't set model 'totally-invalid-model-xyz': Invalid params: "unknown model id". Run 'grok models' to see available models.`;
 
@@ -560,6 +560,28 @@ Deno.test("extractError: grok clean stream is not an error", () => {
   assertEquals(extractError("grok", GROK_STREAM_OK), null);
 });
 
+// A successful run whose stderr carries benign noise matching `Error: …`
+// (update checks, telemetry) must NOT be reported as a provider failure —
+// the plain-text fallback only applies when the run produced no text chunks.
+const GROK_STREAM_OK_WITH_STDERR_NOISE =
+  `${GROK_STREAM_OK}\nError: failed to check for updates: connect ETIMEDOUT`;
+
+Deno.test("extractError: grok ignores stderr Error: noise when text chunks exist", () => {
+  assertEquals(extractError("grok", GROK_STREAM_OK_WITH_STDERR_NOISE), null);
+  assertEquals(
+    extractTextFromOutput("grok", GROK_STREAM_OK_WITH_STDERR_NOISE),
+    "hi",
+  );
+});
+
+Deno.test("extractError: grok JSON type:error wins even alongside text chunks", () => {
+  // Structured errors are authoritative regardless of extracted text.
+  const combined = `${GROK_STREAM_OK}\n${GROK_BAD_MODEL}`;
+  const err = extractError("grok", combined);
+  assertEquals(err !== null, true);
+  assertEquals(err?.message.includes("unknown model id"), true);
+});
+
 Deno.test("extractUsage: grok returns empty (no tokens/cost on headless stdout)", () => {
   assertEquals(extractUsage("grok", GROK_STREAM_OK), {});
   assertEquals(extractUsage("grok", GROK_BAD_MODEL), {});
@@ -578,17 +600,17 @@ Deno.test("parseGrokModelsList: strips bullets, (default), headers, blanks, unic
   );
 });
 
-// --- Provider registry / model resolution (IDIOM-1, ARCH-1, ARCH-2) ---------
+// --- Provider registry / model resolution -----------------------------------
 
 Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→provider default", () => {
   // Explicit always wins.
   assertEquals(resolveModel("grok", "custom-id", "opus"), "custom-id");
   assertEquals(resolveModel("claude", "sonnet", "opus"), "sonnet");
-  // Configured global default wins (CORR-2): user set defaultModel=sonnet.
+  // Configured global default wins: user set defaultModel=sonnet.
   assertEquals(resolveModel("claude", undefined, "sonnet"), "sonnet");
   // Configured Grok model wins over registry default.
   assertEquals(resolveModel("grok", undefined, "grok-4.6"), "grok-4.6");
-  // Unconfigured Claude schema default + non-Claude provider → provider default (ARCH-2).
+  // Unconfigured Claude schema default + non-Claude provider → provider default.
   assertEquals(resolveModel("grok", undefined, "opus"), "grok-4.5");
   assertEquals(resolveModel("grok", "", "opus"), "grok-4.5");
   // Claude with schema default stays opus.
@@ -613,7 +635,7 @@ Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on
   assertEquals(typeof PROVIDERS.opencode.parseModelsList, "function");
   assertEquals(PROVIDERS.claude.parseModelsList, undefined);
   assertEquals(PROVIDERS.grok.defaultModel, "grok-4.5");
-  // Adapter extractors match free functions (ARCH-1).
+  // Adapter extractors match free functions.
   assertEquals(
     PROVIDERS.grok.extractText(GROK_STREAM_OK),
     extractTextFromOutput("grok", GROK_STREAM_OK),

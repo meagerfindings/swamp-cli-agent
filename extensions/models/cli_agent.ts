@@ -28,7 +28,7 @@ const ProviderEnum = z.enum([
 ]);
 
 /**
- * Domain provider id — derived from the schema (IDIOM-1). Do not hand-duplicate
+ * Domain provider id — derived from the schema. Do not hand-duplicate
  * the string union; adding a ProviderEnum member updates this automatically.
  */
 type Provider = z.infer<typeof ProviderEnum>;
@@ -43,7 +43,7 @@ const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
   // Fallback when a provider has no entry-level default in PROVIDERS.
   // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
-  // (ARCH-2: avoids defaultProvider=grok silently using Claude's "opus").
+  // (avoids defaultProvider=grok silently using Claude's "opus").
   defaultModel: z.string().default("opus"),
   commandsDir: z.string().default(".claude/commands"),
   commandSubdirs: z.array(z.string()).default([]).describe(
@@ -282,7 +282,7 @@ async function runCli(
     } catch { /* stream cancelled on kill */ }
   };
 
-  // CORR-4: start drains + watchdog BEFORE writing stdin. Writing a large
+  // Start drains + watchdog BEFORE writing stdin. Writing a large
   // prompt while the child already emits on stdout/stderr can fill the OS pipe
   // buffers and deadlock if nobody is reading yet.
   const drains = Promise.all([
@@ -505,15 +505,10 @@ export function buildGrokCommand(
  *   * grok-4.5 (default)
  *   - grok-composer-2.5-fast
  * ```
- * Strips bullets (`*` / `-`), optional `(default)` suffix, headers, and blanks.
- */
-/**
- * Parse `grok models` human-readable stdout into bare model ids.
- *
  * Strips bullets (`*` / `-` / `•`), optional `(default)` suffix, headers, and
  * blanks. Returns `[]` only when no bullet lines are present — callers that
  * need to distinguish format drift from an empty catalog should check whether
- * stdout looked non-empty (see listModels / CORR-5).
+ * stdout looked non-empty (see listModels).
  */
 export function parseGrokModelsList(stdout: string): string[] {
   const models: string[] = [];
@@ -538,7 +533,7 @@ function assertNever(x: never): never {
 
 /**
  * Provider-typed text extraction (wire shapes). Called only via PROVIDERS
- * adapter methods so call sites never switch on provider strings (ARCH-1).
+ * adapter methods so call sites never switch on provider strings.
  */
 function extractTextImpl(provider: Provider, rawOutput: string): string {
   switch (provider) {
@@ -679,26 +674,14 @@ function looksRateLimited(message: string, code?: string | number): boolean {
  * - `grok`: a `{type:"error", message}` event (JSONL streaming-json or a
  *   single JSON document). Grok often exits 0 on failure and may mirror a
  *   plain-text Error line on stderr; callers pass combined stdout+stderr so
- *   either channel is seen. Unknown-model messages are non-retryable.
+ *   either channel is seen. Plain `Error:` lines only count when the run
+ *   produced no text chunks (benign stderr noise on a successful run is not a
+ *   failure). Unknown-model messages are non-retryable.
  */
 function extractErrorImpl(
   provider: Provider,
   rawOutput: string,
 ): ProviderError | null {
-  // Exhaustiveness gate (IDIOM-2): a new ProviderEnum member fails compile here
-  // until a branch below handles it (or this switch is updated).
-  switch (provider) {
-    case "claude":
-    case "opencode":
-    case "amp":
-    case "gemini":
-    case "codex":
-    case "grok":
-      break;
-    default:
-      return assertNever(provider);
-  }
-
   if (provider === "opencode") {
     for (const line of rawOutput.split("\n")) {
       try {
@@ -799,7 +782,7 @@ function extractErrorImpl(
     // 2) a plain `Error: …` line on stderr.
     // Callers pass combined stdout+stderr. Prefer structured JSON when present;
     // fall back to plain Error: lines so stderr-only exit-0 cases cannot
-    // silent-succeed (CODE-1).
+    // silent-succeed.
     const tryParseJson = (s: string): ProviderError | null => {
       try {
         const event = JSON.parse(s);
@@ -841,7 +824,19 @@ function extractErrorImpl(
     // Single-document fallback (non-streaming json format).
     const whole = tryParseJson(rawOutput.trim());
     if (whole) return whole;
-    // Plain-text stderr-only path (after JSON scan so JSON wins when both exist).
+    // Plain-text stderr-only path (after JSON scan so JSON wins when both
+    // exist). Only when the run produced no assistant text: a successful run
+    // can carry benign stderr noise (update checks, telemetry) that matches
+    // `Error: …`, and must not be reported as a provider failure.
+    const producedText = rawOutput.split("\n").some((line) => {
+      try {
+        const event = JSON.parse(line);
+        return event.type === "text" && typeof event.data === "string";
+      } catch {
+        return false;
+      }
+    });
+    if (producedText) return null;
     for (const line of rawOutput.split("\n")) {
       const err = tryPlainError(line);
       if (err) return err;
@@ -849,7 +844,8 @@ function extractErrorImpl(
     return null;
   }
 
-  // Unreachable when the exhaustiveness switch above is complete.
+  // Compile-time exhaustiveness: a new ProviderEnum member fails to narrow to
+  // `never` here until a branch above handles it.
   return assertNever(provider);
 }
 
@@ -901,19 +897,6 @@ export interface UsageData {
  *   fields on stdout. Return {}. Do not scrape `~/.grok/sessions`.
  */
 function extractUsageImpl(provider: Provider, rawOutput: string): UsageData {
-  // Exhaustiveness gate (IDIOM-2) — see extractErrorImpl.
-  switch (provider) {
-    case "claude":
-    case "opencode":
-    case "amp":
-    case "gemini":
-    case "codex":
-    case "grok":
-      break;
-    default:
-      return assertNever(provider);
-  }
-
   if (provider === "claude") {
     for (const line of rawOutput.split("\n").reverse()) {
       try {
@@ -1101,7 +1084,7 @@ type CommandBuilder = (
 ) => { cmd: string[]; stdin?: string };
 
 /**
- * Closed per-provider capability record (ARCH-1 / IDIOM-1).
+ * Closed per-provider capability record.
  *
  * Adding a provider means extending ProviderEnum **and** this registry (and the
  * pure extract* cases that each adapter method calls) — TypeScript exhaustiveness
@@ -1197,7 +1180,7 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
 };
 
 /**
- * Resolve the model id for an invocation (ARCH-2 + CORR-2).
+ * Resolve the model id for an invocation.
  *
  * Priority:
  * 1. explicit method arg
@@ -1285,11 +1268,10 @@ async function runWithRetries(
       idleTimeoutMs: opts.idleTimeoutMs,
     });
     // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
-    // cannot silent-succeed. Policy lives on the provider registry (ARCH-1).
+    // cannot silent-succeed. Policy lives on the provider registry.
     const errorSource = caps.combineStreams
       ? [lastResult.stdout, lastResult.stderr].filter(Boolean).join("\n")
       : lastResult.stdout;
-    // Dispatch via adapter methods (ARCH-1 closed capability record).
     providerError = caps.extractError(errorSource);
 
     const transientExit = !lastResult.success &&
@@ -1411,7 +1393,7 @@ type MethodContext = {
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
  * - `listModels` — enumerate the models available to a provider's CLI
  */
-/** Shared invoke / invokeAndParse argument schema (IDIOM-1: single source). */
+/** Shared invoke / invokeAndParse argument schema (single source for both). */
 const InvokeArgsSchema = z.object({
   prompt: z.string().describe("The prompt or slash command to execute"),
   provider: ProviderEnum.optional().describe(
@@ -1729,7 +1711,7 @@ export const model = {
           );
         }
 
-        // Same exit-0 provider-error class as invoke (CORR-3): do not treat an
+        // Same exit-0 provider-error class as invoke: do not treat an
         // empty/error stream as a successful empty catalog.
         const errSource = caps.combineStreams
           ? [result.stdout, result.stderr].filter(Boolean).join("\n")
@@ -1744,7 +1726,7 @@ export const model = {
         }
 
         const models = caps.parseModelsList(result.stdout);
-        // CORR-5: non-empty stdout with zero parsed ids is format drift / failure,
+        // Non-empty stdout with zero parsed ids is format drift / failure,
         // not a legitimate empty catalog — fail loud instead of persisting [].
         const stdoutLooksSubstantial = result.stdout.trim().length > 0 &&
           /model/i.test(result.stdout);
