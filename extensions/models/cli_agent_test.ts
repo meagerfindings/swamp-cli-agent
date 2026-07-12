@@ -6,7 +6,7 @@
  * They are the ground truth for the per-provider parsing in `cli_agent.ts`.
  */
 
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   buildGrokCommand,
   extractError,
@@ -14,6 +14,7 @@ import {
   extractUsage,
   isProvider,
   listProvidersFromRegistry,
+  ModelIdSchema,
   parseGrokModelsList,
   PROVIDERS,
   resolveModel,
@@ -607,9 +608,18 @@ Deno.test("parseGrokModelsList: strips bullets, (default), headers, blanks, unic
 
 // --- Provider registry / model resolution -----------------------------------
 
+Deno.test("ModelIdSchema: trims; rejects empty and whitespace-only", () => {
+  assertEquals(ModelIdSchema.parse("  opus  "), "opus");
+  assertEquals(ModelIdSchema.parse("grok-4.5"), "grok-4.5");
+  assertThrows(() => ModelIdSchema.parse(""));
+  assertThrows(() => ModelIdSchema.parse("   "));
+  assertThrows(() => ModelIdSchema.parse("\n\t"));
+});
+
 Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→provider default", () => {
-  // Explicit always wins.
+  // Explicit always wins (after trim).
   assertEquals(resolveModel("grok", "custom-id", "opus"), "custom-id");
+  assertEquals(resolveModel("grok", "  custom-id  ", "opus"), "custom-id");
   assertEquals(resolveModel("claude", "sonnet", "opus"), "sonnet");
   // Configured global default wins: user set defaultModel=sonnet.
   assertEquals(resolveModel("claude", undefined, "sonnet"), "sonnet");
@@ -617,7 +627,9 @@ Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→pr
   assertEquals(resolveModel("grok", undefined, "grok-4.6"), "grok-4.6");
   // Unconfigured Claude schema default + non-Claude provider → provider default.
   assertEquals(resolveModel("grok", undefined, "opus"), "grok-4.5");
+  // Blank / whitespace explicit is treated as omitted (not a model id).
   assertEquals(resolveModel("grok", "", "opus"), "grok-4.5");
+  assertEquals(resolveModel("grok", "   ", "opus"), "grok-4.5");
   // Claude with schema default stays opus.
   assertEquals(resolveModel("claude", undefined, "opus"), "opus");
   // Provider without registry default uses global as-is.

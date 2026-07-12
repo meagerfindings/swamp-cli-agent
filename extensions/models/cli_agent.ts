@@ -39,11 +39,18 @@ type Provider = z.infer<typeof ProviderEnum>;
  * Open-ended (not a closed union): models belong to each vendor's product
  * surface and change without this extension's release cycle. Use this alias
  * so call sites document intent; do not turn it into an enum of known ids.
+ *
+ * Non-empty after trim: blank/whitespace is not a model id (CORR-2 / IDIOM-1).
  */
-const ModelIdSchema = z.string().describe(
+export const ModelIdSchema = z.string().trim().min(1).describe(
   "CLI-specific model id (e.g. opus, sonnet, gpt-5.5, grok-4.5)",
 );
 export type ModelId = z.infer<typeof ModelIdSchema>;
+
+/** True when `m` is present and non-blank (after trim). */
+function isPresentModelId(m: string | undefined): m is ModelId {
+  return m !== undefined && m.trim().length > 0;
+}
 
 /** True when `p` is a known ProviderEnum member. */
 export function isProvider(p: string): p is Provider {
@@ -1248,7 +1255,8 @@ export function resolveModel(
   explicit: ModelId | undefined,
   globalDefault: ModelId,
 ): ModelId {
-  if (explicit !== undefined && explicit !== "") return explicit;
+  // Treat omit / "" / whitespace as "no explicit" (schema also rejects blanks).
+  if (isPresentModelId(explicit)) return explicit.trim();
   const providerDefault = PROVIDERS[provider].defaultModel;
   if (
     provider !== "claude" &&
@@ -1477,7 +1485,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.11.7",
+  version: "2026.07.11.8",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
