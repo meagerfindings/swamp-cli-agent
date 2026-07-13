@@ -8,6 +8,7 @@
 
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
   extractError,
@@ -938,4 +939,213 @@ Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips th
 
   assertEquals(cfg.profilePath, "/custom/profile.sb");
   assertEquals(called, false);
+});
+
+// --- buildBwrapArgs (Linux bwrap sandbox backend) ---------------------------
+//
+// Pure argv builder — see the doc comment on buildBwrapArgs in cli_agent.ts
+// for the full policy rationale and the roccinante proof this mirrors.
+
+Deno.test("buildBwrapArgs: includes the cwd bind, namespaces, network NOT unshared", () => {
+  const exists = () => false; // no home-relative dirs exist in this fixture
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/work/dir",
+    "/home/agent",
+    exists,
+  );
+
+  // cwd is bound read-write for both source and dest.
+  const cwdBindIdx = argv.indexOf("--bind");
+  assertEquals(argv[cwdBindIdx + 1], "/work/dir");
+  assertEquals(argv[cwdBindIdx + 2], "/work/dir");
+
+  // Required namespace/lifecycle flags present.
+  for (
+    const flag of [
+      "--unshare-user",
+      "--unshare-pid",
+      "--unshare-ipc",
+      "--unshare-uts",
+      "--die-with-parent",
+      "--new-session",
+    ]
+  ) {
+    assertEquals(argv.includes(flag), true, `expected ${flag} in argv`);
+  }
+
+  // Network is deliberately NOT unshared (egress allowed, matches Seatbelt).
+  assertEquals(argv.includes("--unshare-net"), false);
+
+  // The real cmd trails, unmodified, as the final argv elements.
+  assertEquals(argv.slice(-3), ["claude", "--print", "hi"]);
+});
+
+Deno.test("buildBwrapArgs: excludes secret dirs entirely (no bind emitted) even when they exist on disk", () => {
+  // Simulate a box where secret dirs DO exist — the function must never bind
+  // them regardless, since they are not in STATE_DIRS/CREDENTIAL_FILES.
+  const exists = () => true;
+  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+
+  for (
+    const secret of [
+      "/home/agent/.ssh",
+      "/home/agent/.aws",
+      "/home/agent/.config/gcloud",
+      "/home/agent/.config/gh",
+      "/home/agent/.gnupg",
+      "/home/agent/.config/op",
+      "/home/agent/.docker",
+      "/home/agent/.gemini",
+      "/home/agent/.npmrc",
+    ]
+  ) {
+    assertEquals(
+      argv.includes(secret),
+      false,
+      `${secret} must never appear in bwrap argv`,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing credential files with /dev/null", () => {
+  const existing = new Set([
+    "/home/agent/.claude",
+    "/home/agent/.claude/.credentials.json",
+    "/home/agent/.cache",
+  ]);
+  const exists = (p: string) => existing.has(p);
+  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+
+  // .claude is bound read-write (state dir).
+  const claudeIdx = argv.indexOf("/home/agent/.claude");
+  assertEquals(argv[claudeIdx - 1], "--bind");
+  assertEquals(argv[claudeIdx + 1], "/home/agent/.claude");
+
+  // The credential file is masked with a read-only /dev/null bind — this
+  // denies BOTH read (process sees empty /dev/null) and write (ro-bind is
+  // immutable) while .claude itself stays writable for non-credential state.
+  const credIdx = argv.indexOf("/home/agent/.claude/.credentials.json");
+  assertEquals(argv[credIdx - 2], "--ro-bind");
+  assertEquals(argv[credIdx - 1], "/dev/null");
+
+  // .cache is bound (state dir), .codex is absent so no bind for it at all.
+  assertEquals(argv.includes("/home/agent/.cache"), true);
+  assertEquals(argv.includes("/home/agent/.codex"), false);
+});
+
+Deno.test("buildBwrapArgs: skips binding a credential file or state dir that does not exist on disk", () => {
+  // bwrap's --bind/--ro-bind require the SOURCE to exist or the whole
+  // invocation fails to start ("Can't find source path ... No such file or
+  // directory" — confirmed on roccinante for ~/.codex, which is absent
+  // there). Every entry must be conditional on pathExists.
+  const exists = () => false;
+  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+
+  assertEquals(argv.includes("/home/agent/.claude"), false);
+  assertEquals(argv.includes("/home/agent/.claude/.credentials.json"), false);
+  assertEquals(argv.includes("/home/agent/.codex"), false);
+  assertEquals(argv.includes("/home/agent/.local/share/opencode"), false);
+});
+
+Deno.test("buildBwrapArgs: home is bound via tmpfs+remount-ro bracket (order load-bearing)", () => {
+  const exists = () => true;
+  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+
+  const tmpfsIdx = argv.indexOf("--tmpfs");
+  // The home tmpfs must appear (there are two --tmpfs uses: /tmp and home).
+  const homeTmpfsIdx = argv.indexOf("/home/agent", tmpfsIdx);
+  assertEquals(argv[homeTmpfsIdx - 1], "--tmpfs");
+
+  // --remount-ro home must come AFTER all the state-dir/credential binds,
+  // i.e. at or near the end, and reference home.
+  const remountIdx = argv.indexOf("--remount-ro");
+  assertEquals(argv[remountIdx + 1], "/home/agent");
+  // Everything bound under home appears before the remount-ro.
+  const lastStateBindIdx = Math.max(
+    argv.lastIndexOf("/home/agent/.cache"),
+    argv.lastIndexOf("/home/agent/.claude"),
+  );
+  if (lastStateBindIdx !== -1) {
+    assertEquals(remountIdx > lastStateBindIdx, true);
+  }
+});
+
+// --- wrapWithSandbox: Linux bwrap dispatch -----------------------------------
+//
+// `Deno.build.os` is a read-only property (confirmed: assigning to it throws
+// "Cannot assign to read only property"), so these tests cannot force the
+// Linux branch on this Darwin dev machine and instead exercise the shared
+// `degradeOrThrow` warn/throw contract that both the Darwin and Linux
+// branches call identically when their sandbox binary is missing — that
+// contract, not the OS check itself, is what these assert. The REAL Linux
+// dispatch (bwrap present, argv built, process actually confined) is proved
+// end-to-end on roccinante — see the commit body for the full transcript.
+// `bwrapPath` is passed here purely to document the parameter exists and is
+// plumbed through; it has no effect while Deno.build.os is "darwin".
+
+Deno.test("wrapWithSandbox: sandbox binary missing + not required degrades and warns, regardless of the unused bwrapPath override", () => {
+  const cmd = ["claude", "--print", "hi"];
+  let warned = false;
+  let warnedReason: unknown;
+  const logger = {
+    info: () => {},
+    warning: (_msg: string, props?: Record<string, unknown>) => {
+      warned = true;
+      warnedReason = props?.reason;
+    },
+    error: () => {},
+  };
+  const out = wrapWithSandbox(
+    cmd,
+    "/tmp/wd",
+    { mode: "seatbelt", profilePath: "/profile.sb", required: false },
+    logger,
+    "/nonexistent/sandbox-exec",
+    "/nonexistent/bwrap",
+  );
+  assertEquals(out, cmd);
+  assertEquals(warned, true);
+  assertEquals(
+    String(warnedReason).includes("/nonexistent/sandbox-exec"),
+    true,
+  );
+});
+
+Deno.test("wrapWithSandbox: sandbox binary missing + sandboxRequired throws instead of degrading (shared degradeOrThrow contract)", () => {
+  const cmd = ["claude", "--print", "hi"];
+  assertThrows(
+    () =>
+      wrapWithSandbox(
+        cmd,
+        "/tmp/wd",
+        { mode: "seatbelt", profilePath: "/profile.sb", required: true },
+        undefined,
+        "/nonexistent/sandbox-exec",
+        "/nonexistent/bwrap",
+      ),
+    Error,
+    "sandboxRequired is true",
+  );
+});
+
+Deno.test("buildBwrapArgs: produces a bwrap-shaped argv usable as the tail of a bwrap invocation (structural smoke test)", () => {
+  // Full structural check mirroring the exact policy proved on roccinante:
+  // namespaces + ro-bind base system + symlinks + proc/dev/tmp + cwd bind +
+  // home tmpfs-bracket + trailing real cmd.
+  const argv = buildBwrapArgs(
+    ["sh", "-c", "echo hi"],
+    "/repo",
+    "/home/agent",
+    () => false,
+  );
+
+  assertEquals(argv[0], "--unshare-user");
+  assertEquals(argv.includes("--ro-bind"), true);
+  assertEquals(argv.includes("/usr"), true);
+  assertEquals(argv.includes("--symlink"), true);
+  assertEquals(argv.includes("--proc"), true);
+  assertEquals(argv.includes("--dev"), true);
+  assertEquals(argv.includes("--tmpfs"), true);
+  assertEquals(argv.slice(-3), ["sh", "-c", "echo hi"]);
 });

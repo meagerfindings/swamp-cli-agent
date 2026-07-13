@@ -293,37 +293,228 @@ type SandboxConfig = {
 export const SANDBOX_PROFILE_FILENAME = "cli_agent.sandbox.sb";
 
 /**
- * Wrap `cmd` in a macOS Seatbelt (`sandbox-exec`) invocation, or return it
- * unchanged.
+ * Path to the `bwrap` (bubblewrap) binary on Linux. A fixed constant (not a
+ * global-args field) because bwrap is a system-level sandbox helper, not a
+ * per-provider CLI path — mirrors how `sandboxExecPath` defaults to a fixed
+ * `/usr/bin/sandbox-exec` rather than being user-configurable.
+ */
+export const BWRAP_PATH = "/usr/bin/bwrap";
+
+/**
+ * Absolute paths, relative to `home`, of this extension's own credential
+ * files that must be BOTH read- and write-denied inside the sandbox, while
+ * their containing directory otherwise stays writable for the CLI's
+ * non-credential state (sessions, history, caches).
+ *
+ * Mirrors the macOS Seatbelt profile's `(literal ...)` read-deny +
+ * write-deny entries for `~/.claude.json`, `~/.claude/.credentials.json`,
+ * `~/.codex/auth.json`, `~/.codex/config.toml`, and
+ * `~/.local/share/opencode/auth.json`. `~/.config/amp` has no single
+ * known credential-file literal on the researched machine (the macOS
+ * profile denies read of the whole subpath instead) — deliberately NOT
+ * bound at all on Linux (see STATE_DIRS below), so it is absent rather
+ * than masked.
+ *
+ * Codex's files (`~/.codex/...`) are included even though `~/.codex` does
+ * not exist on the roccinante Linux box this backend was proven on — the
+ * bind is skipped when the path is absent (see {@link buildBwrapArgs}), so
+ * this list documents intended policy independent of what happens to exist
+ * on any one box today.
+ */
+const CREDENTIAL_FILES: string[] = [
+  ".claude.json",
+  ".claude/.credentials.json",
+  ".codex/auth.json",
+  ".codex/config.toml",
+  ".local/share/opencode/auth.json",
+];
+
+/**
+ * Directories, relative to `home`, that are bound WRITABLE into the sandbox
+ * because a provider CLI needs to persist its own non-credential state
+ * (sessions, history, caches) or a shared toolchain cache. Mirrors the
+ * macOS profile's `file-write*` re-allow subpaths
+ * (`~/.cache`, `~/.deno`, `~/.claude`, `~/.codex`, `~/.config/opencode`,
+ * `~/.local/share/opencode`).
+ *
+ * Deliberately excludes `~/.config/amp`, `~/.gnupg`, `~/.ssh`, `~/.aws`,
+ * etc. — anything not listed here is simply absent inside the sandbox
+ * (bwrap's allowlist-by-omission, see {@link buildBwrapArgs} doc comment).
+ */
+const STATE_DIRS: string[] = [
+  ".cache",
+  ".deno",
+  ".claude",
+  ".codex",
+  ".config/opencode",
+  ".local/share/opencode",
+];
+
+/** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
+type BwrapArg = string;
+
+/**
+ * Build the `bwrap` argv that wraps `cmd`, translating the same confinement
+ * intent as `cli_agent.sandbox.sb` (deny ambient secrets, restrict writes to
+ * cwd/tmp/state, allow egress) into bwrap's imperative bind-mount model.
+ *
+ * Pure and side-effect-free EXCEPT for the injected `pathExists` check, which
+ * is required because bwrap (unlike Seatbelt's path-literal rules) needs its
+ * bind *source* to exist on disk or the whole invocation fails to start
+ * (`bwrap: Can't find source path ... No such file or directory` — confirmed
+ * on roccinante for `~/.codex`, which does not exist there). Every
+ * STATE_DIRS/CREDENTIAL_FILES entry is therefore bound conditionally; a CLI
+ * whose state dir doesn't exist yet on a given box simply gets no bind for
+ * it (and, for a credential file specifically, no mask — masking requires
+ * the parent directory bind to exist first, and an absent parent means
+ * there is nothing on disk to protect anyway).
+ *
+ * Policy (proved end-to-end on roccinante, see commit body for the full
+ * transcript):
+ *
+ * 1. **Namespaces**: `--unshare-user --unshare-pid --unshare-ipc --unshare-uts`,
+ *    `--die-with-parent`, `--new-session`. Network is NOT unshared — egress
+ *    control is a later bet, matching the macOS profile's `(allow network*)`.
+ * 2. **Read-only base system**: `--ro-bind /usr /usr`, `--ro-bind /etc /etc`,
+ *    plus `--symlink usr/bin /bin` (and lib/lib64/sbin) to recreate the
+ *    usr-merge symlinks debian/ubuntu-style distros expect — binding `/bin`
+ *    etc. directly instead of symlinking fails because they ARE symlinks
+ *    into `/usr` on the host; bwrap needs the symlink recreated, not shadowed.
+ * 3. `--proc /proc`, `--dev /dev`, `--tmpfs /tmp` (ephemeral scratch, not the
+ *    real /tmp).
+ * 4. **Workspace**: `--bind cwd cwd` — the only unconditionally-writable path
+ *    outside home-relative state dirs.
+ * 5. **Home**: `--tmpfs home` FIRST (so `home` becomes a real bwrap mount
+ *    point, not merely a synthesized intermediate directory), then the
+ *    STATE_DIRS writable sub-binds and CREDENTIAL_FILES masks on top, then
+ *    `--remount-ro home` LAST. This ordering is load-bearing: binding
+ *    `~/.cache` etc. directly (without the tmpfs+remount-ro bracket) leaves
+ *    `home` itself as a bwrap-synthesized writable directory — a process can
+ *    `touch $HOME/anything` and it silently "succeeds" into that ephemeral
+ *    directory (confirmed on roccinante: exit 0, file invisible outside the
+ *    sandbox and never persisted). `--remount-ro` only works on a real bwrap
+ *    mount, which is why the leading `--tmpfs home` exists — without it
+ *    `--remount-ro` fails with "Unable to find destination in mount table".
+ *    Everything NOT explicitly bound under home (`.ssh`, `.aws`,
+ *    `.config/gcloud`, `.config/gh`, `.gnupg`, `.config/op`, `.docker`,
+ *    `.gemini`, `.npmrc`, ...) is therefore simply absent — allowlist by
+ *    omission, avoiding the mask-precedence trap a broad `--bind home home`
+ *    would require carefully layering masks on top of (see task brief).
+ * 6. **Credential files**: for each existing path in CREDENTIAL_FILES,
+ *    `--ro-bind /dev/null <path>` AFTER its containing STATE_DIRS bind —
+ *    this masks both read (the process sees an empty /dev/null, never the
+ *    real bytes) and write (`/dev/null` is bound read-only, so a write
+ *    attempt gets EROFS) while sibling files in the same directory stay
+ *    fully readable/writable. Proved on roccinante: reading returns
+ *    "Permission denied", writing returns "Permission denied", the real
+ *    file's sha256 is unchanged after the attempt, and a sibling test file
+ *    in the same directory still round-trips.
+ *
+ * `home` is required (not defaulted to `Deno.env.get("HOME")` internally)
+ * so this stays pure and independently testable; callers pass the resolved
+ * value the same way `wrapWithSandbox` already resolves `HOME` for Seatbelt.
+ */
+export function buildBwrapArgs(
+  cmd: string[],
+  cwd: string,
+  home: string,
+  pathExists: (p: string) => boolean,
+): string[] {
+  const args: BwrapArg[] = [
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--die-with-parent",
+    "--new-session",
+    "--ro-bind",
+    "/usr",
+    "/usr",
+    "--ro-bind",
+    "/etc",
+    "/etc",
+    "--symlink",
+    "usr/bin",
+    "/bin",
+    "--symlink",
+    "usr/lib",
+    "/lib",
+    "--symlink",
+    "usr/lib64",
+    "/lib64",
+    "--symlink",
+    "usr/sbin",
+    "/sbin",
+    "--proc",
+    "/proc",
+    "--dev",
+    "/dev",
+    "--tmpfs",
+    "/tmp",
+    "--bind",
+    cwd,
+    cwd,
+    "--tmpfs",
+    home,
+  ];
+
+  for (const rel of STATE_DIRS) {
+    const abs = `${home}/${rel}`;
+    if (pathExists(abs)) {
+      args.push("--bind", abs, abs);
+    }
+  }
+
+  for (const rel of CREDENTIAL_FILES) {
+    const abs = `${home}/${rel}`;
+    if (pathExists(abs)) {
+      args.push("--ro-bind", "/dev/null", abs);
+    }
+  }
+
+  args.push("--remount-ro", home);
+  args.push("--setenv", "HOME", home);
+
+  return [...args, ...cmd];
+}
+
+/**
+ * Wrap `cmd` in an OS-level sandbox (`sandbox-exec` on macOS, `bwrap` on
+ * Linux), or return it unchanged.
  *
  * This is the single seam every provider CLI spawn passes through (via
- * {@link runCli}), so the confinement policy in `cli_agent.sandbox.sb`
- * (deny ambient secrets, restrict writes to cwd/tmp, allow egress — see that
- * file's header for the full first-cut rationale) applies uniformly to
+ * {@link runCli}), so the confinement policy — deny ambient secrets, restrict
+ * writes to cwd/tmp/state, allow egress — applies uniformly to
  * claude/codex/amp/gemini/grok/opencode without touching their individual
- * `build*Command` functions.
+ * `build*Command` functions. macOS's policy lives in `cli_agent.sandbox.sb`
+ * (see that file's header); Linux's equivalent policy is documented on
+ * {@link buildBwrapArgs}.
  *
  * Behavior:
  * - `mode: "off"` → returns `cmd` unchanged (no-op; this is the default).
  * - `mode: "seatbelt"` on Darwin with `/usr/bin/sandbox-exec` present →
  *   prefixes `cmd` with `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
- * - `mode: "seatbelt"` but the platform can't apply it (non-Darwin, or
- *   `sandbox-exec` missing) → **warn-and-degrade**: log a loud warning and
- *   return `cmd` unchanged, so an imperfectly-configured swamp install never
- *   hard-crashes on a platform mismatch. UNLESS `required: true`, in which
- *   case this throws instead — the fail-closed path for callers running
- *   untrusted input (e.g. a future PR-watcher wiring) that must never fall
- *   back to unsandboxed execution silently.
+ * - `mode: "seatbelt"` on Linux with `/usr/bin/bwrap` present → prefixes
+ *   `cmd` with the {@link buildBwrapArgs} argv. (The same enum value
+ *   triggers both backends by design for this unit — renaming/defaulting the
+ *   mode to something OS-neutral like `"auto"` is a separate later change.)
+ * - `mode: "seatbelt"` but the platform can't apply it (non-Darwin/non-Linux,
+ *   or the platform's sandbox binary is missing) → **warn-and-degrade**: log
+ *   a loud warning and return `cmd` unchanged, so an imperfectly-configured
+ *   swamp install never hard-crashes on a platform mismatch. UNLESS
+ *   `required: true`, in which case this throws instead — the fail-closed
+ *   path for callers running untrusted input (e.g. a future PR-watcher
+ *   wiring) that must never fall back to unsandboxed execution silently.
  *
  * `cwd` defaults to `Deno.cwd()` (matching how the two runCli call sites
  * already resolve cwd) so the `CWD` param always has a concrete value even
  * when the caller omits one.
  *
- * `sandboxExecPath` defaults to the real `/usr/bin/sandbox-exec` and exists
- * as a parameter purely so unit tests can point at a nonexistent path to
+ * `sandboxExecPath` (Darwin) and `bwrapPath` (Linux, defaulting to
+ * {@link BWRAP_PATH}) each default to the real system binary and exist as
+ * parameters purely so unit tests can point at a nonexistent path to
  * exercise the warn-and-degrade / fail-closed branches deterministically on
- * any machine (including one that genuinely has sandbox-exec) without
- * mocking `Deno.build.os` or the filesystem.
+ * any machine without mocking `Deno.build.os` or the filesystem.
  */
 export function wrapWithSandbox(
   cmd: string[],
@@ -331,46 +522,93 @@ export function wrapWithSandbox(
   sandbox: SandboxConfig,
   logger?: MethodContext["logger"],
   sandboxExecPath = "/usr/bin/sandbox-exec",
+  bwrapPath = BWRAP_PATH,
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
+  const isFile = (p: string): boolean => {
+    try {
+      return Deno.statSync(p).isFile;
+    } catch {
+      return false;
+    }
+  };
+
   const isDarwin = Deno.build.os === "darwin";
-  const sandboxExecAvailable = isDarwin &&
-    (() => {
+  const isLinux = Deno.build.os === "linux";
+  const resolvedCwd = cwd ?? Deno.cwd();
+  const home = Deno.env.get("HOME") ?? "";
+
+  if (isDarwin) {
+    if (!isFile(sandboxExecPath)) {
+      return degradeOrThrow(
+        `${sandboxExecPath} not found`,
+        sandbox,
+        logger,
+        cmd,
+      );
+    }
+    return [
+      sandboxExecPath,
+      "-f",
+      sandbox.profilePath,
+      "-D",
+      `CWD=${resolvedCwd}`,
+      "-D",
+      `HOME=${home}`,
+      ...cmd,
+    ];
+  }
+
+  if (isLinux) {
+    if (!isFile(bwrapPath)) {
+      return degradeOrThrow(`${bwrapPath} not found`, sandbox, logger, cmd);
+    }
+    const exists = (p: string): boolean => {
       try {
-        return Deno.statSync(sandboxExecPath).isFile;
+        Deno.lstatSync(p);
+        return true;
       } catch {
         return false;
       }
-    })();
-
-  if (!sandboxExecAvailable) {
-    const reason = isDarwin
-      ? `${sandboxExecPath} not found`
-      : `unsupported platform (${Deno.build.os}, seatbelt is macOS-only)`;
-    if (sandbox.required) {
-      throw new Error(
-        `sandboxMode is 'seatbelt' and sandboxRequired is true, but the sandbox cannot be applied: ${reason}. Refusing to run unsandboxed.`,
-      );
-    }
-    logger?.warning(
-      "Seatbelt sandbox requested but unavailable ({reason}) — running UNSANDBOXED. Set sandboxRequired=true to fail closed instead.",
-      { reason },
-    );
-    return cmd;
+    };
+    return [
+      bwrapPath,
+      ...buildBwrapArgs(cmd, resolvedCwd, home, exists),
+    ];
   }
 
-  const home = Deno.env.get("HOME") ?? "";
-  return [
-    sandboxExecPath,
-    "-f",
-    sandbox.profilePath,
-    "-D",
-    `CWD=${cwd ?? Deno.cwd()}`,
-    "-D",
-    `HOME=${home}`,
-    ...cmd,
-  ];
+  return degradeOrThrow(
+    `unsupported platform (${Deno.build.os}, no seatbelt/bwrap backend)`,
+    sandbox,
+    logger,
+    cmd,
+  );
+}
+
+/**
+ * Shared warn-and-degrade / fail-closed fallback for {@link wrapWithSandbox}
+ * when the platform's sandbox backend can't be applied (missing binary or
+ * unsupported OS). Extracted once both the Darwin and Linux branches needed
+ * the identical decision (throw if `sandbox.required`, else warn and return
+ * `cmd` unchanged).
+ */
+function degradeOrThrow(
+  reason: string,
+  sandbox: SandboxConfig,
+  logger: MethodContext["logger"] | undefined,
+  cmd: string[],
+): string[] {
+  if (sandbox.required) {
+    throw new Error(
+      `sandboxMode is 'seatbelt' and sandboxRequired is true, but the sandbox cannot be applied: ${reason}. Refusing to run unsandboxed.`,
+    );
+  }
+  logger?.warning(
+    "Sandbox requested but unavailable ({reason}) — running UNSANDBOXED. Set sandboxRequired=true to fail closed instead.",
+    { reason },
+  );
+  return cmd;
 }
 
 /**
