@@ -496,6 +496,7 @@ Deno.test("buildGrokCommand: exact argv contract, no stdin, no --no-auto-update"
     "grok",
     "grok-4.5",
     "Reply with only: hi",
+    "actor",
   );
   assertEquals(cmd, [
     "grok",

@@ -57,6 +57,13 @@ export function isProvider(p: string): p is Provider {
   return ProviderEnum.safeParse(p).success;
 }
 
+/**
+ * Scoped permission profile applied to a provider's CLI invocation.
+ * "readonly" grants read/search tools only; "actor" (the default) additionally
+ * allows editing files and running shell commands.
+ */
+const ToolProfileEnum = z.enum(["readonly", "actor"]);
+
 /** Global configuration arguments shared across all method invocations. */
 const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -64,6 +71,7 @@ const GlobalArgsSchema = z.object({
   // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
   // (avoids defaultProvider=grok silently using Claude's "opus").
   defaultModel: ModelIdSchema.default("opus"),
+  defaultToolProfile: ToolProfileEnum.default("actor"),
   commandsDir: z.string().default(".claude/commands"),
   commandSubdirs: z.array(z.string()).default([]).describe(
     "Additional subdirectories under commandsDir to search for slash commands",
@@ -401,11 +409,18 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** Claude tool names allowed per profile, passed to `--allowedTools`. */
+const CLAUDE_ALLOWED_TOOLS: Record<ToolProfile, string> = {
+  readonly: "Read Grep Glob",
+  actor: "Read Grep Glob Edit Write Bash",
+};
+
 /** Build the command array for the Claude CLI. */
 function buildClaudeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
+  toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   const cmd = [
     cliPath,
@@ -415,7 +430,10 @@ function buildClaudeCommand(
     "--verbose",
     "--output-format",
     "stream-json",
-    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools",
+    CLAUDE_ALLOWED_TOOLS[toolProfile],
   ];
   cmd.push(resolvedPrompt);
   return { cmd };
@@ -426,6 +444,7 @@ function buildOpencodeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
+  _toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   return {
     cmd: [cliPath, "run", "--format", "json", "--model", model, resolvedPrompt],
@@ -433,33 +452,106 @@ function buildOpencodeCommand(
 }
 
 /**
+ * Amp permission rules per profile, passed via `--settings-file` as JSON
+ * pointing at `amp.permissions` rules (amp has no CLI flag for inline rules).
+ * Rules are evaluated in order; the trailing catch-all makes the remaining
+ * tools allowed-by-default while `reject` rules for dangerous Bash patterns
+ * take precedence over it.
+ */
+const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
+  readonly: [
+    { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
+    { tool: "edit_file", action: "reject" },
+    { tool: "create_file", action: "reject" },
+    { tool: "*", action: "allow" },
+  ],
+  actor: [
+    {
+      tool: "Bash",
+      action: "reject",
+      matches: { cmd: ["git push*", "curl*", "rm -rf*"] },
+    },
+    { tool: "*", action: "allow" },
+  ],
+};
+
+/**
  * Build the command array for the Amp CLI.
  *
  * `--stream-json` makes amp emit Claude-Code-compatible stream JSON (one event
  * per line) instead of plain text, so token usage can be parsed from the
  * `assistant` events. The prompt is fed on stdin in execute mode (`-x`).
+ *
+ * Amp has no CLI flag for inline permission rules (only `amp.permissions` in
+ * a settings file, see `amp permissions --help`), so the profile's rules are
+ * written to a temp settings file passed via `--settings-file`. This replaces
+ * `--dangerously-allow-all`: instead of a blanket bypass, Bash is scoped to
+ * reject `git push`, `curl`, and `rm -rf` (actor profile) or rejected entirely
+ * alongside file edits (readonly profile), with everything else allowed.
  */
-function buildAmpCommand(
+async function buildAmpCommand(
   cliPath: string,
   _model: ModelId,
   resolvedPrompt: string,
-): { cmd: string[]; stdin?: string } {
+  toolProfile: ToolProfile,
+): Promise<{ cmd: string[]; stdin?: string }> {
+  const settingsFile = await Deno.makeTempFile({
+    prefix: "amp-settings-",
+    suffix: ".json",
+  });
+  await Deno.writeTextFile(
+    settingsFile,
+    JSON.stringify({ "amp.permissions": AMP_PERMISSIONS[toolProfile] }),
+  );
   return {
-    cmd: [cliPath, "--dangerously-allow-all", "-x", "--stream-json"],
+    cmd: [
+      cliPath,
+      "--settings-file",
+      settingsFile,
+      "-x",
+      "--stream-json",
+    ],
     stdin: resolvedPrompt,
   };
 }
+
+/** Gemini approval mode per profile: read-only tools only vs. auto-approve all. */
+const GEMINI_APPROVAL_MODE: Record<ToolProfile, string> = {
+  readonly: "plan",
+  actor: "yolo",
+};
 
 /** Build the command array for the Gemini CLI. */
 function buildGeminiCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
+  toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   return {
-    cmd: [cliPath, "-p", resolvedPrompt, "-m", model, "--yolo", "-o", "json"],
+    cmd: [
+      cliPath,
+      "-p",
+      resolvedPrompt,
+      "-m",
+      model,
+      "--approval-mode",
+      GEMINI_APPROVAL_MODE[toolProfile],
+      "-o",
+      "json",
+    ],
   };
 }
+
+/**
+ * Codex sandbox policy per profile, passed via `--sandbox`/`-s`.
+ * "readonly" disallows all file writes and shell command execution beyond
+ * reads; "actor" allows writes scoped to the workspace (no full-disk access).
+ */
+const CODEX_SANDBOX_MODE: Record<ToolProfile, string> = {
+  readonly: "read-only",
+  actor: "workspace-write",
+};
 
 /**
  * Build the command array for the OpenAI Codex CLI.
@@ -477,11 +569,19 @@ function buildGeminiCommand(
  * invokeAndParse). Batch/non-interactive callers legitimately run from arbitrary
  * working directories (nested `swamp model method run` inherits whatever cwd the
  * parent had), so the trust gate is inappropriate here — we always skip it.
+ *
+ * That trust-gate skip is paired with a real sandbox so it isn't a blanket
+ * bypass: `--sandbox` scopes filesystem/network access per profile (read-only
+ * vs workspace-write, never danger-full-access), and `-c approval_policy=never`
+ * keeps the run non-interactive (no TTY is available to answer a prompt in
+ * batch/nested invocation) rather than disabling confirmation via
+ * `--dangerously-bypass-approvals-and-sandbox`.
  */
 function buildCodexCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
+  toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   return {
     cmd: [
@@ -491,6 +591,10 @@ function buildCodexCommand(
       "--color",
       "never",
       "--skip-git-repo-check",
+      "--sandbox",
+      CODEX_SANDBOX_MODE[toolProfile],
+      "-c",
+      "approval_policy=never",
       "-m",
       model,
       resolvedPrompt,
@@ -512,11 +616,16 @@ function buildCodexCommand(
  * Grok id (e.g. `grok-4.5`). Do not pass Claude defaults like `opus`.
  *
  * Exported for unit tests that assert the exact argv contract.
+ *
+ * TODO(security): still a blanket permission bypass — the scoped-permissions
+ * hardening (see buildClaudeCommand, buildAmpCommand, buildCodexCommand) has
+ * not been extended to Grok yet.
  */
 export function buildGrokCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
+  _toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   return {
     cmd: [
@@ -1114,12 +1223,18 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
   return PROVIDERS[provider].extractUsage(rawOutput);
 }
 
+/** A scoped permission profile applied to a provider's CLI invocation. */
+type ToolProfile = "readonly" | "actor";
+
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
-) => { cmd: string[]; stdin?: string };
+  toolProfile: ToolProfile,
+) =>
+  | { cmd: string[]; stdin?: string }
+  | Promise<{ cmd: string[]; stdin?: string }>;
 
 /**
  * Closed per-provider capability record.
@@ -1302,6 +1417,7 @@ async function runWithRetries(
   cliPath: string,
   modelName: string,
   resolved: string,
+  toolProfile: ToolProfile,
   opts: {
     cwd: string;
     wallTimeoutMs: number;
@@ -1317,7 +1433,12 @@ async function runWithRetries(
   let retries = 0;
 
   while (retries <= opts.maxRetries) {
-    const { cmd, stdin } = buildCommand(cliPath, modelName, resolved);
+    const { cmd, stdin } = await buildCommand(
+      cliPath,
+      modelName,
+      resolved,
+      toolProfile,
+    );
     lastResult = await runCli(cmd, {
       cwd: opts.cwd,
       stdin,
@@ -1470,6 +1591,9 @@ const InvokeArgsSchema = z.object({
   wallTimeoutMs: z.number().optional().describe(
     "Override wall timeout in milliseconds",
   ),
+  toolProfile: ToolProfileEnum.optional().describe(
+    "Scoped permission profile: 'readonly' (read/search only) or 'actor' (also edit/write/run shell). Defaults to defaultToolProfile.",
+  ),
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -1485,7 +1609,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.11.8",
+  version: "2026.07.13.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -1538,6 +1662,8 @@ export const model = {
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;
+        const toolProfile = args.toolProfile ||
+          context.globalArgs.defaultToolProfile;
 
         const { resolved, slashCommand } = await resolveSlashCommand(
           args.prompt,
@@ -1553,6 +1679,7 @@ export const model = {
           cliPath,
           modelName,
           resolved,
+          toolProfile,
           { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
           context.logger,
         );
@@ -1651,6 +1778,8 @@ export const model = {
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;
+        const toolProfile = args.toolProfile ||
+          context.globalArgs.defaultToolProfile;
 
         const { resolved, slashCommand } = await resolveSlashCommand(
           args.prompt,
@@ -1666,6 +1795,7 @@ export const model = {
           cliPath,
           modelName,
           resolved,
+          toolProfile,
           { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
           context.logger,
         );
