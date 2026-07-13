@@ -603,29 +603,68 @@ function buildCodexCommand(
 }
 
 /**
+ * Grok sandbox profile per tool profile, passed via `--sandbox`.
+ * "readonly" is the CLI's `read-only` profile (writes confined to `~/.grok/`
+ * and tmp, child network blocked). "actor" is `workspace` (writes confined to
+ * cwd/tmp/`~/.grok/`, not full-disk `devbox`/`off`).
+ */
+const GROK_SANDBOX_MODE: Record<ToolProfile, string> = {
+  readonly: "read-only",
+  actor: "workspace",
+};
+
+/**
+ * Grok permission-mode + extra flags per tool profile.
+ *
+ * "readonly" uses `dontAsk`, which silently denies anything not explicitly
+ * allowed — combined with the `read-only` sandbox above, no write or shell
+ * exec can slip through non-interactively.
+ *
+ * "actor" needs a non-interactive-safe execute mode: `ask`/`acceptEdits`
+ * would stall forever waiting on a TTY prompt for shell commands (there is
+ * none in a batch/nested invocation), so this uses `always-approve` — but,
+ * mirroring Amp's actor profile, pairs it with explicit `--deny` rules for
+ * the same dangerous Bash patterns (git push, curl, rm -rf) rather than
+ * leaving a blanket bypass. The `workspace` sandbox above is the primary
+ * boundary; the deny rules are defense in depth on top of it.
+ */
+const GROK_PERMISSION_ARGS: Record<ToolProfile, string[]> = {
+  readonly: ["--permission-mode", "dontAsk"],
+  actor: [
+    "--permission-mode",
+    "always-approve",
+    "--deny",
+    "Bash(git push*)",
+    "--deny",
+    "Bash(curl*)",
+    "--deny",
+    "Bash(rm -rf*)",
+  ],
+};
+
+/**
  * Build the command array for the xAI Grok Build CLI.
  *
- * Headless mode (`-p` / `--single`) prints to stdout and exits. We use
- * `--output-format streaming-json` so the idle-timeout watchdog sees progress
- * during long tool runs (a single end-of-run `json` blob would look idle).
- * `--always-approve` + `--permission-mode bypassPermissions` mirror other
- * providers' non-interactive permission bypasses — only point this at trusted
- * working directories.
+ * Headless mode (`-p`) prints to stdout and exits. We use `--output-format
+ * streaming-json` so the idle-timeout watchdog sees progress during long tool
+ * runs (a single end-of-run `json` blob would look idle).
+ *
+ * This replaces the prior `--always-approve` + `--permission-mode
+ * bypassPermissions` blanket bypass with `--sandbox` (GROK_SANDBOX_MODE) as
+ * the primary boundary and profile-scoped `--permission-mode`/`--deny` flags
+ * (GROK_PERMISSION_ARGS) — see both consts above for the per-profile
+ * rationale. No bypass flag is passed for either profile.
  *
  * Always pass `-m`: callers using Grok must set `model` / `defaultModel` to a
  * Grok id (e.g. `grok-4.5`). Do not pass Claude defaults like `opus`.
  *
  * Exported for unit tests that assert the exact argv contract.
- *
- * TODO(security): still a blanket permission bypass — the scoped-permissions
- * hardening (see buildClaudeCommand, buildAmpCommand, buildCodexCommand) has
- * not been extended to Grok yet.
  */
 export function buildGrokCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
-  _toolProfile: ToolProfile,
+  toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
   return {
     cmd: [
@@ -636,9 +675,9 @@ export function buildGrokCommand(
       model,
       "--output-format",
       "streaming-json",
-      "--always-approve",
-      "--permission-mode",
-      "bypassPermissions",
+      "--sandbox",
+      GROK_SANDBOX_MODE[toolProfile],
+      ...GROK_PERMISSION_ARGS[toolProfile],
     ],
   };
 }
@@ -1609,7 +1648,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.13.1",
+  version: "2026.07.13.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {

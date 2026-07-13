@@ -491,7 +491,7 @@ Available models:
   - grok-composer-2.5-fast
 `;
 
-Deno.test("buildGrokCommand: exact argv contract, no stdin, no --no-auto-update", () => {
+Deno.test("buildGrokCommand: actor profile argv contract, no stdin, no --no-auto-update", () => {
   const { cmd, stdin } = buildGrokCommand(
     "grok",
     "grok-4.5",
@@ -506,12 +506,45 @@ Deno.test("buildGrokCommand: exact argv contract, no stdin, no --no-auto-update"
     "grok-4.5",
     "--output-format",
     "streaming-json",
-    "--always-approve",
+    "--sandbox",
+    "workspace",
     "--permission-mode",
-    "bypassPermissions",
+    "always-approve",
+    "--deny",
+    "Bash(git push*)",
+    "--deny",
+    "Bash(curl*)",
+    "--deny",
+    "Bash(rm -rf*)",
   ]);
   assertEquals(stdin, undefined);
   assertEquals(cmd.includes("--no-auto-update"), false);
+  assertEquals(cmd.includes("--always-approve"), false);
+  assertEquals(cmd.includes("bypassPermissions"), false);
+});
+
+Deno.test("buildGrokCommand: readonly profile scopes sandbox + denies unlisted tools", () => {
+  const { cmd } = buildGrokCommand(
+    "grok",
+    "grok-4.5",
+    "Reply with only: hi",
+    "readonly",
+  );
+  assertEquals(cmd, [
+    "grok",
+    "-p",
+    "Reply with only: hi",
+    "-m",
+    "grok-4.5",
+    "--output-format",
+    "streaming-json",
+    "--sandbox",
+    "read-only",
+    "--permission-mode",
+    "dontAsk",
+  ]);
+  assertEquals(cmd.includes("--always-approve"), false);
+  assertEquals(cmd.includes("bypassPermissions"), false);
 });
 
 Deno.test("extractTextFromOutput: grok joins type:text data chunks, ignores thought", () => {
