@@ -33,6 +33,25 @@ const ProviderEnum = z.enum([
  */
 type Provider = z.infer<typeof ProviderEnum>;
 
+/**
+ * CLI-specific model identifier as understood by a provider CLI.
+ *
+ * Open-ended (not a closed union): models belong to each vendor's product
+ * surface and change without this extension's release cycle. Use this alias
+ * so call sites document intent; do not turn it into an enum of known ids.
+ *
+ * Non-empty after trim: blank/whitespace is not a model id.
+ */
+export const ModelIdSchema = z.string().trim().min(1).describe(
+  "CLI-specific model id (e.g. opus, sonnet, gpt-5.5, grok-4.5)",
+);
+export type ModelId = z.infer<typeof ModelIdSchema>;
+
+/** True when `m` is present and non-blank (after trim). */
+function isPresentModelId(m: string | undefined): m is ModelId {
+  return m !== undefined && m.trim().length > 0;
+}
+
 /** True when `p` is a known ProviderEnum member. */
 export function isProvider(p: string): p is Provider {
   return ProviderEnum.safeParse(p).success;
@@ -44,7 +63,7 @@ const GlobalArgsSchema = z.object({
   // Fallback when a provider has no entry-level default in PROVIDERS.
   // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
   // (avoids defaultProvider=grok silently using Claude's "opus").
-  defaultModel: z.string().default("opus"),
+  defaultModel: ModelIdSchema.default("opus"),
   commandsDir: z.string().default(".claude/commands"),
   commandSubdirs: z.array(z.string()).default([]).describe(
     "Additional subdirectories under commandsDir to search for slash commands",
@@ -66,7 +85,7 @@ type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 const InvocationSchema = z.object({
   invocationId: z.string(),
   provider: ProviderEnum,
-  model: z.string(),
+  model: ModelIdSchema,
   prompt: z.string(),
   promptHash: z.string(),
   slashCommand: z.string().optional(),
@@ -113,7 +132,28 @@ const TranscriptSchema = z.object({
 /** Schema for the result of enumerating a provider's available models. */
 const ModelListSchema = z.object({
   provider: ProviderEnum,
-  models: z.array(z.string()),
+  models: z.array(ModelIdSchema),
+  count: z.number(),
+  listedAt: z.string(),
+});
+
+/** One entry in the closed PROVIDERS registry (for listProviders discovery). */
+const ProviderInfoSchema = z.object({
+  id: ProviderEnum,
+  defaultModel: ModelIdSchema.optional().describe(
+    "Registry default model id when invoke omits model and global defaultModel is still the unconfigured Claude schema default",
+  ),
+  supportsListModels: z.boolean().describe(
+    "True when this provider's CLI can be enumerated via listModels",
+  ),
+});
+
+/** Domain provider-catalog entry — derived from the schema, not hand-duplicated. */
+export type ProviderInfo = z.infer<typeof ProviderInfoSchema>;
+
+/** Schema for the result of listing supported CLI providers. */
+const ProviderListSchema = z.object({
+  providers: z.array(ProviderInfoSchema),
   count: z.number(),
   listedAt: z.string(),
 });
@@ -364,7 +404,7 @@ function concatChunks(chunks: Uint8Array[]): Uint8Array {
 /** Build the command array for the Claude CLI. */
 function buildClaudeCommand(
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   const cmd = [
@@ -384,7 +424,7 @@ function buildClaudeCommand(
 /** Build the command array for the OpenCode CLI. */
 function buildOpencodeCommand(
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
@@ -401,7 +441,7 @@ function buildOpencodeCommand(
  */
 function buildAmpCommand(
   cliPath: string,
-  _model: string,
+  _model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
@@ -413,7 +453,7 @@ function buildAmpCommand(
 /** Build the command array for the Gemini CLI. */
 function buildGeminiCommand(
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
@@ -440,7 +480,7 @@ function buildGeminiCommand(
  */
 function buildCodexCommand(
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
@@ -475,7 +515,7 @@ function buildCodexCommand(
  */
 export function buildGrokCommand(
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ): { cmd: string[]; stdin?: string } {
   return {
@@ -510,8 +550,8 @@ export function buildGrokCommand(
  * need to distinguish format drift from an empty catalog should check whether
  * stdout looked non-empty (see listModels).
  */
-export function parseGrokModelsList(stdout: string): string[] {
-  const models: string[] = [];
+export function parseGrokModelsList(stdout: string): ModelId[] {
+  const models: ModelId[] = [];
   for (const raw of stdout.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
@@ -1077,7 +1117,7 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
   cliPath: string,
-  model: string,
+  model: ModelId,
   resolvedPrompt: string,
 ) => { cmd: string[]; stdin?: string };
 
@@ -1095,7 +1135,7 @@ type ProviderCapabilities = {
    * Suggested model when the global default is still the unconfigured Claude
    * schema default (`opus`) and this provider is not Claude (see resolveModel).
    */
-  defaultModel?: string;
+  defaultModel?: ModelId;
   /**
    * When true, extractError / extractText see stdout+stderr combined so
    * stderr-only exit-0 failures cannot silent-succeed (Grok).
@@ -1105,7 +1145,7 @@ type ProviderCapabilities = {
    * When set, listModels is supported: run `<cliPath> models` and parse stdout.
    * Absent → listModels rejects that provider.
    */
-  parseModelsList?: (stdout: string) => string[];
+  parseModelsList?: (stdout: string) => ModelId[];
   extractText: (raw: string) => string;
   extractError: (raw: string) => ProviderError | null;
   extractUsage: (raw: string) => UsageData;
@@ -1115,7 +1155,7 @@ type ProviderCapabilities = {
  * Schema-level default for `defaultModel` on GlobalArgsSchema (Claude-first
  * installs). Used by resolveModel to detect "user never set a model default".
  */
-export const CLAUDE_SCHEMA_DEFAULT_MODEL = "opus";
+export const CLAUDE_SCHEMA_DEFAULT_MODEL: ModelId = "opus";
 
 /** Exhaustive provider registry — TypeScript errors if a Provider is missing. */
 export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
@@ -1178,6 +1218,28 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
 };
 
 /**
+ * List providers from the closed PROVIDERS registry (pure; no CLI).
+ *
+ * Prefer this over scraping JSON Schema when agents or scripts need a typed
+ * catalog of what this installed extension version supports.
+ */
+export function listProvidersFromRegistry(): ProviderInfo[] {
+  return (Object.keys(PROVIDERS) as Provider[])
+    .sort()
+    .map((id) => {
+      const caps = PROVIDERS[id];
+      const info: ProviderInfo = {
+        id,
+        supportsListModels: caps.parseModelsList !== undefined,
+      };
+      if (caps.defaultModel !== undefined) {
+        info.defaultModel = caps.defaultModel;
+      }
+      return info;
+    });
+}
+
+/**
  * Resolve the model id for an invocation.
  *
  * Priority:
@@ -1190,10 +1252,11 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
  */
 export function resolveModel(
   provider: Provider,
-  explicit: string | undefined,
-  globalDefault: string,
-): string {
-  if (explicit !== undefined && explicit !== "") return explicit;
+  explicit: ModelId | undefined,
+  globalDefault: ModelId,
+): ModelId {
+  // Treat omit / "" / whitespace as "no explicit" (schema also rejects blanks).
+  if (isPresentModelId(explicit)) return explicit.trim();
   const providerDefault = PROVIDERS[provider].defaultModel;
   if (
     provider !== "claude" &&
@@ -1382,9 +1445,10 @@ type MethodContext = {
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
  *
- * Provides three methods:
+ * Provides four methods:
  * - `invoke` — run a CLI agent and record structured results
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
+ * - `listProviders` — list providers from the closed PROVIDERS registry
  * - `listModels` — enumerate the models available to a provider's CLI
  */
 /** Shared invoke / invokeAndParse argument schema (single source for both). */
@@ -1393,9 +1457,9 @@ const InvokeArgsSchema = z.object({
   provider: ProviderEnum.optional().describe(
     "Override the default provider",
   ),
-  model: z.string().optional().describe(
-    "Override the default model (e.g. 'opus', 'sonnet', 'grok-4.5'). " +
-      "When omitted, uses the provider's defaultModel from PROVIDERS, then global defaultModel.",
+  model: ModelIdSchema.optional().describe(
+    "Override the default model. When omitted, uses the provider's defaultModel " +
+      "from PROVIDERS, then global defaultModel.",
   ),
   cwd: z.string().optional().describe(
     "Working directory for the CLI (defaults to Deno.cwd())",
@@ -1416,9 +1480,12 @@ const ListModelsArgsSchema = z.object({
 });
 type ListModelsArgs = z.infer<typeof ListModelsArgsSchema>;
 
+const ListProvidersArgsSchema = z.object({});
+type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
+
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.11.5",
+  version: "2026.07.11.8",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -1438,6 +1505,13 @@ export const model = {
     modelList: {
       description: "Models available to a provider's CLI",
       schema: ModelListSchema,
+      lifetime: "7d" as const,
+      garbageCollection: 5,
+    },
+    providerList: {
+      description:
+        "CLI providers supported by this extension version (from PROVIDERS registry)",
+      schema: ProviderListSchema,
       lifetime: "7d" as const,
       garbageCollection: 5,
     },
@@ -1676,9 +1750,36 @@ export const model = {
       },
     },
 
+    listProviders: {
+      description:
+        "List CLI providers supported by this extension (from the closed PROVIDERS registry). Pure — does not shell out. Use listModels to enumerate model ids for a provider that supports it.",
+      arguments: ListProvidersArgsSchema,
+      execute: async (
+        _args: ListProvidersArgs,
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const providers = listProvidersFromRegistry();
+        const handle = await context.writeResource(
+          "providerList",
+          "providers",
+          {
+            providers,
+            count: providers.length,
+            listedAt: new Date().toISOString(),
+          },
+        );
+
+        context.logger.info("{count} providers available", {
+          count: providers.length,
+        });
+
+        return { dataHandles: [handle] };
+      },
+    },
+
     listModels: {
       description:
-        "List the model identifiers available to a provider's CLI (any provider with parseModelsList in PROVIDERS — currently opencode and grok)",
+        "List the model identifiers available to a provider's CLI (any provider with parseModelsList in PROVIDERS — currently opencode and grok). Prefer listProviders to see which providers support enumeration.",
       arguments: ListModelsArgsSchema,
       execute: async (
         args: ListModelsArgs,
@@ -1688,7 +1789,7 @@ export const model = {
         const caps = PROVIDERS[provider];
         if (!caps.parseModelsList) {
           throw new Error(
-            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command (no parseModelsList in PROVIDERS). Use a provider that declares one (e.g. opencode, grok).`,
+            `Model enumeration is not supported for '${provider}' — its CLI has no model-listing command (no parseModelsList in PROVIDERS). Run listProviders to see which providers set supportsListModels, or use a provider that declares one (e.g. opencode, grok).`,
           );
         }
 
