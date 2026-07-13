@@ -62,7 +62,13 @@
   (literal (string-append HOME "/.npmrc"))
   ; Docker registry auth
   (literal (string-append HOME "/.docker/config.json"))
-  ; macOS keychains (login keychain holds Safari/Chrome/system secrets)
+  ; macOS keychains (login keychain holds Safari/Chrome/system secrets).
+  ; The login keychain's DB file is re-allowed for read below (carve-out) so
+  ; that provider CLIs authenticated via Keychain (e.g. claude on machines
+  ; where `security find-generic-password -s "Claude Code-credentials"` is
+  ; the auth source, not ~/.claude/.credentials.json) still work sandboxed.
+  ; Every OTHER keychain (metadata.keychain-db, any additional user
+  ; keychains) stays denied.
   (subpath (string-append HOME "/Library/Keychains"))
   ; 1Password CLI/daemon socket + config
   (subpath (string-append HOME "/.config/op"))
@@ -77,6 +83,60 @@
   ; OpenCode CLI's own auth store
   (literal (string-append HOME "/.local/share/opencode/auth.json"))
 )
+
+; --- Re-allow read of the LOGIN keychain DB only -----------------------------
+;
+; Researched on this machine (macOS 26.3 arm64): claude's auth lives in the
+; macOS Keychain under service "Claude Code-credentials", read via
+; `security find-generic-password -s "Claude Code-credentials"` — NOT via
+; ~/.claude/.credentials.json. Under the deny above, that lookup fails with
+; the SAME error/exit code (44, "The specified item could not be found in the
+; keychain") as a genuine missing item, i.e. Seatbelt denials are invisible at
+; the CLI's error-message layer — sandboxed claude just reports "Not logged
+; in" with no hint that it's a sandbox issue, not a real logged-out state.
+;
+; Captured via `log stream --predicate '(process == "sandboxd") OR
+; (subsystem == "com.apple.sandbox") OR (composedMessage CONTAINS
+; "Sandbox:")'` while re-running the denied lookup, the kernel-level denial
+; is:
+;   Sandbox: security(<pid>) deny(1) file-read-metadata /Users/mat/Library/Keychains
+;   Sandbox: security(<pid>) deny(1) file-read-metadata /Users/mat/Library/Keychains/login.keychain-db
+; Only file-read-metadata was denied — no mach-lookup denial for
+; com.apple.securityd/SecurityServer appeared for this process. On this
+; system's Seatbelt/securityd version, the actual credential fetch apparently
+; happens through a mach service that `(allow default)` already permits (no
+; mach-lookup entry needed here); the file-read* deny above is the only
+; blocker. If a future macOS version starts denying that mach lookup too, the
+; log would show `deny(1) mach-lookup com.apple.securityd` (or
+; com.apple.SecurityServer) and the fix would need
+; `(allow mach-lookup (global-name "com.apple.securityd"))` alongside this.
+;
+; Fix: re-allow file-read* (data AND metadata — `file-read*` is the
+; superclass) on ONLY the login keychain DB and its SQLite WAL-mode sidecars
+; (not present on this machine today, but included defensively since a
+; keychain can rotate into WAL mode). This must be `(allow file-read* ...)`,
+; not just `file-read-metadata`, because the confirmed real denial was on
+; -metadata but the underlying keychain read syscalls also need file-read-data
+; access to actually fetch the secret payload. Every other keychain file
+; (metadata.keychain-db, any additional/other user keychains) remains denied
+; by the broader subpath deny above, since this carve-out only names the
+; login keychain literally rather than re-allowing the whole subpath.
+;
+; Tradeoff: this allows a sandboxed process to read the ENTIRE login
+; keychain, not just the "Claude Code-credentials" item — Seatbelt has no
+; concept of "this one keychain item." Any provider CLI (or a compromised
+; one) running inside this sandbox could read other secrets stored in the
+; same login keychain (Wi-Fi passwords, Safari-saved logins, other apps'
+; generic-password items). This is accepted as the minimal fix because (a)
+; the login keychain is unlocked and already readable by every unsandboxed
+; process the user runs anyway, so this does not grant a NEW capability
+; relative to running the CLI unsandboxed, and (b) write access to this file
+; is NOT granted — see the write-deny section below, which still blocks
+; sandboxed processes from tampering with the keychain DB itself.
+(allow file-read*
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db"))
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db-shm"))
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db-wal")))
 
 ; --- Restrict writes to cwd + tmp + known CLI state dirs ---------------------
 ;
