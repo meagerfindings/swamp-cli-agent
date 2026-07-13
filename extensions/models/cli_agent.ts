@@ -555,8 +555,23 @@ const CLAUDE_ALLOWED_TOOLS: Record<ToolProfile, string> = {
   actor: "Read Grep Glob Edit Write Bash",
 };
 
-/** Build the command array for the Claude CLI. */
-function buildClaudeCommand(
+/**
+ * Build the command array for the Claude CLI.
+ *
+ * `--allowedTools`/`--allowed-tools` is declared variadic (`<tools...>`) by
+ * the claude CLI (v2.1.207 confirmed via `claude --help`), meaning it greedily
+ * consumes every following argv token — including the trailing prompt
+ * positional. Passed as two separate argv entries (`"--allowedTools",
+ * "Read Grep Glob"`), claude swallows the prompt into the tools list and then
+ * fails with "Input must be provided either through stdin or as a prompt
+ * argument when using --print" because no positional prompt remains. Using
+ * the `--flag=value` form instead keeps the whole value (including its
+ * internal spaces) as a single argv token, so the variadic parser can't reach
+ * past it to grab the next argv entry. Verified manually: the equals-form
+ * both delivers the prompt AND enforces the allowlist (a disallowed Write
+ * call was denied under `--allowedTools="Read Grep Glob"`).
+ */
+export function buildClaudeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
@@ -572,8 +587,7 @@ function buildClaudeCommand(
     "stream-json",
     "--permission-mode",
     "dontAsk",
-    "--allowedTools",
-    CLAUDE_ALLOWED_TOOLS[toolProfile],
+    "--allowedTools=" + CLAUDE_ALLOWED_TOOLS[toolProfile],
   ];
   cmd.push(resolvedPrompt);
   return { cmd };

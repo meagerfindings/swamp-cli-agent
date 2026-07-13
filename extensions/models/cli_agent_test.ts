@@ -8,6 +8,7 @@
 
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  buildClaudeCommand,
   buildGrokCommand,
   extractError,
   extractTextFromOutput,
@@ -494,6 +495,58 @@ Available models:
   * grok-4.5 (default)
   - grok-composer-2.5-fast
 `;
+
+Deno.test("buildClaudeCommand: actor profile emits single equals-form --allowedTools arg, prompt trails", () => {
+  const { cmd, stdin } = buildClaudeCommand(
+    "claude",
+    "opus",
+    "Reply with only: hi",
+    "actor",
+  );
+  assertEquals(cmd, [
+    "claude",
+    "--model",
+    "opus",
+    "--print",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools=Read Grep Glob Edit Write Bash",
+    "Reply with only: hi",
+  ]);
+  assertEquals(stdin, undefined);
+  // The tools value must be a single argv entry (equals-form), not split into
+  // two entries — `--allowedTools <tools...>` is variadic in claude v2.1.207
+  // and would otherwise swallow the trailing prompt positional.
+  assertEquals(cmd.includes("--allowedTools"), false);
+  assertEquals(cmd[cmd.length - 1], "Reply with only: hi");
+});
+
+Deno.test("buildClaudeCommand: readonly profile scopes allowedTools, prompt still trails", () => {
+  const { cmd } = buildClaudeCommand(
+    "claude",
+    "sonnet",
+    "Reply with only: hi",
+    "readonly",
+  );
+  assertEquals(cmd, [
+    "claude",
+    "--model",
+    "sonnet",
+    "--print",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools=Read Grep Glob",
+    "Reply with only: hi",
+  ]);
+  assertEquals(cmd.includes("--allowedTools"), false);
+  assertEquals(cmd[cmd.length - 1], "Reply with only: hi");
+});
 
 Deno.test("buildGrokCommand: actor profile argv contract, no stdin, no --no-auto-update", () => {
   const { cmd, stdin } = buildGrokCommand(
