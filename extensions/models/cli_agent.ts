@@ -64,6 +64,13 @@ export function isProvider(p: string): p is Provider {
  */
 const ToolProfileEnum = z.enum(["readonly", "actor"]);
 
+/**
+ * OS-level sandbox engine for the spawned CLI subprocess.
+ * "off" (default) — no OS sandbox; "seatbelt" — wrap the spawn in macOS
+ * `sandbox-exec` using the shipped `cli_agent.sandbox.sb` profile.
+ */
+const SandboxModeEnum = z.enum(["off", "seatbelt"]);
+
 /** Global configuration arguments shared across all method invocations. */
 const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -85,6 +92,19 @@ const GlobalArgsSchema = z.object({
   idleTimeoutMs: z.number().default(600_000),
   wallTimeoutMs: z.number().default(3_600_000),
   maxRetries: z.number().default(2),
+  // Sandbox: opt-in OS-level confinement of the spawned CLI subprocess. Default
+  // OFF so existing swamp users/instances are unaffected until they configure
+  // it. See wrapWithSandbox for the wrap point and cli_agent.sandbox.sb for the
+  // deny-secrets/allow-egress first-cut policy.
+  sandboxMode: SandboxModeEnum.default("off").describe(
+    "OS-level sandbox for the spawned CLI: 'off' (default) or 'seatbelt' (macOS sandbox-exec)",
+  ),
+  sandboxProfile: z.string().optional().describe(
+    "Override path to the Seatbelt .sb profile (defaults to the shipped cli_agent.sandbox.sb next to this model)",
+  ),
+  sandboxRequired: z.boolean().default(false).describe(
+    "When true, fail the invocation instead of degrading if sandboxMode is 'seatbelt' but the platform can't apply it (non-Darwin or sandbox-exec missing). Default false: warn and run unsandboxed.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -247,6 +267,102 @@ type CmdResult = {
 /** How long to wait for a SIGTERM'd child to exit before escalating to SIGKILL. */
 const SIGKILL_GRACE_MS = 5_000;
 
+/** Resolved sandbox configuration passed down to {@link wrapWithSandbox}. */
+type SandboxConfig = {
+  mode: "off" | "seatbelt";
+  /** Path to the Seatbelt .sb profile; only read when mode is "seatbelt". */
+  profilePath: string;
+  /** Fail closed (throw) instead of warn-and-degrade when unavailable. */
+  required: boolean;
+};
+
+/** Absolute path to the .sb profile shipped alongside this model file. */
+const DEFAULT_SANDBOX_PROFILE = new URL(
+  "./cli_agent.sandbox.sb",
+  import.meta.url,
+).pathname;
+
+/**
+ * Wrap `cmd` in a macOS Seatbelt (`sandbox-exec`) invocation, or return it
+ * unchanged.
+ *
+ * This is the single seam every provider CLI spawn passes through (via
+ * {@link runCli}), so the confinement policy in `cli_agent.sandbox.sb`
+ * (deny ambient secrets, restrict writes to cwd/tmp, allow egress — see that
+ * file's header for the full first-cut rationale) applies uniformly to
+ * claude/codex/amp/gemini/grok/opencode without touching their individual
+ * `build*Command` functions.
+ *
+ * Behavior:
+ * - `mode: "off"` → returns `cmd` unchanged (no-op; this is the default).
+ * - `mode: "seatbelt"` on Darwin with `/usr/bin/sandbox-exec` present →
+ *   prefixes `cmd` with `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
+ * - `mode: "seatbelt"` but the platform can't apply it (non-Darwin, or
+ *   `sandbox-exec` missing) → **warn-and-degrade**: log a loud warning and
+ *   return `cmd` unchanged, so an imperfectly-configured swamp install never
+ *   hard-crashes on a platform mismatch. UNLESS `required: true`, in which
+ *   case this throws instead — the fail-closed path for callers running
+ *   untrusted input (e.g. a future PR-watcher wiring) that must never fall
+ *   back to unsandboxed execution silently.
+ *
+ * `cwd` defaults to `Deno.cwd()` (matching how the two runCli call sites
+ * already resolve cwd) so the `CWD` param always has a concrete value even
+ * when the caller omits one.
+ *
+ * `sandboxExecPath` defaults to the real `/usr/bin/sandbox-exec` and exists
+ * as a parameter purely so unit tests can point at a nonexistent path to
+ * exercise the warn-and-degrade / fail-closed branches deterministically on
+ * any machine (including one that genuinely has sandbox-exec) without
+ * mocking `Deno.build.os` or the filesystem.
+ */
+export function wrapWithSandbox(
+  cmd: string[],
+  cwd: string | undefined,
+  sandbox: SandboxConfig,
+  logger?: MethodContext["logger"],
+  sandboxExecPath = "/usr/bin/sandbox-exec",
+): string[] {
+  if (sandbox.mode === "off") return cmd;
+
+  const isDarwin = Deno.build.os === "darwin";
+  const sandboxExecAvailable = isDarwin &&
+    (() => {
+      try {
+        return Deno.statSync(sandboxExecPath).isFile;
+      } catch {
+        return false;
+      }
+    })();
+
+  if (!sandboxExecAvailable) {
+    const reason = isDarwin
+      ? `${sandboxExecPath} not found`
+      : `unsupported platform (${Deno.build.os}, seatbelt is macOS-only)`;
+    if (sandbox.required) {
+      throw new Error(
+        `sandboxMode is 'seatbelt' and sandboxRequired is true, but the sandbox cannot be applied: ${reason}. Refusing to run unsandboxed.`,
+      );
+    }
+    logger?.warning(
+      "Seatbelt sandbox requested but unavailable ({reason}) — running UNSANDBOXED. Set sandboxRequired=true to fail closed instead.",
+      { reason },
+    );
+    return cmd;
+  }
+
+  const home = Deno.env.get("HOME") ?? "";
+  return [
+    sandboxExecPath,
+    "-f",
+    sandbox.profilePath,
+    "-D",
+    `CWD=${cwd ?? Deno.cwd()}`,
+    "-D",
+    `HOME=${home}`,
+    ...cmd,
+  ];
+}
+
 /**
  * Spawn a CLI subprocess with optional stdin and two independent timeouts:
  *
@@ -262,6 +378,15 @@ const SIGKILL_GRACE_MS = 5_000;
  * timeout the child is SIGTERM'd, then SIGKILL'd if it ignores SIGTERM, so a
  * wedged process can never hold the caller (and the swamp model lock) open
  * indefinitely.
+ *
+ * When `opts.sandbox` is set (mode !== "off"), `cmd` is passed through
+ * {@link wrapWithSandbox} first — this is the single choke point every
+ * provider CLI spawns through, so the OS-level confinement applies uniformly.
+ * The child Deno.Command then becomes `sandbox-exec`, which execs the real
+ * CLI as a grandchild; SIGTERM/SIGKILL still target the direct child
+ * (sandbox-exec), and the existing `cancelStreams` handling above already
+ * tolerates surviving grandchildren holding the pipe open, so no changes were
+ * needed to the kill/drain logic below for this to work correctly.
  */
 async function runCli(
   cmd: string[],
@@ -270,11 +395,16 @@ async function runCli(
     stdin?: string;
     wallTimeoutMs: number;
     idleTimeoutMs?: number;
+    sandbox?: SandboxConfig;
+    logger?: MethodContext["logger"];
   },
 ): Promise<CmdResult> {
+  const effectiveCmd = opts.sandbox
+    ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
+    : cmd;
   const start = performance.now();
-  const command = new Deno.Command(cmd[0], {
-    args: cmd.slice(1),
+  const command = new Deno.Command(effectiveCmd[0], {
+    args: effectiveCmd.slice(1),
     stdout: "piped",
     stderr: "piped",
     stdin: opts.stdin ? "piped" : "null",
@@ -1426,6 +1556,22 @@ function cliPathFor(provider: Provider, g: GlobalArgs): string {
   return PROVIDERS[provider].cliPath(g);
 }
 
+/**
+ * Build a {@link SandboxConfig} from global args, with optional per-invocation
+ * overrides (mirrors how `toolProfile` is threaded: global default, overridable
+ * per call).
+ */
+function sandboxConfigFrom(
+  g: GlobalArgs,
+  overrides?: { sandboxMode?: "off" | "seatbelt"; sandboxRequired?: boolean },
+): SandboxConfig {
+  return {
+    mode: overrides?.sandboxMode ?? g.sandboxMode,
+    profilePath: g.sandboxProfile ?? DEFAULT_SANDBOX_PROFILE,
+    required: overrides?.sandboxRequired ?? g.sandboxRequired,
+  };
+}
+
 /** The fully-resolved outcome of running a provider CLI (with retries). */
 type RunOutcome = {
   result: CmdResult;
@@ -1462,6 +1608,7 @@ async function runWithRetries(
     wallTimeoutMs: number;
     idleTimeoutMs: number;
     maxRetries: number;
+    sandbox?: SandboxConfig;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -1483,6 +1630,8 @@ async function runWithRetries(
       stdin,
       wallTimeoutMs: opts.wallTimeoutMs,
       idleTimeoutMs: opts.idleTimeoutMs,
+      sandbox: opts.sandbox,
+      logger,
     });
     // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
     // cannot silent-succeed. Policy lives on the provider registry.
@@ -1633,6 +1782,12 @@ const InvokeArgsSchema = z.object({
   toolProfile: ToolProfileEnum.optional().describe(
     "Scoped permission profile: 'readonly' (read/search only) or 'actor' (also edit/write/run shell). Defaults to defaultToolProfile.",
   ),
+  sandboxMode: SandboxModeEnum.optional().describe(
+    "Override the global sandboxMode for this invocation: 'off' or 'seatbelt'.",
+  ),
+  sandboxRequired: z.boolean().optional().describe(
+    "Override the global sandboxRequired for this invocation: fail closed instead of warn-and-degrade when the sandbox can't be applied.",
+  ),
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -1648,7 +1803,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.13.2",
+  version: "2026.07.13.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
@@ -1719,7 +1874,16 @@ export const model = {
           modelName,
           resolved,
           toolProfile,
-          { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
+          {
+            cwd,
+            wallTimeoutMs,
+            idleTimeoutMs,
+            maxRetries,
+            sandbox: sandboxConfigFrom(context.globalArgs, {
+              sandboxMode: args.sandboxMode,
+              sandboxRequired: args.sandboxRequired,
+            }),
+          },
           context.logger,
         );
 
@@ -1835,7 +1999,16 @@ export const model = {
           modelName,
           resolved,
           toolProfile,
-          { cwd, wallTimeoutMs, idleTimeoutMs, maxRetries },
+          {
+            cwd,
+            wallTimeoutMs,
+            idleTimeoutMs,
+            maxRetries,
+            sandbox: sandboxConfigFrom(context.globalArgs, {
+              sandboxMode: args.sandboxMode,
+              sandboxRequired: args.sandboxRequired,
+            }),
+          },
           context.logger,
         );
         const { result, extractedText, providerError } = outcome;
@@ -1965,7 +2138,11 @@ export const model = {
         const cliPath = caps.cliPath(context.globalArgs);
         const result = await runCli(
           [cliPath, "models"],
-          { wallTimeoutMs: 60_000 },
+          {
+            wallTimeoutMs: 60_000,
+            sandbox: sandboxConfigFrom(context.globalArgs),
+            logger: context.logger,
+          },
         );
         if (!result.success) {
           throw new Error(

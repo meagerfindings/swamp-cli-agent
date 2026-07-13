@@ -1,0 +1,130 @@
+; cli_agent.sandbox.sb — macOS Seatbelt (sandbox-exec) profile for spawned
+; provider CLIs (claude/codex/amp/gemini/grok/opencode).
+;
+; FIRST CUT / PERMISSIVE BASELINE — read this before editing.
+;
+; Posture: `(allow default)` + explicit `(deny file-read* ...)` on a known
+; ambient-secret set, plus a `(deny file-write* ...)` scoped to everything
+; under $HOME except cwd/tmp/state dirs a CLI legitimately needs. This is
+; deliberately NOT a `(deny default)` profile. A full deny-default profile is
+; the *hardening* step (tighten later, once the allow-list of what a real
+; coding-agent toolchain touches — dynamic linker paths, sysctl, mach
+; services, language-runtime caches, etc. — has been enumerated and proven
+; non-breaking). Shipping deny-default as the first cut risks silently
+; breaking git/node/deno/ruby/toolchains in ways that are expensive to
+; diagnose from a swamp method run. Prove-then-tighten: this profile proves
+; the confinement works (secrets denied, writes scoped) without gambling on
+; breaking every legitimate host-toolchain call the agent needs to make.
+;
+; Network egress is intentionally ALLOWED in this cut (`(allow network*)`).
+; Domain-level egress control is a later bet (S4) — out of scope here.
+;
+; Params (fill via `sandbox-exec -D CWD=... -D HOME=... -f this-file`):
+;   CWD  — the invocation's working directory (writes are scoped to this).
+;   HOME — the invoking user's home directory (secret paths are relative to it).
+;
+; Denied-secret set (see cli_agent.ts wrapWithSandbox doc comment for the
+; researched-on-this-machine path list this mirrors):
+;   ~/.ssh, ~/.aws, ~/.config/gcloud, ~/.config/gh, ~/.gnupg, ~/.npmrc,
+;   ~/.docker/config.json, ~/Library/Keychains, ~/.config/op,
+;   ~/.claude.json, ~/.claude/.credentials.json, ~/.codex/auth.json,
+;   ~/.codex/config.toml, ~/.config/amp, ~/.local/share/opencode/auth.json.
+;
+; Note the CLI's own *non-credential* state (e.g. ~/.claude/projects,
+; ~/.claude/history.jsonl, ~/.codex/history.jsonl) is intentionally NOT
+; denied for read — a coding agent needs to function, and blanket-denying an
+; entire ~/.claude or ~/.codex directory breaks it. Only the specific
+; credential/token/keyring files are denied.
+
+(version 1)
+
+(allow default)
+
+(import "system.sb")
+
+(define CWD (param "CWD"))
+(define HOME (param "HOME"))
+
+; --- Deny read of ambient secrets --------------------------------------------
+
+(deny file-read*
+  ; SSH keys
+  (subpath (string-append HOME "/.ssh"))
+  ; AWS credentials/config
+  (subpath (string-append HOME "/.aws"))
+  ; gcloud credentials
+  (subpath (string-append HOME "/.config/gcloud"))
+  ; GitHub CLI token/config (hosts.yml holds the oauth token)
+  (subpath (string-append HOME "/.config/gh"))
+  ; GnuPG secret keyring
+  (subpath (string-append HOME "/.gnupg"))
+  ; npm registry auth token
+  (literal (string-append HOME "/.npmrc"))
+  ; Docker registry auth
+  (literal (string-append HOME "/.docker/config.json"))
+  ; macOS keychains (login keychain holds Safari/Chrome/system secrets)
+  (subpath (string-append HOME "/Library/Keychains"))
+  ; 1Password CLI/daemon socket + config
+  (subpath (string-append HOME "/.config/op"))
+  ; Claude Code's own top-level config + OAuth credentials
+  (literal (string-append HOME "/.claude.json"))
+  (literal (string-append HOME "/.claude/.credentials.json"))
+  ; Codex CLI's own OAuth/API credentials + config (may embed API keys)
+  (literal (string-append HOME "/.codex/auth.json"))
+  (literal (string-append HOME "/.codex/config.toml"))
+  ; Amp CLI settings (may embed an API key)
+  (subpath (string-append HOME "/.config/amp"))
+  ; OpenCode CLI's own auth store
+  (literal (string-append HOME "/.local/share/opencode/auth.json"))
+)
+
+; --- Restrict writes to cwd + tmp + known CLI state dirs ---------------------
+;
+; Deny writes anywhere under $HOME first, then re-allow the specific
+; subtrees a CLI legitimately needs (cwd, its own non-credential state,
+; shared caches). Order matters: Seatbelt evaluates rules with later/more
+; specific rules taking precedence over earlier broader ones for the same
+; operation class, so the `(allow file-write* (subpath CWD))` etc. below
+; carve back out of this deny.
+
+(deny file-write*
+  (subpath HOME))
+
+(allow file-write*
+  (subpath CWD)
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/var/folders")
+  ; Deno's own temp/cache dirs (TMPDIR is usually under /var/folders, covered
+  ; above, but some setups point it elsewhere under $HOME — allow explicitly).
+  (subpath (string-append HOME "/.cache"))
+  (subpath (string-append HOME "/.deno"))
+  ; Claude Code's / Codex's / OpenCode's own NON-credential state (sessions,
+  ; history, caches). These CLIs must be able to write their working state to
+  ; function. The specific credential files that live INSIDE these subtrees
+  ; are clawed back below with an explicit write-deny — read-deny alone is not
+  ; enough, because a later/more-specific write-allow subpath would otherwise
+  ; let a sandboxed process OVERWRITE (sabotage) a credential file it cannot
+  ; read. Both a read-deny (above) and a write-deny (below) cover each of them.
+  (subpath (string-append HOME "/.claude"))
+  (subpath (string-append HOME "/.codex"))
+  (subpath (string-append HOME "/.config/opencode"))
+  (subpath (string-append HOME "/.local/share/opencode")))
+
+; --- Re-deny writes to credential files inside write-allowed subtrees --------
+;
+; Placed AFTER the write-allow block so it wins by Seatbelt rule order (later
+; rule takes precedence). Every file named in the read-deny set that also
+; falls under one of the write-allow subpaths above MUST appear here, or a
+; sandboxed process could clobber a credential it is forbidden to read
+; (credential-sabotage / DoS). Cross-checked against the full read-deny list:
+; these four are the only read-denied paths that are write-reachable.
+
+(deny file-write*
+  ; Claude Code OAuth credentials (inside the write-allowed ~/.claude subtree)
+  (literal (string-append HOME "/.claude/.credentials.json"))
+  ; Codex OAuth/API credentials + config (inside write-allowed ~/.codex)
+  (literal (string-append HOME "/.codex/auth.json"))
+  (literal (string-append HOME "/.codex/config.toml"))
+  ; OpenCode auth store (inside write-allowed ~/.local/share/opencode)
+  (literal (string-append HOME "/.local/share/opencode/auth.json")))

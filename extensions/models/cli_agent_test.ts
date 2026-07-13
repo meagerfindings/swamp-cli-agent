@@ -18,6 +18,7 @@ import {
   parseGrokModelsList,
   PROVIDERS,
   resolveModel,
+  wrapWithSandbox,
 } from "./cli_agent.ts";
 
 // --- Fixtures ---------------------------------------------------------------
@@ -716,4 +717,90 @@ Deno.test("listProvidersFromRegistry: closed catalog with listModels capability 
   assertEquals(byId.opencode.defaultModel, undefined);
   assertEquals(byId.codex.supportsListModels, false);
   assertEquals(byId.codex.defaultModel, undefined);
+});
+
+// --- wrapWithSandbox (Seatbelt sandbox wrap point) --------------------------
+
+Deno.test("wrapWithSandbox: mode 'off' returns cmd unchanged", () => {
+  const cmd = ["claude", "--print", "hi"];
+  const out = wrapWithSandbox(cmd, "/tmp/wd", {
+    mode: "off",
+    profilePath: "/some/profile.sb",
+    required: false,
+  });
+  assertEquals(out, cmd);
+});
+
+Deno.test("wrapWithSandbox: mode 'seatbelt' + sandbox-exec available produces the correct argv (this machine is Darwin with real sandbox-exec)", () => {
+  const cmd = ["claude", "--print", "hi"];
+  const out = wrapWithSandbox(cmd, "/tmp/wd", {
+    mode: "seatbelt",
+    profilePath: "/path/to/cli_agent.sandbox.sb",
+    required: false,
+  });
+  assertEquals(out, [
+    "/usr/bin/sandbox-exec",
+    "-f",
+    "/path/to/cli_agent.sandbox.sb",
+    "-D",
+    "CWD=/tmp/wd",
+    "-D",
+    `HOME=${Deno.env.get("HOME") ?? ""}`,
+    "claude",
+    "--print",
+    "hi",
+  ]);
+});
+
+Deno.test("wrapWithSandbox: cwd defaults to Deno.cwd() when omitted", () => {
+  const cmd = ["claude"];
+  const out = wrapWithSandbox(cmd, undefined, {
+    mode: "seatbelt",
+    profilePath: "/profile.sb",
+    required: false,
+  });
+  assertEquals(out[4], `CWD=${Deno.cwd()}`);
+});
+
+Deno.test("wrapWithSandbox: unavailable sandbox-exec + not required degrades to unsandboxed cmd and warns", () => {
+  const cmd = ["claude", "--print", "hi"];
+  let warned = false;
+  let warnedReason: unknown;
+  const logger = {
+    info: () => {},
+    warning: (_msg: string, props?: Record<string, unknown>) => {
+      warned = true;
+      warnedReason = props?.reason;
+    },
+    error: () => {},
+  };
+  const out = wrapWithSandbox(
+    cmd,
+    "/tmp/wd",
+    { mode: "seatbelt", profilePath: "/profile.sb", required: false },
+    logger,
+    "/nonexistent/sandbox-exec",
+  );
+  assertEquals(out, cmd);
+  assertEquals(warned, true);
+  assertEquals(
+    String(warnedReason).includes("/nonexistent/sandbox-exec"),
+    true,
+  );
+});
+
+Deno.test("wrapWithSandbox: unavailable sandbox-exec + sandboxRequired throws instead of degrading", () => {
+  const cmd = ["claude", "--print", "hi"];
+  assertThrows(
+    () =>
+      wrapWithSandbox(
+        cmd,
+        "/tmp/wd",
+        { mode: "seatbelt", profilePath: "/profile.sb", required: true },
+        undefined,
+        "/nonexistent/sandbox-exec",
+      ),
+    Error,
+    "sandboxRequired is true",
+  );
 });
