@@ -40,7 +40,7 @@ type Provider = z.infer<typeof ProviderEnum>;
  * surface and change without this extension's release cycle. Use this alias
  * so call sites document intent; do not turn it into an enum of known ids.
  *
- * Non-empty after trim: blank/whitespace is not a model id (CORR-2 / IDIOM-1).
+ * Non-empty after trim: blank/whitespace is not a model id.
  */
 export const ModelIdSchema = z.string().trim().min(1).describe(
   "CLI-specific model id (e.g. opus, sonnet, gpt-5.5, grok-4.5)",
@@ -148,7 +148,7 @@ const ProviderInfoSchema = z.object({
   ),
 });
 
-/** Domain provider-catalog entry — derived from schema (IDIOM-1; no hand-dup). */
+/** Domain provider-catalog entry — derived from the schema, not hand-duplicated. */
 export type ProviderInfo = z.infer<typeof ProviderInfoSchema>;
 
 /** Schema for the result of listing supported CLI providers. */
