@@ -2176,7 +2176,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.13.3",
+  version: "2026.07.13.7",
   globalArguments: GlobalArgsSchema,
   resources: {
     invocation: {
