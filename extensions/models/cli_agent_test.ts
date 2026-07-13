@@ -12,12 +12,15 @@ import {
   extractError,
   extractTextFromOutput,
   extractUsage,
+  GlobalArgsSchema,
   isProvider,
   listProvidersFromRegistry,
   ModelIdSchema,
   parseGrokModelsList,
   PROVIDERS,
   resolveModel,
+  SANDBOX_PROFILE_FILENAME,
+  sandboxConfigFrom,
   wrapWithSandbox,
 } from "./cli_agent.ts";
 
@@ -803,4 +806,83 @@ Deno.test("wrapWithSandbox: unavailable sandbox-exec + sandboxRequired throws in
     Error,
     "sandboxRequired is true",
   );
+});
+
+// --- sandboxConfigFrom (default profile resolution) -------------------------
+//
+// Regression guard for the ship-time bug where the default profile was resolved
+// via `new URL("./cli_agent.sandbox.sb", import.meta.url)` (i.e. next to the
+// model .ts). The `.sb` ships through the manifest `binaries` field, which lands
+// it in the extension's files root — `<ext>/files/` when pulled, NOT `models/`.
+// So the URL-relative resolution pointed at a nonexistent path once pulled and
+// the sandbox silently failed to load. The fix resolves the default lazily via
+// `ctx.extensionFile(SANDBOX_PROFILE_FILENAME)`, which is layout-agnostic.
+
+/**
+ * Build a tmp dir mimicking the PULLED extension layout:
+ *   <root>/models/cli_agent.ts        (the model)
+ *   <root>/files/cli_agent.sandbox.sb (the binary, where swamp actually ships it)
+ * Returns the files-root dir (what `ctx.extensionFile` closes over when pulled)
+ * and the absolute .sb path inside it.
+ */
+function makePulledLayout(): { filesRoot: string; sbPath: string } {
+  const root = Deno.makeTempDirSync({ prefix: "cli_agent_pulled_" });
+  Deno.mkdirSync(`${root}/models`);
+  Deno.mkdirSync(`${root}/files`);
+  Deno.writeTextFileSync(`${root}/models/cli_agent.ts`, "// pulled model\n");
+  const sbPath = `${root}/files/${SANDBOX_PROFILE_FILENAME}`;
+  Deno.writeTextFileSync(sbPath, "(version 1)(allow default)\n");
+  return { filesRoot: `${root}/files`, sbPath };
+}
+
+Deno.test("sandboxConfigFrom: seatbelt resolves the default profile from the pulled files/ dir (existing file)", () => {
+  const { filesRoot, sbPath } = makePulledLayout();
+  // Faithful stand-in for swamp's ctx.extensionFile: join relPath onto the
+  // files root (the pulled `files/` dir) and confirm it exists on disk.
+  const extensionFile = (relPath: string): string => {
+    const abs = `${filesRoot}/${relPath}`;
+    Deno.lstatSync(abs); // throws if missing — same contract as the runtime
+    return abs;
+  };
+
+  const g = GlobalArgsSchema.parse({});
+  const cfg = sandboxConfigFrom(
+    g,
+    () => extensionFile(SANDBOX_PROFILE_FILENAME),
+    { sandboxMode: "seatbelt" },
+  );
+
+  assertEquals(cfg.mode, "seatbelt");
+  assertEquals(cfg.profilePath, sbPath);
+  // The resolved path must point at a file that actually exists — the whole
+  // point of the bug fix.
+  assertEquals(Deno.lstatSync(cfg.profilePath).isFile, true);
+});
+
+Deno.test("sandboxConfigFrom: off (default) never invokes the resolver", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({}); // sandboxMode defaults to "off"
+  const cfg = sandboxConfigFrom(g, () => {
+    called = true;
+    return "/should/not/be/reached.sb";
+  });
+
+  assertEquals(cfg.mode, "off");
+  assertEquals(called, false); // lazy: no filesystem touch on the off path
+});
+
+Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips the resolver", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({ sandboxProfile: "/custom/profile.sb" });
+  const cfg = sandboxConfigFrom(
+    g,
+    () => {
+      called = true;
+      return "/default/should/not/be/used.sb";
+    },
+    { sandboxMode: "seatbelt" },
+  );
+
+  assertEquals(cfg.profilePath, "/custom/profile.sb");
+  assertEquals(called, false);
 });

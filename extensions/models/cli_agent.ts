@@ -72,7 +72,7 @@ const ToolProfileEnum = z.enum(["readonly", "actor"]);
 const SandboxModeEnum = z.enum(["off", "seatbelt"]);
 
 /** Global configuration arguments shared across all method invocations. */
-const GlobalArgsSchema = z.object({
+export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
   // Fallback when a provider has no entry-level default in PROVIDERS.
   // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
@@ -100,7 +100,7 @@ const GlobalArgsSchema = z.object({
     "OS-level sandbox for the spawned CLI: 'off' (default) or 'seatbelt' (macOS sandbox-exec)",
   ),
   sandboxProfile: z.string().optional().describe(
-    "Override path to the Seatbelt .sb profile (defaults to the shipped cli_agent.sandbox.sb next to this model)",
+    "Override path to the Seatbelt .sb profile (defaults to the shipped cli_agent.sandbox.sb, resolved from the extension's files dir)",
   ),
   sandboxRequired: z.boolean().default(false).describe(
     "When true, fail the invocation instead of degrading if sandboxMode is 'seatbelt' but the platform can't apply it (non-Darwin or sandbox-exec missing). Default false: warn and run unsandboxed.",
@@ -276,11 +276,21 @@ type SandboxConfig = {
   required: boolean;
 };
 
-/** Absolute path to the .sb profile shipped alongside this model file. */
-const DEFAULT_SANDBOX_PROFILE = new URL(
-  "./cli_agent.sandbox.sb",
-  import.meta.url,
-).pathname;
+/**
+ * Manifest-relative name of the shipped Seatbelt profile.
+ *
+ * Resolved at runtime via `ctx.extensionFile()` (see {@link sandboxConfigFrom}),
+ * NOT via `import.meta.url`. The `.sb` ships through the manifest `binaries`
+ * field, which lands it in the extension's files root — `<ext>/files/` when
+ * pulled, alongside the model+manifest in the source tree during dev/test.
+ * A previous `new URL("./cli_agent.sandbox.sb", import.meta.url)` resolved
+ * relative to `models/cli_agent.ts`, which is correct in the source tree but
+ * WRONG once pulled (the binary is in `files/`, not `models/`), so the default
+ * profile could not be found at runtime and the sandbox silently failed to
+ * load. `ctx.extensionFile()` is the documented, layout-agnostic resolver that
+ * works identically in both layouts.
+ */
+export const SANDBOX_PROFILE_FILENAME = "cli_agent.sandbox.sb";
 
 /**
  * Wrap `cmd` in a macOS Seatbelt (`sandbox-exec`) invocation, or return it
@@ -1560,14 +1570,26 @@ function cliPathFor(provider: Provider, g: GlobalArgs): string {
  * Build a {@link SandboxConfig} from global args, with optional per-invocation
  * overrides (mirrors how `toolProfile` is threaded: global default, overridable
  * per call).
+ *
+ * `resolveDefaultProfile` supplies the path to the shipped `.sb` when the caller
+ * has NOT set a `sandboxProfile` override. It is invoked lazily — only for
+ * `mode: "seatbelt"` without an override — so an `off` (default) invocation
+ * never touches the filesystem and never risks throwing when the profile can't
+ * be resolved. Production passes `() => ctx.extensionFile(SANDBOX_PROFILE_FILENAME)`;
+ * tests inject a stub so resolution can be exercised against a simulated pulled
+ * layout without a full model runtime.
  */
-function sandboxConfigFrom(
+export function sandboxConfigFrom(
   g: GlobalArgs,
+  resolveDefaultProfile: () => string,
   overrides?: { sandboxMode?: "off" | "seatbelt"; sandboxRequired?: boolean },
 ): SandboxConfig {
+  const mode = overrides?.sandboxMode ?? g.sandboxMode;
+  const profilePath = g.sandboxProfile ??
+    (mode === "seatbelt" ? resolveDefaultProfile() : "");
   return {
-    mode: overrides?.sandboxMode ?? g.sandboxMode,
-    profilePath: g.sandboxProfile ?? DEFAULT_SANDBOX_PROFILE,
+    mode,
+    profilePath,
     required: overrides?.sandboxRequired ?? g.sandboxRequired,
   };
 }
@@ -1749,6 +1771,14 @@ type MethodContext = {
     instanceName: string,
     data: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>;
+  /**
+   * Resolve a manifest-relative bundled file (an `additionalFiles`/`binaries`
+   * entry) to an absolute on-disk path. Swamp injects this; it resolves against
+   * the extension's files root — `<ext>/files/` when pulled, the source dir in
+   * dev/test — so the same relPath works in both layouts. Used to locate the
+   * shipped Seatbelt profile ({@link SANDBOX_PROFILE_FILENAME}).
+   */
+  extensionFile: (relPath: string) => string;
 };
 
 /**
@@ -1879,10 +1909,14 @@ export const model = {
             wallTimeoutMs,
             idleTimeoutMs,
             maxRetries,
-            sandbox: sandboxConfigFrom(context.globalArgs, {
-              sandboxMode: args.sandboxMode,
-              sandboxRequired: args.sandboxRequired,
-            }),
+            sandbox: sandboxConfigFrom(
+              context.globalArgs,
+              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+              {
+                sandboxMode: args.sandboxMode,
+                sandboxRequired: args.sandboxRequired,
+              },
+            ),
           },
           context.logger,
         );
@@ -2004,10 +2038,14 @@ export const model = {
             wallTimeoutMs,
             idleTimeoutMs,
             maxRetries,
-            sandbox: sandboxConfigFrom(context.globalArgs, {
-              sandboxMode: args.sandboxMode,
-              sandboxRequired: args.sandboxRequired,
-            }),
+            sandbox: sandboxConfigFrom(
+              context.globalArgs,
+              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+              {
+                sandboxMode: args.sandboxMode,
+                sandboxRequired: args.sandboxRequired,
+              },
+            ),
           },
           context.logger,
         );
@@ -2140,7 +2178,10 @@ export const model = {
           [cliPath, "models"],
           {
             wallTimeoutMs: 60_000,
-            sandbox: sandboxConfigFrom(context.globalArgs),
+            sandbox: sandboxConfigFrom(
+              context.globalArgs,
+              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+            ),
             logger: context.logger,
           },
         );
