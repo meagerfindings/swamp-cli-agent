@@ -66,10 +66,15 @@ const ToolProfileEnum = z.enum(["readonly", "actor"]);
 
 /**
  * OS-level sandbox engine for the spawned CLI subprocess.
- * "off" (default) — no OS sandbox; "seatbelt" — wrap the spawn in macOS
- * `sandbox-exec` using the shipped `cli_agent.sandbox.sb` profile.
+ * "auto" (default) — pick the backend for the current OS: Seatbelt
+ * (`sandbox-exec`) on Darwin, bwrap on Linux; degrades (or throws, if
+ * `sandboxRequired`) on any other OS or when the chosen backend's binary is
+ * missing. "off" — explicit opt-out, no sandbox. "seatbelt" / "bwrap" — force
+ * a specific backend regardless of OS-detection (useful for testing or being
+ * explicit); if the forced backend doesn't match the running OS or its binary
+ * is missing, this also degrades/throws exactly like "auto" on a mismatch.
  */
-const SandboxModeEnum = z.enum(["off", "seatbelt"]);
+const SandboxModeEnum = z.enum(["off", "auto", "seatbelt", "bwrap"]);
 
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
@@ -92,18 +97,27 @@ export const GlobalArgsSchema = z.object({
   idleTimeoutMs: z.number().default(600_000),
   wallTimeoutMs: z.number().default(3_600_000),
   maxRetries: z.number().default(2),
-  // Sandbox: opt-in OS-level confinement of the spawned CLI subprocess. Default
-  // OFF so existing swamp users/instances are unaffected until they configure
-  // it. See wrapWithSandbox for the wrap point and cli_agent.sandbox.sb for the
+  // Sandbox: OS-level confinement of the spawned CLI subprocess, DEFAULT ON via
+  // "auto" (picks Seatbelt on Darwin / bwrap on Linux; warns-and-degrades, or
+  // throws if sandboxRequired, on an unsupported OS or missing binary).
+  // Instances that need to opt OUT set sandboxMode: "off" explicitly. See
+  // wrapWithSandbox for the wrap point and cli_agent.sandbox.sb for the
   // deny-secrets/allow-egress first-cut policy.
-  sandboxMode: SandboxModeEnum.default("off").describe(
-    "OS-level sandbox for the spawned CLI: 'off' (default) or 'seatbelt' (macOS sandbox-exec)",
+  //
+  // NOTE for callers that forward this as a per-invocation override (e.g. the
+  // pr-watcher model, which passes its OWN global sandboxMode into this
+  // extension's invoke/invokeAndParse `sandboxMode` arg): an explicit override
+  // always wins over this default, so a caller whose own default is still
+  // "off" will keep disabling the sandbox here even though this default is now
+  // "auto". Downstream models must update their own default to inherit auto-on.
+  sandboxMode: SandboxModeEnum.default("auto").describe(
+    "OS-level sandbox for the spawned CLI: 'auto' (default; picks Seatbelt on Darwin or bwrap on Linux, degrades elsewhere), 'off' (explicit opt-out), 'seatbelt', or 'bwrap' (force a specific backend)",
   ),
   sandboxProfile: z.string().optional().describe(
     "Override path to the Seatbelt .sb profile (defaults to the shipped cli_agent.sandbox.sb, resolved from the extension's files dir)",
   ),
   sandboxRequired: z.boolean().default(false).describe(
-    "When true, fail the invocation instead of degrading if sandboxMode is 'seatbelt' but the platform can't apply it (non-Darwin or sandbox-exec missing). Default false: warn and run unsandboxed.",
+    "When true, fail the invocation instead of degrading when a sandbox is requested but the platform can't apply it (no backend for the OS, or the backend's binary is missing). Default false: warn and run unsandboxed.",
   ),
 });
 
@@ -269,12 +283,59 @@ const SIGKILL_GRACE_MS = 5_000;
 
 /** Resolved sandbox configuration passed down to {@link wrapWithSandbox}. */
 type SandboxConfig = {
-  mode: "off" | "seatbelt";
-  /** Path to the Seatbelt .sb profile; only read when mode is "seatbelt". */
+  mode: "off" | "auto" | "seatbelt" | "bwrap";
+  /**
+   * Path to the Seatbelt .sb profile; only read/needed when the EFFECTIVE
+   * backend (see {@link resolveEffectiveBackend}) is seatbelt.
+   */
   profilePath: string;
   /** Fail closed (throw) instead of warn-and-degrade when unavailable. */
   required: boolean;
 };
+
+/** A concrete OS-level sandbox backend, or none (no backend for this OS). */
+type SandboxBackend = "seatbelt" | "bwrap" | "none";
+
+/**
+ * Pure resolution of {@link SandboxConfig.mode} + a `Deno.build.os`-shaped OS
+ * string down to the concrete backend that {@link wrapWithSandbox} should
+ * attempt. Extracted as its own exported function (rather than inlined in
+ * `wrapWithSandbox`) so the OS-dispatch DECISION can be unit-tested for every
+ * mode/OS combination without needing to mock `Deno.build.os` (a read-only
+ * property) or touch the filesystem — `wrapWithSandbox` still owns checking
+ * whether the resolved backend's binary actually exists.
+ *
+ * Truth table:
+ * - `"off"` + any OS → `"none"` (explicit opt-out; wrapWithSandbox actually
+ *   short-circuits on `mode === "off"` before ever calling this, but the pure
+ *   mapping is included here for completeness/testability).
+ * - `"auto"` + `"darwin"` → `"seatbelt"`.
+ * - `"auto"` + `"linux"` → `"bwrap"`.
+ * - `"auto"` + anything else (e.g. `"windows"`) → `"none"` (no backend for
+ *   this OS; caller degrades-or-throws per `sandboxRequired`).
+ * - `"seatbelt"` + any OS → `"seatbelt"` (forced; if the OS isn't darwin or
+ *   the binary is missing, `wrapWithSandbox` degrades/throws on that mismatch
+ *   — this function only resolves WHICH backend is being requested, not
+ *   whether it's actually usable here).
+ * - `"bwrap"` + any OS → `"bwrap"` (forced; same mismatch handling as above).
+ */
+export function resolveEffectiveBackend(
+  mode: "off" | "auto" | "seatbelt" | "bwrap",
+  os: string,
+): SandboxBackend {
+  switch (mode) {
+    case "off":
+      return "none";
+    case "seatbelt":
+      return "seatbelt";
+    case "bwrap":
+      return "bwrap";
+    case "auto":
+      if (os === "darwin") return "seatbelt";
+      if (os === "linux") return "bwrap";
+      return "none";
+  }
+}
 
 /**
  * Manifest-relative name of the shipped Seatbelt profile.
@@ -491,20 +552,23 @@ export function buildBwrapArgs(
  * {@link buildBwrapArgs}.
  *
  * Behavior:
- * - `mode: "off"` → returns `cmd` unchanged (no-op; this is the default).
- * - `mode: "seatbelt"` on Darwin with `/usr/bin/sandbox-exec` present →
- *   prefixes `cmd` with `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
- * - `mode: "seatbelt"` on Linux with `/usr/bin/bwrap` present → prefixes
- *   `cmd` with the {@link buildBwrapArgs} argv. (The same enum value
- *   triggers both backends by design for this unit — renaming/defaulting the
- *   mode to something OS-neutral like `"auto"` is a separate later change.)
- * - `mode: "seatbelt"` but the platform can't apply it (non-Darwin/non-Linux,
- *   or the platform's sandbox binary is missing) → **warn-and-degrade**: log
- *   a loud warning and return `cmd` unchanged, so an imperfectly-configured
- *   swamp install never hard-crashes on a platform mismatch. UNLESS
- *   `required: true`, in which case this throws instead — the fail-closed
- *   path for callers running untrusted input (e.g. a future PR-watcher
- *   wiring) that must never fall back to unsandboxed execution silently.
+ * - `mode: "off"` → returns `cmd` unchanged (no-op; explicit opt-out).
+ * - Otherwise the EFFECTIVE backend is resolved via
+ *   {@link resolveEffectiveBackend} (`"auto"` → seatbelt on Darwin / bwrap on
+ *   Linux / none elsewhere; `"seatbelt"` / `"bwrap"` → that backend, forced):
+ *   - effective backend `"seatbelt"`, running on Darwin, with
+ *     `/usr/bin/sandbox-exec` present → prefixes `cmd` with
+ *     `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
+ *   - effective backend `"bwrap"`, running on Linux, with `bwrap` present →
+ *     prefixes `cmd` with the {@link buildBwrapArgs} argv.
+ *   - effective backend `"none"` (`"auto"` on an unsupported OS), or the
+ *     resolved backend doesn't match the running OS, or its binary is
+ *     missing → **warn-and-degrade**: log a loud warning and return `cmd`
+ *     unchanged, so an imperfectly-configured swamp install never
+ *     hard-crashes on a platform mismatch. UNLESS `required: true`, in which
+ *     case this throws instead — the fail-closed path for callers running
+ *     untrusted input (e.g. a future PR-watcher wiring) that must never fall
+ *     back to unsandboxed execution silently.
  *
  * `cwd` defaults to `Deno.cwd()` (matching how the two runCli call sites
  * already resolve cwd) so the `CWD` param always has a concrete value even
@@ -539,7 +603,17 @@ export function wrapWithSandbox(
   const resolvedCwd = cwd ?? Deno.cwd();
   const home = Deno.env.get("HOME") ?? "";
 
-  if (isDarwin) {
+  const backend = resolveEffectiveBackend(sandbox.mode, Deno.build.os);
+
+  if (backend === "seatbelt") {
+    if (!isDarwin) {
+      return degradeOrThrow(
+        `seatbelt requested but platform is ${Deno.build.os}, not darwin`,
+        sandbox,
+        logger,
+        cmd,
+      );
+    }
     if (!isFile(sandboxExecPath)) {
       return degradeOrThrow(
         `${sandboxExecPath} not found`,
@@ -560,7 +634,15 @@ export function wrapWithSandbox(
     ];
   }
 
-  if (isLinux) {
+  if (backend === "bwrap") {
+    if (!isLinux) {
+      return degradeOrThrow(
+        `bwrap requested but platform is ${Deno.build.os}, not linux`,
+        sandbox,
+        logger,
+        cmd,
+      );
+    }
     if (!isFile(bwrapPath)) {
       return degradeOrThrow(`${bwrapPath} not found`, sandbox, logger, cmd);
     }
@@ -579,7 +661,7 @@ export function wrapWithSandbox(
   }
 
   return degradeOrThrow(
-    `unsupported platform (${Deno.build.os}, no seatbelt/bwrap backend)`,
+    `no sandbox backend for platform ${Deno.build.os}`,
     sandbox,
     logger,
     cmd,
@@ -601,7 +683,7 @@ function degradeOrThrow(
 ): string[] {
   if (sandbox.required) {
     throw new Error(
-      `sandboxMode is 'seatbelt' and sandboxRequired is true, but the sandbox cannot be applied: ${reason}. Refusing to run unsandboxed.`,
+      `a sandbox was requested (sandboxRequired is true) but cannot be applied: ${reason}. Refusing to run unsandboxed.`,
     );
   }
   logger?.warning(
@@ -1824,21 +1906,30 @@ function cliPathFor(provider: Provider, g: GlobalArgs): string {
  * per call).
  *
  * `resolveDefaultProfile` supplies the path to the shipped `.sb` when the caller
- * has NOT set a `sandboxProfile` override. It is invoked lazily — only for
- * `mode: "seatbelt"` without an override — so an `off` (default) invocation
- * never touches the filesystem and never risks throwing when the profile can't
- * be resolved. Production passes `() => ctx.extensionFile(SANDBOX_PROFILE_FILENAME)`;
- * tests inject a stub so resolution can be exercised against a simulated pulled
- * layout without a full model runtime.
+ * has NOT set a `sandboxProfile` override. It is invoked lazily — only when the
+ * EFFECTIVE backend (via {@link resolveEffectiveBackend}, using the CURRENT
+ * `Deno.build.os`) is seatbelt, i.e. `mode: "seatbelt"` explicitly, or
+ * `mode: "auto"` while running on Darwin — without an override. This keeps
+ * `off`, explicit `bwrap`, and `auto` on Linux (or any non-Darwin OS) from ever
+ * touching the filesystem for a profile bwrap doesn't use, and from risking a
+ * throw when the profile can't be resolved. Production passes
+ * `() => ctx.extensionFile(SANDBOX_PROFILE_FILENAME)`; tests inject a stub so
+ * resolution can be exercised against a simulated pulled layout without a full
+ * model runtime.
  */
 export function sandboxConfigFrom(
   g: GlobalArgs,
   resolveDefaultProfile: () => string,
-  overrides?: { sandboxMode?: "off" | "seatbelt"; sandboxRequired?: boolean },
+  overrides?: {
+    sandboxMode?: "off" | "auto" | "seatbelt" | "bwrap";
+    sandboxRequired?: boolean;
+  },
 ): SandboxConfig {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
+  const needsProfile = resolveEffectiveBackend(mode, Deno.build.os) ===
+    "seatbelt";
   const profilePath = g.sandboxProfile ??
-    (mode === "seatbelt" ? resolveDefaultProfile() : "");
+    (needsProfile ? resolveDefaultProfile() : "");
   return {
     mode,
     profilePath,
@@ -2065,7 +2156,7 @@ const InvokeArgsSchema = z.object({
     "Scoped permission profile: 'readonly' (read/search only) or 'actor' (also edit/write/run shell). Defaults to defaultToolProfile.",
   ),
   sandboxMode: SandboxModeEnum.optional().describe(
-    "Override the global sandboxMode for this invocation: 'off' or 'seatbelt'.",
+    "Override the global sandboxMode for this invocation: 'auto' (default; OS-picked backend), 'off', 'seatbelt', or 'bwrap'.",
   ),
   sandboxRequired: z.boolean().optional().describe(
     "Override the global sandboxRequired for this invocation: fail closed instead of warn-and-degrade when the sandbox can't be applied.",

@@ -20,6 +20,7 @@ import {
   ModelIdSchema,
   parseGrokModelsList,
   PROVIDERS,
+  resolveEffectiveBackend,
   resolveModel,
   SANDBOX_PROFILE_FILENAME,
   sandboxConfigFrom,
@@ -913,9 +914,9 @@ Deno.test("sandboxConfigFrom: seatbelt resolves the default profile from the pul
   assertEquals(Deno.lstatSync(cfg.profilePath).isFile, true);
 });
 
-Deno.test("sandboxConfigFrom: off (default) never invokes the resolver", () => {
+Deno.test("sandboxConfigFrom: explicit off never invokes the resolver", () => {
   let called = false;
-  const g = GlobalArgsSchema.parse({}); // sandboxMode defaults to "off"
+  const g = GlobalArgsSchema.parse({ sandboxMode: "off" });
   const cfg = sandboxConfigFrom(g, () => {
     called = true;
     return "/should/not/be/reached.sb";
@@ -923,6 +924,36 @@ Deno.test("sandboxConfigFrom: off (default) never invokes the resolver", () => {
 
   assertEquals(cfg.mode, "off");
   assertEquals(called, false); // lazy: no filesystem touch on the off path
+});
+
+Deno.test("sandboxConfigFrom: auto (default) on this Darwin test machine resolves the seatbelt profile", () => {
+  // GlobalArgsSchema now defaults sandboxMode to "auto", and this suite runs
+  // on a real Darwin machine, so the effective backend is seatbelt and the
+  // profile resolver IS invoked (mirrors the seatbelt-explicit test above,
+  // but exercises the new default instead of an explicit override).
+  let called = false;
+  const g = GlobalArgsSchema.parse({}); // sandboxMode defaults to "auto"
+  const cfg = sandboxConfigFrom(g, () => {
+    called = true;
+    return "/resolved/default.sb";
+  });
+
+  assertEquals(cfg.mode, "auto");
+  assertEquals(called, true);
+  assertEquals(cfg.profilePath, "/resolved/default.sb");
+});
+
+Deno.test("sandboxConfigFrom: bwrap mode never invokes the seatbelt profile resolver", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({ sandboxMode: "bwrap" });
+  const cfg = sandboxConfigFrom(g, () => {
+    called = true;
+    return "/should/not/be/reached.sb";
+  });
+
+  assertEquals(cfg.mode, "bwrap");
+  assertEquals(called, false);
+  assertEquals(cfg.profilePath, "");
 });
 
 Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips the resolver", () => {
@@ -939,6 +970,116 @@ Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips th
 
   assertEquals(cfg.profilePath, "/custom/profile.sb");
   assertEquals(called, false);
+});
+
+// --- resolveEffectiveBackend (pure mode+OS → backend resolution) ------------
+//
+// Extracted out of wrapWithSandbox specifically so the OS-dispatch DECISION
+// is unit-testable for every mode/OS combination without mocking
+// `Deno.build.os` (read-only) or the filesystem — wrapWithSandbox still owns
+// checking whether the resolved backend's binary actually exists.
+
+Deno.test("resolveEffectiveBackend: auto + darwin -> seatbelt", () => {
+  assertEquals(resolveEffectiveBackend("auto", "darwin"), "seatbelt");
+});
+
+Deno.test("resolveEffectiveBackend: auto + linux -> bwrap", () => {
+  assertEquals(resolveEffectiveBackend("auto", "linux"), "bwrap");
+});
+
+Deno.test("resolveEffectiveBackend: auto + windows (unsupported OS) -> none", () => {
+  assertEquals(resolveEffectiveBackend("auto", "windows"), "none");
+});
+
+Deno.test("resolveEffectiveBackend: off + any OS -> none", () => {
+  assertEquals(resolveEffectiveBackend("off", "darwin"), "none");
+  assertEquals(resolveEffectiveBackend("off", "linux"), "none");
+  assertEquals(resolveEffectiveBackend("off", "windows"), "none");
+});
+
+Deno.test("resolveEffectiveBackend: seatbelt + linux -> seatbelt (forced; will degrade in wrapWithSandbox)", () => {
+  assertEquals(resolveEffectiveBackend("seatbelt", "linux"), "seatbelt");
+});
+
+Deno.test("resolveEffectiveBackend: bwrap + darwin -> bwrap (forced; will degrade in wrapWithSandbox)", () => {
+  assertEquals(resolveEffectiveBackend("bwrap", "darwin"), "bwrap");
+});
+
+Deno.test("resolveEffectiveBackend: seatbelt + darwin -> seatbelt (forced, matches OS)", () => {
+  assertEquals(resolveEffectiveBackend("seatbelt", "darwin"), "seatbelt");
+});
+
+Deno.test("resolveEffectiveBackend: bwrap + linux -> bwrap (forced, matches OS)", () => {
+  assertEquals(resolveEffectiveBackend("bwrap", "linux"), "bwrap");
+});
+
+// --- wrapWithSandbox: mode "auto" ---------------------------------------------
+//
+// This suite runs on a real Darwin machine, so "auto" resolves to seatbelt
+// here and produces the exact same argv as an explicit `mode: "seatbelt"`
+// config. The Linux side of "auto" (resolves to bwrap) is proved by
+// `resolveEffectiveBackend: auto + linux -> bwrap` above plus the existing
+// `buildBwrapArgs`/roccinante-proven argv tests — `Deno.build.os` cannot be
+// forced to "linux" in-process (read-only property), so the full dispatch
+// through `wrapWithSandbox` for the Linux branch is exercised on roccinante,
+// not in this suite (see the "Linux bwrap dispatch" comment block below).
+
+Deno.test("wrapWithSandbox: mode 'auto' on darwin resolves to seatbelt and produces the sandbox-exec argv", () => {
+  const cmd = ["claude", "--print", "hi"];
+  const out = wrapWithSandbox(cmd, "/tmp/wd", {
+    mode: "auto",
+    profilePath: "/path/to/cli_agent.sandbox.sb",
+    required: false,
+  });
+  assertEquals(out, [
+    "/usr/bin/sandbox-exec",
+    "-f",
+    "/path/to/cli_agent.sandbox.sb",
+    "-D",
+    "CWD=/tmp/wd",
+    "-D",
+    `HOME=${Deno.env.get("HOME") ?? ""}`,
+    "claude",
+    "--print",
+    "hi",
+  ]);
+});
+
+Deno.test("wrapWithSandbox: mode 'bwrap' forced on darwin (OS mismatch) degrades and warns", () => {
+  const cmd = ["claude", "--print", "hi"];
+  let warned = false;
+  let warnedReason: unknown;
+  const logger = {
+    info: () => {},
+    warning: (_msg: string, props?: Record<string, unknown>) => {
+      warned = true;
+      warnedReason = props?.reason;
+    },
+    error: () => {},
+  };
+  const out = wrapWithSandbox(
+    cmd,
+    "/tmp/wd",
+    { mode: "bwrap", profilePath: "", required: false },
+    logger,
+  );
+  assertEquals(out, cmd);
+  assertEquals(warned, true);
+  assertEquals(String(warnedReason).includes("not linux"), true);
+});
+
+Deno.test("wrapWithSandbox: mode 'bwrap' forced on darwin + sandboxRequired throws", () => {
+  const cmd = ["claude", "--print", "hi"];
+  assertThrows(
+    () =>
+      wrapWithSandbox(cmd, "/tmp/wd", {
+        mode: "bwrap",
+        profilePath: "",
+        required: true,
+      }),
+    Error,
+    "sandboxRequired is true",
+  );
 });
 
 // --- buildBwrapArgs (Linux bwrap sandbox backend) ---------------------------
