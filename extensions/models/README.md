@@ -44,7 +44,9 @@ Override them if your binaries live in a non-standard location.
 **Auth:** each provider CLI must already be installed and authenticated on the
 host (this extension only shells out). For Grok Build: run `grok login` or set
 `XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
-env credentials.
+env credentials. Provider subprocesses preserve ordinary environment-based
+authentication and configuration, but do not inherit known Swamp control-plane
+credential variables from the extension method process.
 
 **Model resolution** when `invoke` omits `model`:
 
@@ -173,22 +175,23 @@ Arguments:
 
 Each invocation is persisted with these fields:
 
-| Field           | Type    | Description                              |
-| --------------- | ------- | ---------------------------------------- |
-| `invocationId`  | string  | Unique UUID for this invocation          |
-| `provider`      | enum    | Which CLI agent was used                 |
-| `model`         | string  | Model name passed to the CLI             |
-| `prompt`        | string  | First 500 chars of the original prompt   |
-| `promptHash`    | string  | Base-36 hash for deduplication           |
-| `exitCode`      | number  | Process exit code                        |
-| `success`       | boolean | Whether the invocation succeeded         |
-| `durationMs`    | number  | Wall-clock duration in milliseconds      |
-| `outputBytes`   | number  | Raw output size in bytes                 |
-| `outputPreview` | string  | First 1000 chars of extracted text       |
-| `retries`       | number  | How many retries were needed             |
-| `tokens`        | object  | Token counts (input, output, cache, etc) |
-| `costUsd`       | number  | Estimated cost in USD                    |
-| `tags`          | object  | User-supplied key-value tags             |
+| Field             | Type    | Description                              |
+| ----------------- | ------- | ---------------------------------------- |
+| `invocationId`    | string  | Unique UUID for this invocation          |
+| `provider`        | enum    | Which CLI agent was used                 |
+| `model`           | string  | Model name passed to the CLI             |
+| `prompt`          | string  | First 500 chars of the original prompt   |
+| `promptTruncated` | boolean | Whether `prompt` was capped at 500 chars |
+| `promptHash`      | string  | Base-36 hash for deduplication           |
+| `exitCode`        | number  | Process exit code                        |
+| `success`         | boolean | Whether the invocation succeeded         |
+| `durationMs`      | number  | Wall-clock duration in milliseconds      |
+| `outputBytes`     | number  | Raw output size in bytes                 |
+| `outputPreview`   | string  | First 1000 chars of extracted text       |
+| `retries`         | number  | How many retries were needed             |
+| `tokens`          | object  | Token counts (input, output, cache, etc) |
+| `costUsd`         | number  | Estimated cost in USD                    |
+| `tags`            | object  | User-supplied key-value tags             |
 
 The `prompt` and `outputPreview` fields are truncated for queryability. The
 full untruncated prompt and extracted output are persisted alongside every

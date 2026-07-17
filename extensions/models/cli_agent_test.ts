@@ -14,14 +14,17 @@ import {
   extractError,
   extractTextFromOutput,
   extractUsage,
+  filterProviderChildEnv,
   GlobalArgsSchema,
   isProvider,
   listProvidersFromRegistry,
   ModelIdSchema,
   parseGrokModelsList,
+  PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
   resolveEffectiveBackend,
   resolveModel,
+  runCli,
   SANDBOX_PROFILE_FILENAME,
   sandboxConfigFrom,
   wrapWithSandbox,
@@ -700,6 +703,85 @@ Deno.test("parseGrokModelsList: strips bullets, (default), headers, blanks, unic
 });
 
 // --- Provider registry / model resolution -----------------------------------
+
+Deno.test("filterProviderChildEnv: removes only Swamp control-plane credentials without mutating input", () => {
+  assertEquals(PROVIDER_CHILD_ENV_DENYLIST, [
+    "SWAMP_WORKER_TOKEN",
+    "SWAMP_SERVER_TOKEN",
+    "SWAMP_API_KEY",
+    "SWAMP_SERVE_EXTRA_HEADERS",
+  ]);
+
+  const env = {
+    SWAMP_WORKER_TOKEN: "worker-secret",
+    SWAMP_SERVER_TOKEN: "server-secret",
+    SWAMP_API_KEY: "api-secret",
+    SWAMP_SERVE_EXTRA_HEADERS: "Authorization: secret",
+    SWAMP_REPO_DIR: "/repo",
+    SWAMP_ORCHESTRATOR_URL: "https://orchestrator.example",
+    SWAMP_SERVER_URL: "https://server.example",
+    SWAMP_SERVE_URL: "https://serve.example",
+    SWAMP_CLUB_URL: "https://club.example",
+    PATH: "/usr/local/bin:/usr/bin",
+    HOME: "/home/agent",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+    OPENAI_API_KEY: "openai-secret",
+  };
+  const original = { ...env };
+
+  assertEquals(filterProviderChildEnv(env), {
+    SWAMP_REPO_DIR: "/repo",
+    SWAMP_ORCHESTRATOR_URL: "https://orchestrator.example",
+    SWAMP_SERVER_URL: "https://server.example",
+    SWAMP_SERVE_URL: "https://serve.example",
+    SWAMP_CLUB_URL: "https://club.example",
+    PATH: "/usr/local/bin:/usr/bin",
+    HOME: "/home/agent",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+    OPENAI_API_KEY: "openai-secret",
+  });
+  assertEquals(env, original);
+});
+
+Deno.test("runCli: spawned child omits control-plane credentials and preserves provider config", async () => {
+  const names = [...PROVIDER_CHILD_ENV_DENYLIST, "XAI_API_KEY"];
+  const previous = Object.fromEntries(
+    names.map((name) => [name, Deno.env.get(name)]),
+  );
+
+  try {
+    for (const name of PROVIDER_CHILD_ENV_DENYLIST) {
+      Deno.env.set(name, "test-secret");
+    }
+    Deno.env.set("XAI_API_KEY", "test-provider-config");
+
+    const result = await runCli(
+      [
+        Deno.execPath(),
+        "eval",
+        `const names = ${
+          JSON.stringify(names)
+        }; console.log(JSON.stringify(Object.fromEntries(names.map((name) => [name, Deno.env.has(name)]))))`,
+      ],
+      { wallTimeoutMs: 10_000 },
+    );
+
+    assertEquals(result.success, true);
+    assertEquals(JSON.parse(result.stdout), {
+      SWAMP_WORKER_TOKEN: false,
+      SWAMP_SERVER_TOKEN: false,
+      SWAMP_API_KEY: false,
+      SWAMP_SERVE_EXTRA_HEADERS: false,
+      XAI_API_KEY: true,
+    });
+  } finally {
+    for (const name of names) {
+      const value = previous[name];
+      if (value === undefined) Deno.env.delete(name);
+      else Deno.env.set(name, value);
+    }
+  }
+});
 
 Deno.test("ModelIdSchema: trims; rejects empty and whitespace-only", () => {
   assertEquals(ModelIdSchema.parse("  opus  "), "opus");

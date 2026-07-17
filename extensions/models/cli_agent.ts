@@ -129,6 +129,9 @@ const InvocationSchema = z.object({
   provider: ProviderEnum,
   model: ModelIdSchema,
   prompt: z.string(),
+  promptTruncated: z.boolean().optional().describe(
+    "True when prompt contains only the first 500 characters; absent on records created before this field was added.",
+  ),
   promptHash: z.string(),
   slashCommand: z.string().optional(),
   cwd: z.string(),
@@ -693,6 +696,23 @@ function degradeOrThrow(
   return cmd;
 }
 
+/** Swamp control-plane credentials that provider CLI children must not inherit. */
+export const PROVIDER_CHILD_ENV_DENYLIST = [
+  "SWAMP_WORKER_TOKEN",
+  "SWAMP_SERVER_TOKEN",
+  "SWAMP_API_KEY",
+  "SWAMP_SERVE_EXTRA_HEADERS",
+] as const;
+
+/** Return a copy of `env` without Swamp control-plane credentials. */
+export function filterProviderChildEnv(
+  env: Record<string, string>,
+): Record<string, string> {
+  const filtered = { ...env };
+  for (const name of PROVIDER_CHILD_ENV_DENYLIST) delete filtered[name];
+  return filtered;
+}
+
 /**
  * Spawn a CLI subprocess with optional stdin and two independent timeouts:
  *
@@ -718,7 +738,7 @@ function degradeOrThrow(
  * tolerates surviving grandchildren holding the pipe open, so no changes were
  * needed to the kill/drain logic below for this to work correctly.
  */
-async function runCli(
+export async function runCli(
   cmd: string[],
   opts: {
     cwd?: string;
@@ -739,6 +759,8 @@ async function runCli(
     stderr: "piped",
     stdin: opts.stdin ? "piped" : "null",
     cwd: opts.cwd,
+    clearEnv: true,
+    env: filterProviderChildEnv(Deno.env.toObject()),
   });
 
   const child = command.spawn();
@@ -2064,6 +2086,7 @@ function buildInvocationBase(
     provider,
     model: modelName,
     prompt: args.prompt.slice(0, 500),
+    promptTruncated: args.prompt.length > 500,
     promptHash,
     slashCommand,
     cwd,
@@ -2176,8 +2199,16 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.13.7",
+  version: "2026.07.17.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.07.17.1",
+      description:
+        "Harden provider child environments; no global argument schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     invocation: {
       description:
