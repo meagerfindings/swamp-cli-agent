@@ -189,9 +189,34 @@ Each invocation is persisted with these fields:
 | `outputBytes`     | number  | Raw output size in bytes                 |
 | `outputPreview`   | string  | First 1000 chars of extracted text       |
 | `retries`         | number  | How many retries were needed             |
+| `failureClass`    | enum    | Typed failure taxonomy; absent on success |
 | `tokens`          | object  | Token counts (input, output, cache, etc) |
 | `costUsd`         | number  | Estimated cost in USD                    |
 | `tags`            | object  | User-supplied key-value tags             |
+
+### Failure classification (`failureClass`)
+
+Every **failed** invocation is tagged with a deterministic, typed
+`failureClass`. Successful invocations omit the field, and records written
+before this field existed parse unchanged (it is optional and additive). The
+closed taxonomy is:
+
+| Class                | When it is assigned                                          |
+| -------------------- | ----------------------------------------------------------- |
+| `rate-limit`         | Provider throttling signatures (429, "rate limit", "too many requests", "overloaded") |
+| `session-limit`      | Quota / plan / session exhaustion (`quota`, "payment required", `insufficient_quota`) |
+| `contract-violation` | Output failed the declared contract (e.g. `invokeAndParse` found no valid JSON) |
+| `agent-declined`     | Clean process exit but the invocation still failed (agent produced no answer) |
+| `infrastructure`     | Timeout, spawn/sandbox, or non-zero process exit with no provider error |
+| `unknown`            | A failure that matched none of the above                     |
+
+Classification is driven by a versioned signature table
+(`SIGNATURE_TABLE.version`) and computed by the pure, exported
+`classifyFailure` function, so the signatures are unit-tested and extensible.
+Only `rate-limit` and `session-limit` are throttling classes that a downstream
+provider-fallback gate should act on. Rate-limit and session-limit currently
+share the same captured signatures for providers other than opencode; see the
+`SIGNATURE_TABLE` comment for the documented evidence gap.
 
 The `prompt` and `outputPreview` fields are truncated for queryability. The
 full untruncated prompt and extracted output are persisted alongside every

@@ -124,7 +124,7 @@ export const GlobalArgsSchema = z.object({
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
 /** Schema for a structured invocation record persisted as a swamp resource. */
-const InvocationSchema = z.object({
+export const InvocationSchema = z.object({
   invocationId: z.string(),
   provider: ProviderEnum,
   model: ModelIdSchema,
@@ -146,6 +146,16 @@ const InvocationSchema = z.object({
   timeoutReason: z.string().optional(),
   failureReason: z.string().optional().describe(
     "Why the invocation failed: provider_error:<code>, exit_<n>, or a timeout reason. Absent on success.",
+  ),
+  failureClass: z.enum([
+    "rate-limit",
+    "session-limit",
+    "contract-violation",
+    "agent-declined",
+    "infrastructure",
+    "unknown",
+  ]).optional().describe(
+    "Typed failure taxonomy for the invocation. Deterministic, additive, and absent on success (and on records created before this field was added). Consumed by downstream provider-fallback gating (only rate-limit/session-limit trigger a fallback).",
   ),
   invokedAt: z.string(),
   tokens: z.object({
@@ -1318,23 +1328,163 @@ export interface ProviderError {
   retryable: boolean;
 }
 
-/** Substrings (lowercased) in an error message that signal a rate-limit / quota condition. */
-const RATE_LIMIT_HINTS: string[] = [
-  "rate limit",
-  "rate_limit",
-  "ratelimit",
-  "quota",
-  "too many requests",
-  "overloaded",
-  "payment required",
-  "insufficient_quota",
-  "429",
-];
+/**
+ * Failure classification taxonomy for a persisted invocation result.
+ *
+ * These values are a stable contract consumed downstream — notably the
+ * software-factory `frink-runtime` `decideProviderFallback` (FRK-AGENT-002),
+ * whose provider-fallback gate advances a role's tier ONLY on the two
+ * throttling classes (`rate-limit`, `session-limit`) and treats the rest as
+ * non-fallback signals. Keep the string values EXACTLY in sync with that
+ * consumer's closed signal-class universe. Successful invocations carry no
+ * class (the field is omitted).
+ */
+export type FailureClass =
+  | "rate-limit"
+  | "session-limit"
+  | "contract-violation"
+  | "agent-declined"
+  | "infrastructure"
+  | "unknown";
 
-/** True when an error message/code looks like a rate-limit or quota exhaustion. */
+/**
+ * Versioned signature table for the failure classifier. Bump SIGNATURE_TABLE
+ * .version when the substring sets change so downstream telemetry can tell
+ * which revision classified a given record.
+ *
+ * Signature-set provenance (do not invent — grounded in this repo's observed
+ * captures and the retryable-error heuristics):
+ *
+ * - `rateLimit`: transient throttling the provider expects you to retry —
+ *   HTTP 429 / "rate limit" / "too many requests" / server "overloaded".
+ *   Codex and Claude/Gemini surface these; see extractError + the *_RATE_LIMIT
+ *   fixtures in cli_agent_test.ts.
+ * - `sessionLimit`: quota / plan / session exhaustion that a retry cannot cure
+ *   within the window — opencode's real capture is
+ *   `{name:"quota_exceeded", ... "Payment Required: You have exceeded your
+ *   monthly quota"}` with `isRetryable:false`. "insufficient_quota" is the
+ *   OpenAI-family quota-exhaustion code.
+ *
+ * EVIDENCE GAP (documented, not invented): the repo's only captured
+ * quota/session signatures are the opencode `quota_exceeded` / "payment
+ * required" / "insufficient_quota" family — there is no captured, provider-
+ * distinct "session limit" wording for claude/amp/gemini/codex/grok. Those
+ * providers currently share this combined session-limit set. When live
+ * telemetry surfaces a provider-specific session/quota string that today would
+ * misclassify (e.g. a Claude "session limit reached" that lands in `unknown`),
+ * add it here and bump `version` rather than guessing its exact wording now.
+ *
+ * Precedence: `rateLimit` is matched BEFORE `sessionLimit` so a message that
+ * mentions both (e.g. "429 ... upgrade your quota") is treated as the
+ * recoverable throttle. `looksRateLimited` (retryability) unions both sets, so
+ * splitting them here does NOT change which errors get retried.
+ */
+export const SIGNATURE_TABLE: {
+  readonly version: string;
+  readonly rateLimit: readonly string[];
+  readonly sessionLimit: readonly string[];
+} = {
+  version: "1",
+  rateLimit: [
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+    "overloaded",
+    "429",
+  ],
+  sessionLimit: [
+    "quota",
+    "payment required",
+    "insufficient_quota",
+    "session limit",
+    "session_limit",
+  ],
+};
+
+/** True when `hay` contains any of `sigs` (all lowercased comparison). */
+function matchesAny(hay: string, sigs: readonly string[]): boolean {
+  return sigs.some((s) => hay.includes(s));
+}
+
+/**
+ * True when an error message/code looks like a rate-limit OR session/quota
+ * exhaustion. Retryability is the union of both throttling signature sets —
+ * this preserves the historical retry behavior after the table was split into
+ * distinct rate-limit vs session-limit classes.
+ */
 function looksRateLimited(message: string, code?: string | number): boolean {
   const hay = `${message} ${code ?? ""}`.toLowerCase();
-  return RATE_LIMIT_HINTS.some((h) => hay.includes(h));
+  return matchesAny(hay, SIGNATURE_TABLE.rateLimit) ||
+    matchesAny(hay, SIGNATURE_TABLE.sessionLimit);
+}
+
+/** Structured inputs the classifier reads to assign a {@link FailureClass}. */
+export interface FailureSignal {
+  /** Whether the invocation ultimately succeeded. Success carries no class. */
+  success: boolean;
+  /** Provider error surfaced in the CLI output stream, if any. */
+  providerError?: { message?: string; code?: string } | null;
+  /** True when the run was killed by a wall/idle timeout. */
+  timedOut?: boolean;
+  /** Non-zero/kill process exit code, if the process itself failed. */
+  exitCode?: number;
+  /** True when the CLI exited cleanly but produced no usable answer. */
+  cleanExit?: boolean;
+  /**
+   * True when the output failed a declared schema/parse contract even though
+   * the run otherwise succeeded (invokeAndParse's JSON requirement).
+   */
+  contractViolation?: boolean;
+}
+
+/**
+ * Deterministically classify a FAILED invocation into a {@link FailureClass}.
+ *
+ * Pure and table-driven so it is unit-testable and the signature table is the
+ * single versioned source of truth. Returns `undefined` for a success (no
+ * class is persisted). Classification precedence, highest first:
+ *
+ * 1. `contract-violation` — declared output contract failed (parse/schema),
+ *    regardless of a clean process exit (invokeAndParse).
+ * 2. `rate-limit` / `session-limit` — provider-reported throttling, split by
+ *    the {@link SIGNATURE_TABLE}; rate-limit wins a tie.
+ * 3. `infrastructure` — timeout, spawn/sandbox/exit failure with no provider
+ *    error (the process, not the model, failed).
+ * 4. `agent-declined` — clean process exit but `success:false` and no other
+ *    signal (the agent ran but declined / produced no answer).
+ * 5. `unknown` — anything else that still failed.
+ */
+export function classifyFailure(
+  signal: FailureSignal,
+): FailureClass | undefined {
+  if (signal.success) return undefined;
+
+  if (signal.contractViolation) return "contract-violation";
+
+  const err = signal.providerError;
+  if (err) {
+    const hay = `${err.message ?? ""} ${err.code ?? ""}`.toLowerCase();
+    if (matchesAny(hay, SIGNATURE_TABLE.rateLimit)) return "rate-limit";
+    if (matchesAny(hay, SIGNATURE_TABLE.sessionLimit)) return "session-limit";
+    // A provider surfaced an error we can't bucket as throttling: it's a
+    // provider/agent-side failure, not host infrastructure.
+    return "unknown";
+  }
+
+  if (
+    signal.timedOut ||
+    (signal.exitCode !== undefined && signal.exitCode !== 0 &&
+      !signal.cleanExit)
+  ) {
+    return "infrastructure";
+  }
+
+  // Clean process exit (or exit 0) but the invocation still failed and no
+  // provider error was surfaced: the agent ran and declined / gave no answer.
+  if (signal.cleanExit || signal.exitCode === 0) return "agent-declined";
+
+  return "unknown";
 }
 
 /**
@@ -2108,6 +2258,16 @@ function buildInvocationBase(
       : !result.success
       ? `exit_${result.code}`
       : undefined,
+    // Deterministic typed failure class (absent on success). invokeAndParse
+    // layers `contract-violation` on top when a clean run failed the JSON
+    // contract; see its handler.
+    failureClass: classifyFailure({
+      success: outcome.ok,
+      providerError,
+      timedOut: result.timedOut,
+      exitCode: result.code,
+      cleanExit: result.success,
+    }),
     invokedAt: new Date().toISOString(),
     tokens: usage.total
       ? {
@@ -2199,13 +2359,19 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.17.1",
+  version: "2026.07.18.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.07.17.1",
       description:
         "Harden provider child environments; no global argument schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.18.1",
+      description:
+        "Add optional typed failureClass to invocation records (additive; existing records without it still parse)",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2440,19 +2606,31 @@ export const model = {
         }
 
         const invocationId = uuid();
+        // invokeAndParse additionally requires a parseable JSON payload. A run
+        // that otherwise succeeded but produced no valid JSON is a
+        // contract-violation; a run that already failed keeps the base class.
+        const parseFailedOnOtherwiseOkRun = outcome.ok && parsedJson === null;
+        const base = buildInvocationBase(
+          invocationId,
+          provider,
+          modelName,
+          args,
+          promptHash,
+          slashCommand,
+          cwd,
+          outcome,
+        );
         const invocation = {
-          ...buildInvocationBase(
-            invocationId,
-            provider,
-            modelName,
-            args,
-            promptHash,
-            slashCommand,
-            cwd,
-            outcome,
-          ),
-          // invokeAndParse additionally requires a parseable JSON payload.
+          ...base,
           success: outcome.ok && parsedJson !== null,
+          failureClass: classifyFailure({
+            success: outcome.ok && parsedJson !== null,
+            providerError: outcome.providerError,
+            timedOut: outcome.result.timedOut,
+            exitCode: outcome.result.code,
+            cleanExit: outcome.result.success,
+            contractViolation: parseFailedOnOtherwiseOkRun,
+          }),
           parsedResponse: parsedJson,
         };
 

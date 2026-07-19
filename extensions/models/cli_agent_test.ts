@@ -11,11 +11,13 @@ import {
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
+  classifyFailure,
   extractError,
   extractTextFromOutput,
   extractUsage,
   filterProviderChildEnv,
   GlobalArgsSchema,
+  InvocationSchema,
   isProvider,
   listProvidersFromRegistry,
   ModelIdSchema,
@@ -27,6 +29,7 @@ import {
   runCli,
   SANDBOX_PROFILE_FILENAME,
   sandboxConfigFrom,
+  SIGNATURE_TABLE,
   wrapWithSandbox,
 } from "./cli_agent.ts";
 
@@ -1371,4 +1374,247 @@ Deno.test("buildBwrapArgs: produces a bwrap-shaped argv usable as the tail of a 
   assertEquals(argv.includes("--dev"), true);
   assertEquals(argv.includes("--tmpfs"), true);
   assertEquals(argv.slice(-3), ["sh", "-c", "echo hi"]);
+});
+
+// --- Failure classification (classifyFailure / SIGNATURE_TABLE) --------------
+//
+// Deterministic, table-driven taxonomy consumed by downstream provider-fallback
+// gating. The class string values are a stable contract (rate-limit,
+// session-limit, contract-violation, agent-declined, infrastructure, unknown).
+
+Deno.test("SIGNATURE_TABLE: version is set and rate-limit / session-limit sets are disjoint", () => {
+  assertEquals(SIGNATURE_TABLE.version, "1");
+  const overlap = SIGNATURE_TABLE.rateLimit.filter((s) =>
+    SIGNATURE_TABLE.sessionLimit.includes(s)
+  );
+  assertEquals(
+    overlap,
+    [],
+    "rate-limit and session-limit signatures must be disjoint",
+  );
+});
+
+Deno.test("classifyFailure: a success carries no class (field is omitted)", () => {
+  assertEquals(classifyFailure({ success: true }), undefined);
+  // A success is a success even if a stray non-fatal error object is present.
+  assertEquals(
+    classifyFailure({ success: true, exitCode: 0, cleanExit: true }),
+    undefined,
+  );
+});
+
+// Table-driven: every rate-limit signature (as it appears per provider) must
+// classify as rate-limit; every session-limit signature as session-limit.
+// Signatures are grounded in extractError + the *_RATE_LIMIT / *_QUOTA fixtures.
+const RATE_LIMIT_CASES: Array<[string, string, string | undefined]> = [
+  ["claude", "Overloaded", "error_overloaded"],
+  ["codex", "Rate limit reached for requests", "rate_limit"],
+  ["gemini", "Resource has been exhausted (too many requests)", "429"],
+  ["grok", "429 Too Many Requests", undefined],
+  ["amp", "the service is currently overloaded", undefined],
+  ["opencode", "RateLimit: slow down", "ratelimit"],
+];
+
+for (const [provider, message, code] of RATE_LIMIT_CASES) {
+  Deno.test(`classifyFailure: ${provider} rate-limit signature "${message.slice(0, 24)}" -> rate-limit`, () => {
+    assertEquals(
+      classifyFailure({
+        success: false,
+        providerError: { message, code },
+      }),
+      "rate-limit",
+    );
+  });
+}
+
+const SESSION_LIMIT_CASES: Array<[string, string, string | undefined]> = [
+  // opencode is the repo's real captured quota/session-exhaustion shape.
+  [
+    "opencode",
+    "Payment Required: You have exceeded your monthly quota",
+    "quota_exceeded",
+  ],
+  ["codex", "You exceeded your current quota", "insufficient_quota"],
+  ["claude", "Session limit reached for this plan", "session_limit"],
+  ["grok", "Payment Required", undefined],
+];
+
+for (const [provider, message, code] of SESSION_LIMIT_CASES) {
+  Deno.test(`classifyFailure: ${provider} session-limit signature "${message.slice(0, 24)}" -> session-limit`, () => {
+    assertEquals(
+      classifyFailure({
+        success: false,
+        providerError: { message, code },
+      }),
+      "session-limit",
+    );
+  });
+}
+
+Deno.test("classifyFailure: rate-limit wins when a message mentions both throttle kinds", () => {
+  assertEquals(
+    classifyFailure({
+      success: false,
+      providerError: {
+        message: "429 too many requests — upgrade your quota to continue",
+      },
+    }),
+    "rate-limit",
+  );
+});
+
+Deno.test("classifyFailure: contract-violation wins even on a clean process exit", () => {
+  assertEquals(
+    classifyFailure({
+      success: false,
+      cleanExit: true,
+      exitCode: 0,
+      contractViolation: true,
+    }),
+    "contract-violation",
+  );
+  // ...and even if a provider error is also present, the declared-contract
+  // failure takes precedence (invokeAndParse's JSON requirement).
+  assertEquals(
+    classifyFailure({
+      success: false,
+      contractViolation: true,
+      providerError: { message: "rate limit" },
+    }),
+    "contract-violation",
+  );
+});
+
+Deno.test("classifyFailure: a provider error that isn't throttling classifies as unknown, not infrastructure", () => {
+  assertEquals(
+    classifyFailure({
+      success: false,
+      providerError: {
+        message: "unknown model id 'gpt-9'",
+        code: "invalid_request",
+      },
+    }),
+    "unknown",
+  );
+});
+
+Deno.test("classifyFailure: timeouts and non-zero exits with no provider error are infrastructure", () => {
+  // wall/idle timeout
+  assertEquals(
+    classifyFailure({
+      success: false,
+      timedOut: true,
+      exitCode: 143,
+      cleanExit: false,
+    }),
+    "infrastructure",
+  );
+  // spawn/sandbox/killed non-zero exit
+  assertEquals(
+    classifyFailure({ success: false, exitCode: 137, cleanExit: false }),
+    "infrastructure",
+  );
+  assertEquals(
+    classifyFailure({ success: false, exitCode: 1, cleanExit: false }),
+    "infrastructure",
+  );
+});
+
+Deno.test("classifyFailure: clean exit but success:false with no other signal is agent-declined", () => {
+  assertEquals(
+    classifyFailure({ success: false, cleanExit: true, exitCode: 0 }),
+    "agent-declined",
+  );
+});
+
+Deno.test("classifyFailure: a failure matching nothing else is unknown", () => {
+  assertEquals(classifyFailure({ success: false }), "unknown");
+});
+
+// --- InvocationSchema round-trip with / without failureClass ----------------
+
+const BASE_INVOCATION = {
+  invocationId: "11111111-1111-1111-1111-111111111111",
+  provider: "claude" as const,
+  model: "opus",
+  prompt: "hi",
+  promptHash: "abc",
+  cwd: "/repo",
+  exitCode: 0,
+  success: true,
+  durationMs: 1234,
+  outputBytes: 2,
+  outputPreview: "hi",
+  retries: 0,
+  timedOut: false,
+  invokedAt: "2026-07-18T00:00:00.000Z",
+};
+
+Deno.test("InvocationSchema: a success record without failureClass parses and round-trips", () => {
+  const parsed = InvocationSchema.parse(BASE_INVOCATION);
+  assertEquals(parsed.failureClass, undefined);
+  assertEquals(JSON.parse(JSON.stringify(parsed)), BASE_INVOCATION);
+});
+
+Deno.test("InvocationSchema: a failed record with failureClass parses and round-trips", () => {
+  const failed = {
+    ...BASE_INVOCATION,
+    success: false,
+    exitCode: 1,
+    failureReason: "provider_error:rate_limit",
+    failureClass: "rate-limit" as const,
+  };
+  const parsed = InvocationSchema.parse(failed);
+  assertEquals(parsed.failureClass, "rate-limit");
+  assertEquals(JSON.parse(JSON.stringify(parsed)), failed);
+});
+
+Deno.test("InvocationSchema: every classifier class value is accepted by the schema enum", () => {
+  for (
+    const cls of [
+      "rate-limit",
+      "session-limit",
+      "contract-violation",
+      "agent-declined",
+      "infrastructure",
+      "unknown",
+    ]
+  ) {
+    const rec = { ...BASE_INVOCATION, success: false, failureClass: cls };
+    assertEquals(InvocationSchema.safeParse(rec).success, true, cls);
+  }
+});
+
+Deno.test("InvocationSchema: an unknown failureClass value is rejected (closed enum)", () => {
+  const rec = {
+    ...BASE_INVOCATION,
+    success: false,
+    failureClass: "totally-bogus",
+  };
+  assertEquals(InvocationSchema.safeParse(rec).success, false);
+});
+
+// Regression: a pre-change persisted payload (no failureClass, no promptTruncated)
+// must still parse unchanged — the field is additive and optional.
+Deno.test("InvocationSchema: a legacy pre-failureClass payload still parses", () => {
+  const legacy = {
+    invocationId: "22222222-2222-2222-2222-222222222222",
+    provider: "opencode",
+    model: "some-model",
+    prompt: "old prompt",
+    promptHash: "xyz",
+    cwd: "/old",
+    exitCode: 1,
+    success: false,
+    durationMs: 42,
+    outputBytes: 0,
+    outputPreview: "",
+    retries: 2,
+    timedOut: false,
+    failureReason: "exit_1",
+    invokedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const parsed = InvocationSchema.parse(legacy);
+  assertEquals(parsed.failureClass, undefined);
+  assertEquals(parsed.success, false);
 });
