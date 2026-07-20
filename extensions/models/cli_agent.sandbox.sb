@@ -28,7 +28,9 @@
 ;   ~/.ssh, ~/.aws, ~/.config/gcloud, ~/.config/gh, ~/.gnupg, ~/.npmrc,
 ;   ~/.docker/config.json, ~/Library/Keychains, ~/.config/op,
 ;   ~/.claude.json, ~/.claude/.credentials.json, ~/.codex/auth.json,
-;   ~/.codex/config.toml, ~/.config/amp, ~/.local/share/opencode/auth.json.
+;   ~/.codex/config.toml, ~/.config/amp, ~/.local/share/opencode/auth.json,
+;   ~/.config/swamp (FRK-SEC-001: the Swamp control-plane API key persisted
+;   by `swamp auth login` at ~/.config/swamp/auth.json — see below).
 ;
 ; Note the CLI's own *non-credential* state (e.g. ~/.claude/projects,
 ; ~/.claude/history.jsonl, ~/.codex/history.jsonl) is intentionally NOT
@@ -82,6 +84,17 @@
   (subpath (string-append HOME "/.config/amp"))
   ; OpenCode CLI's own auth store
   (literal (string-append HOME "/.local/share/opencode/auth.json"))
+  ; Swamp control-plane credentials (FRK-SEC-001): `swamp auth login`
+  ; persists the API key at ~/.config/swamp/auth.json, plus server/identity
+  ; metadata at servers.json and identity.json in the same directory. This
+  ; is the SAME credential class PROVIDER_CHILD_ENV_DENYLIST strips from the
+  ; child's environment in cli_agent.ts (SWAMP_API_KEY, SWAMP_WORKER_TOKEN,
+  ; SWAMP_SERVER_TOKEN, SWAMP_SERVE_EXTRA_HEADERS) — the env filter closes
+  ; the environment vector, this closes the on-disk vector for the same
+  ; secret. Deny the whole subpath (like ~/.config/gh, ~/.config/gcloud,
+  ; ~/.config/amp above) rather than only the three known files, so any
+  ; future file Swamp adds under this directory is covered by default.
+  (subpath (string-append HOME "/.config/swamp"))
 )
 
 ; --- Re-allow read of the LOGIN keychain DB only -----------------------------
@@ -146,6 +159,13 @@
 ; specific rules taking precedence over earlier broader ones for the same
 ; operation class, so the `(allow file-write* (subpath CWD))` etc. below
 ; carve back out of this deny.
+;
+; Note: ~/.config/swamp is NOT among the write-allow subtrees re-allowed
+; below (unlike ~/.claude, ~/.codex, ~/.config/opencode), so it already
+; stays covered by this blanket `(deny file-write* (subpath HOME))` with no
+; carve-out needed. It is still named explicitly in the re-deny block below
+; (mirroring the other credential files) as defense-in-depth in case a
+; future edit ever adds a broader ~/.config write-allow.
 
 (deny file-write*
   (subpath HOME))
@@ -188,3 +208,12 @@
   (literal (string-append HOME "/.codex/config.toml"))
   ; OpenCode auth store (inside write-allowed ~/.local/share/opencode)
   (literal (string-append HOME "/.local/share/opencode/auth.json")))
+
+; --- Explicit write-deny for the Swamp control-plane credential dir ----------
+;
+; Redundant with the blanket `(deny file-write* (subpath HOME))` above (see
+; the note in that section), since ~/.config/swamp is never write-allowed.
+; Named explicitly, and scoped to the whole subpath like the read-deny above,
+; so this stays correct even if a future edit broadens a write-allow subtree.
+(deny file-write*
+  (subpath (string-append HOME "/.config/swamp")))

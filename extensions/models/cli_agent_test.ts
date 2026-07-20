@@ -746,6 +746,32 @@ Deno.test("filterProviderChildEnv: removes only Swamp control-plane credentials 
   assertEquals(env, original);
 });
 
+// FRK-SEC-001 (Medium): `filterProviderChildEnv` used to be a four-literal
+// denylist over the full environment, which fails OPEN for any future
+// `SWAMP_*` credential var Swamp introduces — it would reach provider
+// subprocesses by default until someone remembered to add it to the list.
+// It is now a deny-by-`SWAMP_`-prefix strip with a fixed non-secret
+// re-allow list, which fails CLOSED instead: this test proves an entirely
+// unknown, made-up `SWAMP_*` var (not in the four-literal list, not in the
+// non-secret re-allow list, not seen anywhere in this codebase) is stripped
+// anyway, purely because of its prefix. This assertion only passes under
+// the prefix design — a literal denylist would let it through unchanged.
+Deno.test("filterProviderChildEnv: strips an unknown future SWAMP_* var by prefix, not just the four known literals", () => {
+  const env = {
+    SWAMP_SECRET_X: "some-future-credential-nobody-added-to-a-list-yet",
+    SWAMP_REPO_DIR: "/repo",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+  };
+
+  const filtered = filterProviderChildEnv(env);
+
+  assertEquals("SWAMP_SECRET_X" in filtered, false);
+  assertEquals(filtered, {
+    SWAMP_REPO_DIR: "/repo",
+    ANTHROPIC_API_KEY: "anthropic-secret",
+  });
+});
+
 Deno.test("runCli: spawned child omits control-plane credentials and preserves provider config", async () => {
   const names = [...PROVIDER_CHILD_ENV_DENYLIST, "XAI_API_KEY"];
   const previous = Object.fromEntries(
@@ -1164,6 +1190,57 @@ Deno.test("wrapWithSandbox: mode 'bwrap' forced on darwin + sandboxRequired thro
       }),
     Error,
     "sandboxRequired is true",
+  );
+});
+
+// --- Seatbelt profile content: Swamp control-plane credential deny (FRK-SEC-001) ---
+//
+// The tests above exercise `wrapWithSandbox`'s ARGV construction (it just
+// passes `-f <profilePath>` through) but never parse the actual shipped
+// `.sb` file's contents. FRK-SEC-001 found that `~/.config/swamp/auth.json`
+// (the Swamp control-plane API key persisted by `swamp auth login`) was
+// missing from the profile's read-deny and write-deny sets, so a sandboxed
+// provider CLI could read it directly off disk even though
+// `PROVIDER_CHILD_ENV_DENYLIST` already strips the equivalent
+// `SWAMP_API_KEY` env var. This test reads the real source `.sb` file
+// (sibling of this test file in the source tree, same layout the doc
+// comment on SANDBOX_PROFILE_FILENAME describes) and asserts the fix is
+// present as a regression guard against it silently regressing.
+Deno.test("cli_agent.sandbox.sb: denies read and write of ~/.config/swamp (Swamp control-plane credentials)", async () => {
+  const sbPath = new URL("./cli_agent.sandbox.sb", import.meta.url);
+  const profile = await Deno.readTextFile(sbPath);
+
+  // Read-deny: must appear inside the `(deny file-read* ...)` block.
+  assertEquals(
+    profile.includes('(subpath (string-append HOME "/.config/swamp"))'),
+    true,
+    'expected a (subpath ... "/.config/swamp") entry (read or write deny) in cli_agent.sandbox.sb',
+  );
+
+  // There must be at least two occurrences: one under file-read* and one
+  // under file-write* — a single shared entry would not prove both classes
+  // are covered, since Seatbelt rules are scoped per operation class.
+  const denySubpathCount = profile.split(
+    '(subpath (string-append HOME "/.config/swamp"))',
+  ).length - 1;
+  assertEquals(
+    denySubpathCount >= 2,
+    true,
+    "expected ~/.config/swamp to be denied under BOTH file-read* and file-write*, " +
+      `found ${denySubpathCount} occurrence(s)`,
+  );
+
+  // Sanity: the new deny must be reachable from a `(deny file-write* ...)`
+  // form somewhere in the file, not just read-deny.
+  const writeDenyIdx = profile.indexOf("(deny file-write*");
+  const configSwampAfterWriteDeny = profile.indexOf(
+    "/.config/swamp",
+    writeDenyIdx,
+  );
+  assertEquals(
+    writeDenyIdx !== -1 && configSwampAfterWriteDeny !== -1,
+    true,
+    "expected /.config/swamp to appear after a (deny file-write* ...) form",
   );
 });
 

@@ -394,6 +394,24 @@ export const BWRAP_PATH = "/usr/bin/bwrap";
  * bind is skipped when the path is absent (see {@link buildBwrapArgs}), so
  * this list documents intended policy independent of what happens to exist
  * on any one box today.
+ *
+ * FRK-SEC-001: `~/.config/swamp` (the Swamp control-plane API key at
+ * `auth.json`, plus `servers.json`/`identity.json`) is deliberately NOT
+ * listed here, following the same pattern as `~/.config/amp` above — it is
+ * also NOT in STATE_DIRS below, so on bwrap it is simply absent from the
+ * sandboxed `home` tmpfs (allowlist-by-omission), which is already fully
+ * protective for both read and write. Adding it to CREDENTIAL_FILES would
+ * be actively worse, not neutral: masking only works for a path already
+ * reachable inside a STATE_DIRS-bound directory (see the loop order in
+ * {@link buildBwrapArgs} — `--ro-bind /dev/null <path>` is emitted after
+ * the containing dir's `--bind`), so masking `.config/swamp/auth.json`
+ * without also adding `.config/swamp` to STATE_DIRS would make bwrap
+ * synthesize a NEW `.config/swamp` directory inside the tmpfs home purely
+ * to host that mask — creating a path that wouldn't otherwise exist in the
+ * sandbox at all, for zero additional protection over plain omission. The
+ * macOS Seatbelt profile (`cli_agent.sandbox.sb`) is the required fix for
+ * this finding (subpath read+write deny); this comment documents why the
+ * bwrap side needs no corresponding CREDENTIAL_FILES/STATE_DIRS change.
  */
 const CREDENTIAL_FILES: string[] = [
   ".claude.json",
@@ -706,7 +724,12 @@ function degradeOrThrow(
   return cmd;
 }
 
-/** Swamp control-plane credentials that provider CLI children must not inherit. */
+/**
+ * Swamp control-plane credentials that provider CLI children must not
+ * inherit. Kept as an explicit list (rather than only relying on the
+ * `SWAMP_`-prefix strip below) so the four concrete, currently-known secrets
+ * stay independently documented and independently testable by name.
+ */
 export const PROVIDER_CHILD_ENV_DENYLIST = [
   "SWAMP_WORKER_TOKEN",
   "SWAMP_SERVER_TOKEN",
@@ -714,12 +737,54 @@ export const PROVIDER_CHILD_ENV_DENYLIST = [
   "SWAMP_SERVE_EXTRA_HEADERS",
 ] as const;
 
-/** Return a copy of `env` without Swamp control-plane credentials. */
+/**
+ * Non-secret `SWAMP_*` environment variables that are safe to pass through
+ * to a provider CLI child — directories, URLs, labels, and tuning values,
+ * never credential material. Provider CLIs never read these, but passing
+ * them through is harmless and avoids surprising a future in-process
+ * consumer that expects them.
+ *
+ * This is the fixed re-allow list for the deny-by-`SWAMP_`-prefix strip
+ * (FRK-SEC-001 Medium finding): `filterProviderChildEnv` used to be a
+ * four-literal denylist over the FULL inherited environment, which fails
+ * OPEN — any new `SWAMP_*` credential var introduced by a future Swamp
+ * release would reach provider subprocesses by default until someone
+ * remembered to add it here. Stripping every `SWAMP_*` var EXCEPT this
+ * fixed allowlist fails CLOSED instead: an unknown future `SWAMP_*` var
+ * (credential or not) is stripped by default, and only has to be added
+ * here if it turns out to be genuinely needed and non-secret.
+ */
+const SWAMP_ENV_PASSTHROUGH_ALLOWLIST = new Set([
+  "SWAMP_REPO_DIR",
+  "SWAMP_ORCHESTRATOR_URL",
+  "SWAMP_SERVER_URL",
+  "SWAMP_SERVE_URL",
+  "SWAMP_CLUB_URL",
+  "SWAMP_WORKER_LABELS",
+  "SWAMP_TRUSTED_HOSTS",
+]);
+
+/**
+ * Return a copy of `env` without Swamp control-plane credentials.
+ *
+ * Deny-by-`SWAMP_`-prefix, not a denylist over the full environment: every
+ * key starting with `SWAMP_` is removed UNLESS it appears in
+ * {@link SWAMP_ENV_PASSTHROUGH_ALLOWLIST}. Every non-`SWAMP_` key (provider
+ * API keys, `PATH`, `HOME`, locale, proxy, etc.) is untouched.
+ * {@link PROVIDER_CHILD_ENV_DENYLIST} is redundant with this prefix strip
+ * for today's four known secrets (all `SWAMP_*`) but is kept as the
+ * documented, individually-named source of truth for what those four are.
+ */
 export function filterProviderChildEnv(
   env: Record<string, string>,
 ): Record<string, string> {
-  const filtered = { ...env };
-  for (const name of PROVIDER_CHILD_ENV_DENYLIST) delete filtered[name];
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith("SWAMP_") && !SWAMP_ENV_PASSTHROUGH_ALLOWLIST.has(key)) {
+      continue;
+    }
+    filtered[key] = value;
+  }
   return filtered;
 }
 
@@ -2359,7 +2424,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.18.1",
+  version: "2026.07.20.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2372,6 +2437,12 @@ export const model = {
       toVersion: "2026.07.18.1",
       description:
         "Add optional typed failureClass to invocation records (additive; existing records without it still parse)",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.20.1",
+      description:
+        "FRK-SEC-001: deny read/write of ~/.config/swamp in the Seatbelt sandbox profile (closes the on-disk exposure of the Swamp control-plane API key on macOS), and convert the provider child env filter from a four-literal denylist to a deny-by-SWAMP_-prefix strip with a fixed non-secret re-allow list; no global argument schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
