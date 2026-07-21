@@ -76,6 +76,19 @@ const ToolProfileEnum = z.enum(["readonly", "actor"]);
  */
 const SandboxModeEnum = z.enum(["off", "auto", "seatbelt", "bwrap"]);
 
+/**
+ * Network egress policy applied inside the OS sandbox. "allow" (the default)
+ * keeps the existing permissive base profile — network + repo access — for
+ * build/test/deploy agents (ADW, software-factory) that legitimately need
+ * both. "deny" selects the hardened profile (no network egress, and the
+ * per-repo `.swamp/secrets` vault under CWD is denied): the defense against a
+ * flow that runs an LLM over UNTRUSTED input, where an injected instruction
+ * to exfiltrate data over the network or read a co-located vault secret must
+ * have nowhere to go. Only meaningful when the effective sandbox backend is
+ * seatbelt — bwrap and "off" ignore it (see {@link sandboxConfigFrom}).
+ */
+const SandboxNetworkEnum = z.enum(["allow", "deny"]);
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -118,6 +131,9 @@ export const GlobalArgsSchema = z.object({
   ),
   sandboxRequired: z.boolean().default(false).describe(
     "When true, fail the invocation instead of degrading when a sandbox is requested but the platform can't apply it (no backend for the OS, or the backend's binary is missing). Default false: warn and run unsandboxed.",
+  ),
+  sandboxNetwork: SandboxNetworkEnum.default("allow").describe(
+    "Network egress policy for the OS sandbox. 'allow' (default) uses the permissive base profile — network + repo access, for build/test/deploy agents. 'deny' selects the hardened profile: NO network egress and the per-repo .swamp/secrets vault is denied — for flows running an LLM on UNTRUSTED input (prompt-injection exfiltration defense). Only effective when the sandbox backend is seatbelt.",
   ),
 });
 
@@ -365,6 +381,17 @@ export function resolveEffectiveBackend(
  * works identically in both layouts.
  */
 export const SANDBOX_PROFILE_FILENAME = "cli_agent.sandbox.sb";
+
+/**
+ * Manifest-relative name of the shipped HARDENED Seatbelt profile — the
+ * default profile plus `(deny network*)` and a deny of the per-repo
+ * `.swamp/secrets` vault under CWD. Selected instead of
+ * {@link SANDBOX_PROFILE_FILENAME} only when the effective network policy is
+ * `"deny"` (see {@link sandboxConfigFrom}) AND no explicit `sandboxProfile`
+ * override is set. Ships the same way as the base profile — through the
+ * manifest `binaries` field, resolved via `ctx.extensionFile()`.
+ */
+export const SANDBOX_STRICT_PROFILE_FILENAME = "cli_agent.sandbox.strict.sb";
 
 /**
  * Path to the `bwrap` (bubblewrap) binary on Linux. A fixed constant (not a
@@ -2142,31 +2169,44 @@ function cliPathFor(provider: Provider, g: GlobalArgs): string {
  * overrides (mirrors how `toolProfile` is threaded: global default, overridable
  * per call).
  *
- * `resolveDefaultProfile` supplies the path to the shipped `.sb` when the caller
- * has NOT set a `sandboxProfile` override. It is invoked lazily — only when the
- * EFFECTIVE backend (via {@link resolveEffectiveBackend}, using the CURRENT
- * `Deno.build.os`) is seatbelt, i.e. `mode: "seatbelt"` explicitly, or
- * `mode: "auto"` while running on Darwin — without an override. This keeps
- * `off`, explicit `bwrap`, and `auto` on Linux (or any non-Darwin OS) from ever
- * touching the filesystem for a profile bwrap doesn't use, and from risking a
- * throw when the profile can't be resolved. Production passes
- * `() => ctx.extensionFile(SANDBOX_PROFILE_FILENAME)`; tests inject a stub so
- * resolution can be exercised against a simulated pulled layout without a full
- * model runtime.
+ * `resolveProfile` resolves a manifest-relative filename to the shipped `.sb`'s
+ * absolute path when the caller has NOT set a `sandboxProfile` override. It is
+ * invoked lazily — only when the EFFECTIVE backend (via
+ * {@link resolveEffectiveBackend}, using the CURRENT `Deno.build.os`) is
+ * seatbelt, i.e. `mode: "seatbelt"` explicitly, or `mode: "auto"` while
+ * running on Darwin — without an override. This keeps `off`, explicit
+ * `bwrap`, and `auto` on Linux (or any non-Darwin OS) from ever touching the
+ * filesystem for a profile bwrap doesn't use, and from risking a throw when
+ * the profile can't be resolved. Production passes
+ * `(fn) => ctx.extensionFile(fn)`; tests inject a stub so resolution can be
+ * exercised against a simulated pulled layout without a full model runtime.
+ *
+ * WHICH default filename is passed to `resolveProfile` depends on the
+ * effective `sandboxNetwork` policy: `"deny"` resolves
+ * {@link SANDBOX_STRICT_PROFILE_FILENAME} (the hardened, network-denying
+ * profile); `"allow"` (the default, unchanged from before this arg existed)
+ * resolves {@link SANDBOX_PROFILE_FILENAME}. An explicit `g.sandboxProfile`
+ * path override still takes precedence over BOTH — a caller who names an
+ * exact profile file gets exactly that file regardless of `sandboxNetwork`.
  */
 export function sandboxConfigFrom(
   g: GlobalArgs,
-  resolveDefaultProfile: () => string,
+  resolveProfile: (filename: string) => string,
   overrides?: {
     sandboxMode?: "off" | "auto" | "seatbelt" | "bwrap";
     sandboxRequired?: boolean;
+    sandboxNetwork?: "allow" | "deny";
   },
 ): SandboxConfig {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
+  const network = overrides?.sandboxNetwork ?? g.sandboxNetwork;
   const needsProfile = resolveEffectiveBackend(mode, Deno.build.os) ===
     "seatbelt";
+  const defaultFilename = network === "deny"
+    ? SANDBOX_STRICT_PROFILE_FILENAME
+    : SANDBOX_PROFILE_FILENAME;
   const profilePath = g.sandboxProfile ??
-    (needsProfile ? resolveDefaultProfile() : "");
+    (needsProfile ? resolveProfile(defaultFilename) : "");
   return {
     mode,
     profilePath,
@@ -2409,6 +2449,9 @@ const InvokeArgsSchema = z.object({
   sandboxRequired: z.boolean().optional().describe(
     "Override the global sandboxRequired for this invocation: fail closed instead of warn-and-degrade when the sandbox can't be applied.",
   ),
+  sandboxNetwork: SandboxNetworkEnum.optional().describe(
+    "Override the global sandboxNetwork for this invocation: 'allow' (default; permissive base profile) or 'deny' (hardened profile — no network egress, per-repo .swamp/secrets vault denied). Set 'deny' only for flows running an LLM on untrusted input.",
+  ),
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -2424,7 +2467,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.20.1",
+  version: "2026.07.21.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2443,6 +2486,12 @@ export const model = {
       toVersion: "2026.07.20.1",
       description:
         "FRK-SEC-001: deny read/write of ~/.config/swamp in the Seatbelt sandbox profile (closes the on-disk exposure of the Swamp control-plane API key on macOS), and convert the provider child env filter from a four-literal denylist to a deny-by-SWAMP_-prefix strip with a fixed non-secret re-allow list; no global argument schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.21.1",
+      description:
+        "Add opt-in sandboxNetwork ('allow'|'deny', global + per-invocation override, default 'allow') selecting a new hardened Seatbelt profile (cli_agent.sandbox.strict.sb: base profile + deny all network egress + deny the per-repo .swamp/secrets vault under CWD) for flows running an LLM on untrusted input. Default 'allow' preserves the exact prior behavior for every existing consumer (ADW, software-factory, etc.) — additive schema change, no upgrade rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2522,10 +2571,11 @@ export const model = {
             maxRetries,
             sandbox: sandboxConfigFrom(
               context.globalArgs,
-              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+              (fn) => context.extensionFile(fn),
               {
                 sandboxMode: args.sandboxMode,
                 sandboxRequired: args.sandboxRequired,
+                sandboxNetwork: args.sandboxNetwork,
               },
             ),
           },
@@ -2651,10 +2701,11 @@ export const model = {
             maxRetries,
             sandbox: sandboxConfigFrom(
               context.globalArgs,
-              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+              (fn) => context.extensionFile(fn),
               {
                 sandboxMode: args.sandboxMode,
                 sandboxRequired: args.sandboxRequired,
+                sandboxNetwork: args.sandboxNetwork,
               },
             ),
           },
@@ -2803,7 +2854,7 @@ export const model = {
             wallTimeoutMs: 60_000,
             sandbox: sandboxConfigFrom(
               context.globalArgs,
-              () => context.extensionFile(SANDBOX_PROFILE_FILENAME),
+              (fn) => context.extensionFile(fn),
             ),
             logger: context.logger,
           },

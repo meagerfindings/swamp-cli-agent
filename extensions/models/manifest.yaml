@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/cli-agent"
-version: "2026.07.20.1"
+version: "2026.07.21.1"
 description: >
   Invoke CLI coding agents (claude, opencode, amp, gemini, codex, grok) with
   typed inputs and capture structured outputs — tokens, cost, duration,
@@ -18,5 +18,6 @@ additionalFiles:
 
 binaries:
   - cli_agent.sandbox.sb
+  - cli_agent.sandbox.strict.sb
 
 platforms: []

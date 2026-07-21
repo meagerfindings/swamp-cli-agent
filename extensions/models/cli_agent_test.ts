@@ -28,6 +28,7 @@ import {
   resolveModel,
   runCli,
   SANDBOX_PROFILE_FILENAME,
+  SANDBOX_STRICT_PROFILE_FILENAME,
   sandboxConfigFrom,
   SIGNATURE_TABLE,
   wrapWithSandbox,
@@ -1014,7 +1015,7 @@ Deno.test("sandboxConfigFrom: seatbelt resolves the default profile from the pul
   const g = GlobalArgsSchema.parse({});
   const cfg = sandboxConfigFrom(
     g,
-    () => extensionFile(SANDBOX_PROFILE_FILENAME),
+    (fn) => extensionFile(fn),
     { sandboxMode: "seatbelt" },
   );
 
@@ -1081,6 +1082,121 @@ Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips th
 
   assertEquals(cfg.profilePath, "/custom/profile.sb");
   assertEquals(called, false);
+});
+
+// --- sandboxConfigFrom + sandboxNetwork (opt-in hardened profile selection) --
+//
+// Regression guard for the opt-in strict-network-deny sandbox mode: the
+// DEFAULT (`sandboxNetwork: "allow"`, whether via global default or omitted
+// per-call override) must resolve the exact same base filename as before this
+// arg existed — every existing consumer (ADW, software-factory) is unaffected.
+// Only an explicit "deny" resolves the strict filename, and only when seatbelt
+// is the effective backend; the resolver is otherwise never invoked (lazy).
+
+Deno.test("sandboxConfigFrom: sandboxNetwork defaults to 'allow' on GlobalArgsSchema", () => {
+  const g = GlobalArgsSchema.parse({});
+  assertEquals(g.sandboxNetwork, "allow");
+});
+
+Deno.test("sandboxConfigFrom: sandboxNetwork 'allow' (default) resolves the BASE filename, not strict", () => {
+  let resolvedFilename: string | undefined;
+  const g = GlobalArgsSchema.parse({}); // sandboxNetwork defaults to "allow"
+  const cfg = sandboxConfigFrom(
+    g,
+    (fn) => {
+      resolvedFilename = fn;
+      return `/resolved/${fn}`;
+    },
+    { sandboxMode: "seatbelt" },
+  );
+
+  assertEquals(resolvedFilename, SANDBOX_PROFILE_FILENAME);
+  assertEquals(cfg.profilePath, `/resolved/${SANDBOX_PROFILE_FILENAME}`);
+});
+
+Deno.test("sandboxConfigFrom: sandboxNetwork 'deny' resolves the STRICT filename", () => {
+  let resolvedFilename: string | undefined;
+  const g = GlobalArgsSchema.parse({});
+  const cfg = sandboxConfigFrom(
+    g,
+    (fn) => {
+      resolvedFilename = fn;
+      return `/resolved/${fn}`;
+    },
+    { sandboxMode: "seatbelt", sandboxNetwork: "deny" },
+  );
+
+  assertEquals(resolvedFilename, SANDBOX_STRICT_PROFILE_FILENAME);
+  assertEquals(cfg.profilePath, `/resolved/${SANDBOX_STRICT_PROFILE_FILENAME}`);
+});
+
+Deno.test("sandboxConfigFrom: global sandboxNetwork 'deny' (no per-call override) also resolves the STRICT filename", () => {
+  // Exercises the g.sandboxNetwork fallback path (overrides?.sandboxNetwork is
+  // undefined), mirroring how a downstream model could set its OWN global
+  // default to "deny" for an untrusted-input-only instance.
+  let resolvedFilename: string | undefined;
+  const g = GlobalArgsSchema.parse({ sandboxNetwork: "deny" });
+  const cfg = sandboxConfigFrom(
+    g,
+    (fn) => {
+      resolvedFilename = fn;
+      return `/resolved/${fn}`;
+    },
+    { sandboxMode: "seatbelt" },
+  );
+
+  assertEquals(resolvedFilename, SANDBOX_STRICT_PROFILE_FILENAME);
+  assertEquals(cfg.profilePath, `/resolved/${SANDBOX_STRICT_PROFILE_FILENAME}`);
+});
+
+Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins over sandboxNetwork:'deny' too", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({ sandboxProfile: "/custom/profile.sb" });
+  const cfg = sandboxConfigFrom(
+    g,
+    () => {
+      called = true;
+      return "/default/should/not/be/used.sb";
+    },
+    { sandboxMode: "seatbelt", sandboxNetwork: "deny" },
+  );
+
+  assertEquals(cfg.profilePath, "/custom/profile.sb");
+  assertEquals(called, false);
+});
+
+Deno.test("sandboxConfigFrom: sandboxNetwork:'deny' with backend NOT seatbelt (mode 'off') never invokes the resolver", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({ sandboxMode: "off" });
+  const cfg = sandboxConfigFrom(
+    g,
+    () => {
+      called = true;
+      return "/should/not/be/reached.sb";
+    },
+    { sandboxNetwork: "deny" },
+  );
+
+  assertEquals(cfg.mode, "off");
+  assertEquals(called, false);
+  assertEquals(cfg.profilePath, "");
+});
+
+Deno.test("sandboxConfigFrom: sandboxNetwork:'deny' with backend bwrap never invokes the (seatbelt-only) resolver", () => {
+  let called = false;
+  const g = GlobalArgsSchema.parse({ sandboxMode: "bwrap" });
+  const cfg = sandboxConfigFrom(
+    g,
+    () => {
+      called = true;
+      return "/should/not/be/reached.sb";
+    },
+    { sandboxNetwork: "deny" },
+  );
+
+  assertEquals(cfg.mode, "bwrap");
+  assertEquals(called, false);
+  assertEquals(cfg.profilePath, "");
 });
 
 // --- resolveEffectiveBackend (pure mode+OS → backend resolution) ------------

