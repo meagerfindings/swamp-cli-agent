@@ -2467,7 +2467,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.21.2",
+  version: "2026.07.21.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2492,6 +2492,12 @@ export const model = {
       toVersion: "2026.07.21.1",
       description:
         "Add opt-in sandboxNetwork ('allow'|'deny', global + per-invocation override, default 'allow') selecting a new hardened Seatbelt profile (cli_agent.sandbox.strict.sb: base profile + deny all network egress + deny the per-repo .swamp/secrets vault under CWD) for flows running an LLM on untrusted input. Default 'allow' preserves the exact prior behavior for every existing consumer (ADW, software-factory, etc.) — additive schema change, no upgrade rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.21.3",
+      description:
+        "Strict (sandboxNetwork:deny) Seatbelt profile now denies only EXTERNAL network and re-allows localhost, so a network-denied flow can reach a LOCAL model (e.g. Ollama on 127.0.0.1) while all external egress stays blocked. Profile-file change only — no schema change, no attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
