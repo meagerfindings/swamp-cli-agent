@@ -1341,7 +1341,7 @@ export function buildPiCommand(
       "--mode",
       "json",
       "--no-session",
-      "-m",
+      "--model",
       model,
       ...PI_TOOL_ARGS[toolProfile],
       resolvedPrompt,

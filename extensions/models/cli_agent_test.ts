@@ -1554,7 +1554,7 @@ Deno.test("buildPiCommand: actor is yolo-by-default (no --tools flag), readonly 
     "--mode",
     "json",
     "--no-session",
-    "-m",
+    "--model",
     "openrouter/moonshotai/kimi-k3",
     "do it",
   ]);
@@ -1570,7 +1570,7 @@ Deno.test("buildPiCommand: actor is yolo-by-default (no --tools flag), readonly 
     "--mode",
     "json",
     "--no-session",
-    "-m",
+    "--model",
     "openrouter/moonshotai/kimi-k3",
     "--tools",
     "read",
