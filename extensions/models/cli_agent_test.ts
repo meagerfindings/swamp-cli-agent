@@ -813,6 +813,38 @@ Deno.test("runCli: spawned child omits control-plane credentials and preserves p
   }
 });
 
+Deno.test("runCli: child PWD matches its requested working directory", async () => {
+  const parentDir = await Deno.makeTempDir();
+  const requestedDir = await Deno.makeTempDir({
+    prefix: "repo-trees-worktree-",
+  });
+  const previousPwd = Deno.env.get("PWD");
+
+  try {
+    Deno.env.set("PWD", parentDir);
+
+    const result = await runCli(
+      [
+        Deno.execPath(),
+        "eval",
+        `console.log(JSON.stringify({ cwd: Deno.cwd(), pwd: Deno.env.get("PWD") }))`,
+      ],
+      { cwd: requestedDir, wallTimeoutMs: 10_000 },
+    );
+
+    assertEquals(result.success, true);
+    assertEquals(JSON.parse(result.stdout), {
+      cwd: await Deno.realPath(requestedDir),
+      pwd: requestedDir,
+    });
+  } finally {
+    if (previousPwd === undefined) Deno.env.delete("PWD");
+    else Deno.env.set("PWD", previousPwd);
+    await Deno.remove(parentDir, { recursive: true });
+    await Deno.remove(requestedDir, { recursive: true });
+  }
+});
+
 Deno.test("ModelIdSchema: trims; rejects empty and whitespace-only", () => {
   assertEquals(ModelIdSchema.parse("  opus  "), "opus");
   assertEquals(ModelIdSchema.parse("grok-4.5"), "grok-4.5");
