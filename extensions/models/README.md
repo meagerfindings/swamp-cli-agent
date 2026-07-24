@@ -52,7 +52,11 @@ argument. Note for macOS: the Seatbelt sandbox profiles deny reads of `~/.pi`
 for all providers (static profiles can't be provider-scoped), so under the
 default `sandboxMode: auto` on Darwin pi must authenticate via environment
 variables (e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`) rather than its
-`auth.json` store. On Linux (bwrap) `~/.pi` is bound writable for the pi
+`auth.json` store, and loses in-sandbox access to everything else under
+`~/.pi` too: custom providers defined in `models.json`, user `settings.json`,
+and installed extensions — pass `--model`/`defaultModel` explicitly and keep
+custom providers to env-authenticated ones (or set `sandboxMode: off`).
+On Linux (bwrap) `~/.pi` is bound writable for the pi
 provider only. Provider subprocesses preserve ordinary environment-based
 authentication and configuration, but do not inherit known Swamp control-plane
 credential variables from the extension method process.

@@ -1632,6 +1632,27 @@ Deno.test("extractError: pi reads stopReason error / errorMessage, classifies re
   assertEquals(extractError("pi", PI_STREAM_OK), null);
 });
 
+Deno.test("extractError: pi treats stopReason 'aborted' as a provider failure (PI-CORR-2)", () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [], stopReason: "aborted" },
+  });
+  const err = extractError("pi", stream);
+  assertEquals(err?.code, "aborted");
+  assertEquals(err?.retryable, false);
+});
+
+Deno.test("Seatbelt profiles: both deny reads of ~/.pi (PI-SAFE-2)", async () => {
+  for (const f of ["cli_agent.sandbox.sb", "cli_agent.sandbox.strict.sb"]) {
+    const content = await Deno.readTextFile(new URL(`./${f}`, import.meta.url));
+    assertEquals(
+      content.includes('(subpath (string-append HOME "/.pi"))'),
+      true,
+      `${f} missing ~/.pi read-deny`,
+    );
+  }
+});
+
 Deno.test("extractError: pi reads exhausted auto_retry_end finalError", () => {
   const stream = JSON.stringify({
     type: "auto_retry_end",
