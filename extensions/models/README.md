@@ -30,7 +30,7 @@ models:
   my-agent:
     type: "@mgreten/cli-agent"
     globalArgs:
-      defaultProvider: claude     # claude | opencode | amp | gemini | codex | grok
+      defaultProvider: claude     # claude | opencode | amp | gemini | codex | grok | pi
       defaultModel: opus          # schema default (Claude-first); see model resolution below
       commandsDir: .claude/commands  # where slash commands live
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
@@ -38,13 +38,17 @@ models:
 ```
 
 CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
-`grokPath`) default to the bare binary name, relying on `$PATH` resolution.
+`grokPath`, `piPath`) default to the bare binary name, relying on `$PATH` resolution.
 Override them if your binaries live in a non-standard location.
 
 **Auth:** each provider CLI must already be installed and authenticated on the
 host (this extension only shells out). For Grok Build: run `grok login` or set
 `XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
-env credentials. Provider subprocesses preserve ordinary environment-based
+env credentials. For pi: run `pi` once interactively to authenticate — the
+extension reads pi's existing configuration (`~/.pi/agent/auth.json`,
+`models.json`, `settings.json`); pass the model as pi's `provider/id` form
+(e.g. `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model`
+argument. Provider subprocesses preserve ordinary environment-based
 authentication and configuration, but do not inherit known Swamp control-plane
 credential variables from the extension method process.
 

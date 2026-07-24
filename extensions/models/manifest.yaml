@@ -1,8 +1,8 @@
 manifestVersion: 1
 name: "@mgreten/cli-agent"
-version: "2026.07.21.3"
+version: "2026.07.24.1"
 description: >
-  Invoke CLI coding agents (claude, opencode, amp, gemini, codex, grok) with
+  Invoke CLI coding agents (claude, opencode, amp, gemini, codex, grok, pi) with
   typed inputs and capture structured outputs — tokens, cost, duration,
   retries, and exit code. Supports slash command resolution and JSON response
   parsing.
