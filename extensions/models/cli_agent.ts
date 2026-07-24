@@ -1,7 +1,8 @@
 /**
  * Multi-provider CLI agent invoker for swamp.
  *
- * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex, grok) with
+ * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex, grok,
+ * pi) with
  * typed inputs, captures structured outputs including token counts, cost,
  * duration, exit code, and automatic retries on transient failures. Supports
  * slash command resolution from a configurable commands directory and optional
@@ -469,14 +470,24 @@ const STATE_DIRS: string[] = [
   ".codex",
   ".config/opencode",
   ".local/share/opencode",
-  // pi persists sessions, settings, and auth under ~/.pi/agent. pi CANNOT
-  // work without it (auth.json holds the provider credentials the CLI reads
-  // at startup), so unlike the CREDENTIAL_FILES masking above this dir must
-  // be bound readable+writable for the pi provider to function in a bwrap
-  // sandbox at all — the OS sandbox's boundary is cwd/network, not pi's own
-  // config. pi has no separate non-credential state location to bind instead.
-  ".pi",
 ];
+
+/**
+ * State dirs bound ONLY when the spawned provider is pi (adversarial-review
+ * finding PI-SAFE-1). pi keeps its provider credentials at
+ * `~/.pi/agent/auth.json` and has no keychain/env-only auth path it can fall
+ * back to for custom providers, so pi itself cannot function in the sandbox
+ * without reading it — unlike claude (Keychain) or amp (env vars), whose
+ * credential paths stay masked/unbound. But STATE_DIRS is provider-agnostic:
+ * binding `~/.pi` there would hand pi's API keys to EVERY sandboxed provider
+ * (readable AND writable — exfiltration over the default allow-network
+ * policy, plus tampering with pi's settings/extensions for later code
+ * execution outside the sandbox). Scoping the bind to the pi provider keeps
+ * the credential reachable only by the CLI that owns it, restoring the
+ * allowlist-by-omission invariant for everyone else. Writable because pi
+ * persists sessions/state there (same rationale as the other STATE_DIRS).
+ */
+const PI_ONLY_STATE_DIRS: string[] = [".pi"];
 
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
 type BwrapArg = string;
@@ -547,6 +558,7 @@ export function buildBwrapArgs(
   cwd: string,
   home: string,
   pathExists: (p: string) => boolean,
+  provider?: string,
 ): string[] {
   const args: BwrapArg[] = [
     "--unshare-user",
@@ -590,6 +602,17 @@ export function buildBwrapArgs(
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
+    }
+  }
+
+  // Provider-scoped binds (PI-SAFE-1): pi's config/credential dir is bound
+  // ONLY for the pi provider — see PI_ONLY_STATE_DIRS.
+  if (provider === "pi") {
+    for (const rel of PI_ONLY_STATE_DIRS) {
+      const abs = `${home}/${rel}`;
+      if (pathExists(abs)) {
+        args.push("--bind", abs, abs);
+      }
     }
   }
 
@@ -654,6 +677,7 @@ export function wrapWithSandbox(
   logger?: MethodContext["logger"],
   sandboxExecPath = "/usr/bin/sandbox-exec",
   bwrapPath = BWRAP_PATH,
+  provider?: string,
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
@@ -723,7 +747,7 @@ export function wrapWithSandbox(
     };
     return [
       bwrapPath,
-      ...buildBwrapArgs(cmd, resolvedCwd, home, exists),
+      ...buildBwrapArgs(cmd, resolvedCwd, home, exists, provider),
     ];
   }
 
@@ -858,10 +882,20 @@ export async function runCli(
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
     logger?: MethodContext["logger"];
+    /** Spawned provider id — scopes provider-specific sandbox policy (PI-SAFE-1). */
+    provider?: string;
   },
 ): Promise<CmdResult> {
   const effectiveCmd = opts.sandbox
-    ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
+    ? wrapWithSandbox(
+      cmd,
+      opts.cwd,
+      opts.sandbox,
+      opts.logger,
+      undefined,
+      undefined,
+      opts.provider,
+    )
     : cmd;
   const start = performance.now();
   const command = new Deno.Command(effectiveCmd[0], {
@@ -1322,9 +1356,10 @@ const PI_TOOL_ARGS: Record<ToolProfile, string[]> = {
  * models.json) — pi has no per-invocation credential flag in use here; the
  * child inherits the environment (minus `SWAMP_*`, see
  * {@link filterProviderChildEnv}), so provider API keys set as env vars also
- * work. The `model` arg is passed to `-m` and accepts pi's `provider/id`
- * form (e.g. `openrouter/moonshotai/kimi-k3`), which selects provider and
- * model in one flag, so no separate `--provider` flag is threaded through.
+ * work. The `model` arg is passed to `--model` (pi has no `-m` shorthand)
+ * and accepts pi's `provider/id` form (e.g. `openrouter/moonshotai/kimi-k3`),
+ * which selects provider and model in one flag, so no separate `--provider`
+ * flag is threaded through.
  *
  * Exported for unit tests that assert the exact argv contract.
  */
@@ -1869,7 +1904,7 @@ function extractErrorImpl(
 
   if (provider === "pi") {
     // pi surfaces LLM/transport failures in-band:
-    // 1) an assistant message with stopReason "error"/"aborted" and an
+    // 1) an assistant message with stopReason "error" (or "aborted") and an
     //    errorMessage field (on turn_end/message_end/agent_end payloads), or
     // 2) auto_retry_end with success:false and finalError, after pi's own
     //    internal retries are exhausted.
@@ -1883,6 +1918,7 @@ function extractErrorImpl(
             event.type === "agent_end") &&
           event.message?.role === "assistant" &&
           (event.message?.stopReason === "error" ||
+            event.message?.stopReason === "aborted" ||
             typeof event.message?.errorMessage === "string")
         ) {
           const message: string = event.message.errorMessage ??
@@ -2293,12 +2329,17 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
   pi: {
     buildCommand: buildPiCommand,
     cliPath: (g) => g.piPath,
-    // No registry defaultModel: pi resolves its own configured default model
-    // from ~/.pi/agent when -m is omitted... but this extension ALWAYS passes
-    // -m (see resolveModel falling back to global defaultModel), so a pi
-    // instance MUST set defaultModel (or pass model per invoke) to a pi model
-    // id, e.g. "openrouter/moonshotai/kimi-k3".
-    combineStreams: true,
+    // No registry defaultModel: a pi instance MUST set defaultModel (or pass
+    // model per invoke) to a pi model id, e.g. "openrouter/moonshotai/kimi-k3"
+    // (resolveModel falls back to global defaultModel, which is always passed
+    // via --model).
+    // combineStreams false (PI-CONS-1): pi surfaces in-band errors on stdout
+    // JSONL, and pre-start failures exit non-zero with the message on stderr
+    // (captured by the exit-code failure path, which includes stderr in the
+    // thrown error). There is no stderr-only exit-0 failure class for pi
+    // (unlike Grok), so combining streams would only risk stderr noise
+    // leaking into the extractText rawOutput fallback.
+    combineStreams: false,
     extractText: (raw) => extractTextImpl("pi", raw),
     extractError: (raw) => extractErrorImpl("pi", raw),
     extractUsage: (raw) => extractUsageImpl("pi", raw),
@@ -2470,6 +2511,7 @@ async function runWithRetries(
       idleTimeoutMs: opts.idleTimeoutMs,
       sandbox: opts.sandbox,
       logger,
+      provider,
     });
     // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
     // cannot silent-succeed. Policy lives on the provider registry.
@@ -2699,7 +2741,7 @@ export const model = {
     {
       toVersion: "2026.07.24.1",
       description:
-        "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session, auth/models from ~/.pi/agent, piPath global arg, JSONL text/error/usage extractors) and bind ~/.pi into the bwrap sandbox STATE_DIRS so a sandboxed pi can read its config. Additive schema change (ProviderEnum member + optional-path global arg with default), no attribute rewrite.",
+        "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --model <provider/id>, auth/models from ~/.pi/agent, piPath global arg, JSONL text/error/usage extractors). bwrap: ~/.pi is bound writable ONLY for the pi provider (PI_ONLY_STATE_DIRS) — a provider-agnostic bind would expose pi's auth.json to every sandboxed CLI (adversarial-review PI-SAFE-1). Seatbelt (macOS): ~/.pi is read-denied for ALL providers like ~/.config/amp — pi on macOS must authenticate via env vars (e.g. OPENROUTER_API_KEY) since auth.json is unreadable in-sandbox. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2735,7 +2777,7 @@ export const model = {
   methods: {
     invoke: {
       description:
-        "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok) with a prompt and record structured results",
+        "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok, pi) with a prompt and record structured results",
       arguments: InvokeArgsSchema,
       execute: async (
         args: InvokeArgs,

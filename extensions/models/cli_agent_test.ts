@@ -855,7 +855,8 @@ Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on
   ]);
   assertEquals(PROVIDERS.grok.combineStreams, true);
   assertEquals(PROVIDERS.claude.combineStreams, false);
-  assertEquals(PROVIDERS.pi.combineStreams, true);
+  // PI-CONS-1: pi has no stderr-only exit-0 failure class — streams not combined.
+  assertEquals(PROVIDERS.pi.combineStreams, false);
   assertEquals(typeof PROVIDERS.grok.parseModelsList, "function");
   assertEquals(typeof PROVIDERS.opencode.parseModelsList, "function");
   assertEquals(PROVIDERS.claude.parseModelsList, undefined);
@@ -1461,12 +1462,41 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
   assertEquals(argv.includes("/home/agent/.codex"), false);
 });
 
-Deno.test("buildBwrapArgs: binds ~/.pi writable (pi's config/auth lives there — no credential masking)", () => {
+Deno.test("buildBwrapArgs: binds ~/.pi writable ONLY for the pi provider (PI-SAFE-1)", () => {
   const existing = new Set(["/home/agent/.pi"]);
   const exists = (p: string) => existing.has(p);
-  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
-  const idx = argv.indexOf("/home/agent/.pi");
-  assertEquals(argv[idx - 1], "--bind");
+  // pi provider: bound writable.
+  const piArgv = buildBwrapArgs(
+    ["echo", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    "pi",
+  );
+  const idx = piArgv.indexOf("/home/agent/.pi");
+  assertEquals(piArgv[idx - 1], "--bind");
+  // Every other provider (and an unspecified provider): no bind at all —
+  // pi's auth.json must not be reachable by other sandboxed CLIs.
+  for (
+    const p of [
+      undefined,
+      "claude",
+      "codex",
+      "grok",
+      "opencode",
+      "amp",
+      "gemini",
+    ]
+  ) {
+    const argv = buildBwrapArgs(
+      ["echo", "hi"],
+      "/work",
+      "/home/agent",
+      exists,
+      p,
+    );
+    assertEquals(argv.includes("/home/agent/.pi"), false, `provider=${p}`);
+  }
 });
 
 // --- pi provider ------------------------------------------------------------
