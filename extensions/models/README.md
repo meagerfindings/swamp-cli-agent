@@ -44,22 +44,16 @@ Override them if your binaries live in a non-standard location.
 **Auth:** each provider CLI must already be installed and authenticated on the
 host (this extension only shells out). For Grok Build: run `grok login` or set
 `XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
-env credentials. For pi: run `pi` once interactively to authenticate — the
-extension reads pi's existing configuration (`~/.pi/agent/auth.json`,
-`models.json`, `settings.json`); pass the model as pi's `provider/id` form
-(e.g. `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model`
-argument. Note for macOS: the Seatbelt sandbox profiles deny reads of `~/.pi`
-for all providers (static profiles can't be provider-scoped), so under the
-default `sandboxMode: auto` on Darwin pi must authenticate via environment
-variables (e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`) rather than its
-`auth.json` store, and loses in-sandbox access to everything else under
-`~/.pi` too: custom providers defined in `models.json`, user `settings.json`,
-and installed extensions — pass `--model`/`defaultModel` explicitly and keep
-custom providers to env-authenticated ones (or set `sandboxMode: off`).
-On Linux (bwrap) `~/.pi` is bound writable for the pi
-provider only. Provider subprocesses preserve ordinary environment-based
-authentication and configuration, but do not inherit known Swamp control-plane
-credential variables from the extension method process.
+env credentials. For pi, pass the model in `provider/id` form (for example,
+`openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.
+Pi 0.82.0 or newer is required. Pi extensions are always disabled. Sandboxed
+pi uses fresh disposable config, cannot read or modify the host's `~/.pi`, and
+therefore must authenticate through environment variables such as
+`OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`. Custom providers, file-backed auth,
+and user settings require the explicit trust decision `sandboxMode: off`.
+Provider subprocesses preserve ordinary environment-based authentication and
+configuration, but do not inherit known Swamp control-plane credential
+variables from the extension method process.
 
 **Model resolution** when `invoke` omits `model`:
 

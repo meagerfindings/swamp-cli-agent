@@ -814,6 +814,29 @@ Deno.test("runCli: spawned child omits control-plane credentials and preserves p
   }
 });
 
+Deno.test("runCli: explicit child environment overrides inherited values", async () => {
+  const previous = Deno.env.get("PI_CODING_AGENT_DIR");
+  try {
+    Deno.env.set("PI_CODING_AGENT_DIR", "/host/pi");
+    const result = await runCli(
+      [
+        Deno.execPath(),
+        "eval",
+        "console.log(Deno.env.get('PI_CODING_AGENT_DIR'))",
+      ],
+      {
+        env: { PI_CODING_AGENT_DIR: "/tmp/disposable-pi" },
+        wallTimeoutMs: 10_000,
+      },
+    );
+    assertEquals(result.success, true);
+    assertEquals(result.stdout.trim(), "/tmp/disposable-pi");
+  } finally {
+    if (previous === undefined) Deno.env.delete("PI_CODING_AGENT_DIR");
+    else Deno.env.set("PI_CODING_AGENT_DIR", previous);
+  }
+});
+
 Deno.test("ModelIdSchema: trims; rejects empty and whitespace-only", () => {
   assertEquals(ModelIdSchema.parse("  opus  "), "opus");
   assertEquals(ModelIdSchema.parse("grok-4.5"), "grok-4.5");
@@ -840,6 +863,15 @@ Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→pr
   assertEquals(resolveModel("claude", undefined, "opus"), "opus");
   // Provider without registry default uses global as-is.
   assertEquals(resolveModel("codex", undefined, "gpt-5.5"), "gpt-5.5");
+  assertEquals(
+    resolveModel("pi", undefined, "openrouter/moonshotai/kimi-k3"),
+    "openrouter/moonshotai/kimi-k3",
+  );
+  assertThrows(
+    () => resolveModel("pi", undefined, "opus"),
+    Error,
+    "pi requires an explicit provider/model id",
+  );
 });
 
 Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on adapters", () => {
@@ -1462,41 +1494,16 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
   assertEquals(argv.includes("/home/agent/.codex"), false);
 });
 
-Deno.test("buildBwrapArgs: binds ~/.pi writable ONLY for the pi provider (PI-SAFE-1)", () => {
+Deno.test("buildBwrapArgs: never exposes the host ~/.pi tree", () => {
   const existing = new Set(["/home/agent/.pi"]);
   const exists = (p: string) => existing.has(p);
-  // pi provider: bound writable.
-  const piArgv = buildBwrapArgs(
+  const argv = buildBwrapArgs(
     ["echo", "hi"],
     "/work",
     "/home/agent",
     exists,
-    "pi",
   );
-  const idx = piArgv.indexOf("/home/agent/.pi");
-  assertEquals(piArgv[idx - 1], "--bind");
-  // Every other provider (and an unspecified provider): no bind at all —
-  // pi's auth.json must not be reachable by other sandboxed CLIs.
-  for (
-    const p of [
-      undefined,
-      "claude",
-      "codex",
-      "grok",
-      "opencode",
-      "amp",
-      "gemini",
-    ]
-  ) {
-    const argv = buildBwrapArgs(
-      ["echo", "hi"],
-      "/work",
-      "/home/agent",
-      exists,
-      p,
-    );
-    assertEquals(argv.includes("/home/agent/.pi"), false, `provider=${p}`);
-  }
+  assertEquals(argv.includes("/home/agent/.pi"), false);
 });
 
 // --- pi provider ------------------------------------------------------------
@@ -1553,7 +1560,8 @@ const PI_STREAM_OK = [
     },
     toolResults: [],
   }),
-  JSON.stringify({ type: "agent_end", messages: [] }),
+  JSON.stringify({ type: "agent_end", messages: [], willRetry: false }),
+  JSON.stringify({ type: "agent_settled" }),
 ].join("\n");
 
 // pi surfaces an LLM failure as an assistant message with stopReason "error"
@@ -1571,11 +1579,11 @@ const PI_TURN_ERROR = [
   }),
 ].join("\n");
 
-Deno.test("buildPiCommand: actor is yolo-by-default (no --tools flag), readonly allowlists read only", () => {
+Deno.test("buildPiCommand: disables extensions and sends hostile prompts via stdin", () => {
   const actor = buildPiCommand(
     "pi",
     "openrouter/moonshotai/kimi-k3",
-    "do it",
+    "--list-models",
     "actor",
   );
   assertEquals(actor.cmd, [
@@ -1584,14 +1592,15 @@ Deno.test("buildPiCommand: actor is yolo-by-default (no --tools flag), readonly 
     "--mode",
     "json",
     "--no-session",
+    "--no-extensions",
     "--model",
     "openrouter/moonshotai/kimi-k3",
-    "do it",
   ]);
+  assertEquals(actor.stdin, "--list-models");
   const ro = buildPiCommand(
     "pi",
     "openrouter/moonshotai/kimi-k3",
-    "look",
+    "@/etc/passwd",
     "readonly",
   );
   assertEquals(ro.cmd, [
@@ -1600,12 +1609,31 @@ Deno.test("buildPiCommand: actor is yolo-by-default (no --tools flag), readonly 
     "--mode",
     "json",
     "--no-session",
+    "--no-extensions",
     "--model",
     "openrouter/moonshotai/kimi-k3",
     "--tools",
     "read",
-    "look",
   ]);
+  assertEquals(ro.stdin, "@/etc/passwd");
+  for (
+    const prompt of [
+      "--list-models",
+      "--no-tools",
+      "-x",
+      "@/etc/passwd",
+      "--- YAML-like content",
+    ]
+  ) {
+    const built = buildPiCommand(
+      "pi",
+      "openrouter/moonshotai/kimi-k3",
+      prompt,
+      "actor",
+    );
+    assertEquals(built.cmd.includes(prompt), false, prompt);
+    assertEquals(built.stdin, prompt);
+  }
 });
 
 Deno.test("extractText: pi joins assistant text parts, excludes thinking", () => {
@@ -1624,7 +1652,14 @@ Deno.test("extractUsage: pi sums message_end usage incl cost.total, folds cacheR
 });
 
 Deno.test("extractError: pi reads stopReason error / errorMessage, classifies retryable", () => {
-  const err = extractError("pi", PI_TURN_ERROR);
+  const err = extractError(
+    "pi",
+    [
+      PI_TURN_ERROR,
+      JSON.stringify({ type: "agent_end", willRetry: false }),
+      JSON.stringify({ type: "agent_settled" }),
+    ].join("\n"),
+  );
   assertEquals(err?.message, "429 rate limit exceeded");
   assertEquals(err?.code, "error");
   assertEquals(err?.retryable, true);
@@ -1633,10 +1668,14 @@ Deno.test("extractError: pi reads stopReason error / errorMessage, classifies re
 });
 
 Deno.test("extractError: pi treats stopReason 'aborted' as a provider failure (PI-CORR-2)", () => {
-  const stream = JSON.stringify({
-    type: "message_end",
-    message: { role: "assistant", content: [], stopReason: "aborted" },
-  });
+  const stream = [
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "aborted" },
+    }),
+    JSON.stringify({ type: "agent_end", willRetry: false }),
+    JSON.stringify({ type: "agent_settled" }),
+  ].join("\n");
   const err = extractError("pi", stream);
   assertEquals(err?.code, "aborted");
   assertEquals(err?.retryable, false);
@@ -1654,15 +1693,71 @@ Deno.test("Seatbelt profiles: both deny reads of ~/.pi (PI-SAFE-2)", async () =>
 });
 
 Deno.test("extractError: pi reads exhausted auto_retry_end finalError", () => {
-  const stream = JSON.stringify({
-    type: "auto_retry_end",
-    success: false,
-    attempt: 3,
-    finalError: "quota exceeded",
-  });
+  const stream = [
+    JSON.stringify({ type: "agent_end", willRetry: false }),
+    JSON.stringify({
+      type: "auto_retry_end",
+      success: false,
+      attempt: 3,
+      finalError: "quota exceeded",
+    }),
+    JSON.stringify({ type: "agent_settled" }),
+  ].join("\n");
   const err = extractError("pi", stream);
   assertEquals(err?.message, "quota exceeded");
-  assertEquals(err?.retryable, true);
+  assertEquals(err?.code, "auto_retry_exhausted");
+  assertEquals(err?.retryable, false);
+});
+
+Deno.test("extractError: pi internal retry success supersedes provisional error", () => {
+  const stream = [
+    PI_TURN_ERROR,
+    JSON.stringify({ type: "agent_end", willRetry: true }),
+    JSON.stringify({ type: "auto_retry_start", attempt: 2 }),
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "recovered" }],
+        stopReason: "stop",
+      },
+    }),
+    JSON.stringify({ type: "auto_retry_end", success: true, attempt: 2 }),
+    JSON.stringify({ type: "agent_end", willRetry: false }),
+    JSON.stringify({ type: "agent_settled" }),
+  ].join("\n");
+  assertEquals(extractError("pi", stream), null);
+  assertEquals(extractTextFromOutput("pi", stream), "recovered");
+});
+
+Deno.test("extractError: pi rejects truncated or malformed JSONL", () => {
+  const truncated = [
+    JSON.stringify({ type: "session", version: 3 }),
+    JSON.stringify({ type: "agent_start" }),
+  ].join("\n");
+  assertEquals(extractError("pi", truncated)?.code, "invalid_stream");
+  assertEquals(
+    extractError("pi", `${PI_STREAM_OK}\nnot-json`)?.code,
+    "invalid_stream",
+  );
+  assertEquals(
+    extractError("pi", PI_TURN_ERROR)?.code,
+    "invalid_stream",
+  );
+  const malformedError = [
+    PI_TURN_ERROR,
+    "not-json",
+    JSON.stringify({ type: "agent_end", willRetry: false }),
+    JSON.stringify({ type: "agent_settled" }),
+  ].join("\n");
+  assertEquals(extractError("pi", malformedError)?.code, "invalid_stream");
+  const truncatedSuccess = PI_STREAM_OK.split("\n").slice(0, -1).join("\n");
+  assertEquals(extractError("pi", truncatedSuccess)?.code, "invalid_stream");
+  const truncatedError = [
+    PI_TURN_ERROR,
+    JSON.stringify({ type: "agent_end", willRetry: false }),
+  ].join("\n");
+  assertEquals(extractError("pi", truncatedError)?.code, "invalid_stream");
 });
 
 Deno.test("buildBwrapArgs: skips binding a credential file or state dir that does not exist on disk", () => {

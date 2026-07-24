@@ -472,23 +472,6 @@ const STATE_DIRS: string[] = [
   ".local/share/opencode",
 ];
 
-/**
- * State dirs bound ONLY when the spawned provider is pi (adversarial-review
- * finding PI-SAFE-1). pi keeps its provider credentials at
- * `~/.pi/agent/auth.json` and has no keychain/env-only auth path it can fall
- * back to for custom providers, so pi itself cannot function in the sandbox
- * without reading it — unlike claude (Keychain) or amp (env vars), whose
- * credential paths stay masked/unbound. But STATE_DIRS is provider-agnostic:
- * binding `~/.pi` there would hand pi's API keys to EVERY sandboxed provider
- * (readable AND writable — exfiltration over the default allow-network
- * policy, plus tampering with pi's settings/extensions for later code
- * execution outside the sandbox). Scoping the bind to the pi provider keeps
- * the credential reachable only by the CLI that owns it, restoring the
- * allowlist-by-omission invariant for everyone else. Writable because pi
- * persists sessions/state there (same rationale as the other STATE_DIRS).
- */
-const PI_ONLY_STATE_DIRS: string[] = [".pi"];
-
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
 type BwrapArg = string;
 
@@ -558,7 +541,6 @@ export function buildBwrapArgs(
   cwd: string,
   home: string,
   pathExists: (p: string) => boolean,
-  provider?: string,
 ): string[] {
   const args: BwrapArg[] = [
     "--unshare-user",
@@ -602,17 +584,6 @@ export function buildBwrapArgs(
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
-    }
-  }
-
-  // Provider-scoped binds (PI-SAFE-1): pi's config/credential dir is bound
-  // ONLY for the pi provider — see PI_ONLY_STATE_DIRS.
-  if (provider === "pi") {
-    for (const rel of PI_ONLY_STATE_DIRS) {
-      const abs = `${home}/${rel}`;
-      if (pathExists(abs)) {
-        args.push("--bind", abs, abs);
-      }
     }
   }
 
@@ -677,7 +648,6 @@ export function wrapWithSandbox(
   logger?: MethodContext["logger"],
   sandboxExecPath = "/usr/bin/sandbox-exec",
   bwrapPath = BWRAP_PATH,
-  provider?: string,
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
@@ -747,7 +717,7 @@ export function wrapWithSandbox(
     };
     return [
       bwrapPath,
-      ...buildBwrapArgs(cmd, resolvedCwd, home, exists, provider),
+      ...buildBwrapArgs(cmd, resolvedCwd, home, exists),
     ];
   }
 
@@ -878,24 +848,15 @@ export async function runCli(
   opts: {
     cwd?: string;
     stdin?: string;
+    env?: Record<string, string>;
     wallTimeoutMs: number;
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
     logger?: MethodContext["logger"];
-    /** Spawned provider id — scopes provider-specific sandbox policy (PI-SAFE-1). */
-    provider?: string;
   },
 ): Promise<CmdResult> {
   const effectiveCmd = opts.sandbox
-    ? wrapWithSandbox(
-      cmd,
-      opts.cwd,
-      opts.sandbox,
-      opts.logger,
-      undefined,
-      undefined,
-      opts.provider,
-    )
+    ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
     : cmd;
   const start = performance.now();
   const command = new Deno.Command(effectiveCmd[0], {
@@ -905,7 +866,10 @@ export async function runCli(
     stdin: opts.stdin ? "piped" : "null",
     cwd: opts.cwd,
     clearEnv: true,
-    env: filterProviderChildEnv(Deno.env.toObject()),
+    env: {
+      ...filterProviderChildEnv(Deno.env.toObject()),
+      ...opts.env,
+    },
   });
 
   const child = command.spawn();
@@ -1350,16 +1314,17 @@ const PI_TOOL_ARGS: Record<ToolProfile, string[]> = {
  * turn_end, agent_end)
  * that {@link extractTextImpl}/{@link extractUsageImpl} parse. `--no-session`
  * keeps the run ephemeral — batch invocations must not accumulate session
- * files under `~/.pi/agent/sessions`.
+ * files under `~/.pi/agent/sessions`. `--no-extensions` prevents project or
+ * global extensions from executing inside a supposedly confined invocation.
  *
- * Auth and provider/model catalogs come from `~/.pi/agent/` (auth.json,
- * models.json) — pi has no per-invocation credential flag in use here; the
- * child inherits the environment (minus `SWAMP_*`, see
- * {@link filterProviderChildEnv}), so provider API keys set as env vars also
- * work. The `model` arg is passed to `--model` (pi has no `-m` shorthand)
- * and accepts pi's `provider/id` form (e.g. `openrouter/moonshotai/kimi-k3`),
- * which selects provider and model in one flag, so no separate `--provider`
- * flag is threaded through.
+ * Sandboxed runs point `PI_CODING_AGENT_DIR` at fresh disposable state and
+ * authenticate through inherited environment variables (minus `SWAMP_*`, see
+ * {@link filterProviderChildEnv}). With sandboxing explicitly off, pi can use
+ * its normal `~/.pi/agent` auth and model configuration. The `model` arg is
+ * passed to `--model` (pi has no `-m` shorthand) and accepts pi's
+ * `provider/id` form (e.g. `openrouter/moonshotai/kimi-k3`), which selects
+ * provider and model in one flag, so no separate `--provider` flag is threaded
+ * through.
  *
  * Exported for unit tests that assert the exact argv contract.
  */
@@ -1376,11 +1341,14 @@ export function buildPiCommand(
       "--mode",
       "json",
       "--no-session",
+      "--no-extensions",
       "--model",
       model,
       ...PI_TOOL_ARGS[toolProfile],
-      resolvedPrompt,
     ],
+    // Pi parses positional argv beginning with "-" as options and "@path" as
+    // file attachments. Stdin is consumed directly as prompt text in JSON mode.
+    stdin: resolvedPrompt,
   };
 }
 
@@ -1910,12 +1878,20 @@ function extractErrorImpl(
     //    internal retries are exhausted.
     // Pre-start failures (bad model id, missing auth) go to stderr as plain
     // text with a non-zero exit — those fail via the exit-code path, not here.
+    let terminalError: ProviderError | null = null;
+    let sawEvent = false;
+    let sawSettled = false;
+    let malformed = false;
     for (const line of rawOutput.split("\n")) {
+      if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
+        sawEvent = true;
+        if (event.type === "agent_settled") {
+          sawSettled = true;
+        }
         if (
-          (event.type === "turn_end" || event.type === "message_end" ||
-            event.type === "agent_end") &&
+          (event.type === "turn_end" || event.type === "message_end") &&
           event.message?.role === "assistant" &&
           (event.message?.stopReason === "error" ||
             event.message?.stopReason === "aborted" ||
@@ -1923,25 +1899,48 @@ function extractErrorImpl(
         ) {
           const message: string = event.message.errorMessage ??
             `pi turn failed (${event.message.stopReason ?? "unknown"})`;
-          return {
+          terminalError = {
             message,
             code: event.message.stopReason,
             retryable: looksRateLimited(message),
           };
+          continue;
+        }
+        if (
+          (event.type === "turn_end" || event.type === "message_end") &&
+          event.message?.role === "assistant" &&
+          typeof event.message?.stopReason === "string"
+        ) {
+          // A later successful message supersedes a provisional failure that
+          // pi retried internally.
+          terminalError = null;
         }
         if (
           event.type === "auto_retry_end" && event.success === false &&
           typeof event.finalError === "string"
         ) {
-          return {
+          terminalError = {
             message: event.finalError,
-            code: undefined,
-            retryable: looksRateLimited(event.finalError),
+            code: "auto_retry_exhausted",
+            // Pi already exhausted its own retry policy; do not rerun the
+            // complete process through the wrapper's provider-error retry.
+            retryable: false,
           };
+        } else if (event.type === "auto_retry_end" && event.success === true) {
+          terminalError = null;
         }
-      } catch { /* not JSON */ }
+      } catch {
+        malformed = true;
+      }
     }
-    return null;
+    if (malformed || !sawEvent || !sawSettled) {
+      return {
+        message: "pi returned an incomplete or malformed JSON event stream",
+        code: "invalid_stream",
+        retryable: false,
+      };
+    }
+    return terminalError;
   }
 
   // Compile-time exhaustiveness: a new ProviderEnum member fails to narrow to
@@ -2387,6 +2386,11 @@ export function resolveModel(
   // Treat omit / "" / whitespace as "no explicit" (schema also rejects blanks).
   if (isPresentModelId(explicit)) return explicit.trim();
   const providerDefault = PROVIDERS[provider].defaultModel;
+  if (provider === "pi" && globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL) {
+    throw new Error(
+      "pi requires an explicit provider/model id; set defaultModel or pass model to invoke",
+    );
+  }
   if (
     provider !== "claude" &&
     globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL &&
@@ -2504,15 +2508,29 @@ async function runWithRetries(
       resolved,
       toolProfile,
     );
-    lastResult = await runCli(cmd, {
-      cwd: opts.cwd,
-      stdin,
-      wallTimeoutMs: opts.wallTimeoutMs,
-      idleTimeoutMs: opts.idleTimeoutMs,
-      sandbox: opts.sandbox,
-      logger,
-      provider,
-    });
+    // Sandboxed pi must never read or mutate the host's credential-bearing
+    // ~/.pi tree. Point it at fresh disposable state and rely on environment
+    // authentication. Explicit sandboxMode:"off" preserves normal pi config.
+    const piConfigDir = provider === "pi" && opts.sandbox?.mode !== "off"
+      ? `/tmp/swamp-cli-agent-pi-${crypto.randomUUID()}`
+      : undefined;
+    try {
+      lastResult = await runCli(cmd, {
+        cwd: opts.cwd,
+        stdin,
+        env: piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : undefined,
+        wallTimeoutMs: opts.wallTimeoutMs,
+        idleTimeoutMs: opts.idleTimeoutMs,
+        sandbox: opts.sandbox,
+        logger,
+      });
+    } finally {
+      if (piConfigDir) {
+        await Deno.remove(piConfigDir, { recursive: true }).catch((error) => {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        });
+      }
+    }
     // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
     // cannot silent-succeed. Policy lives on the provider registry.
     const errorSource = caps.combineStreams
@@ -2741,7 +2759,7 @@ export const model = {
     {
       toVersion: "2026.07.24.1",
       description:
-        "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --model <provider/id>, auth/models from ~/.pi/agent, piPath global arg, JSONL text/error/usage extractors). bwrap: ~/.pi is bound writable ONLY for the pi provider (PI_ONLY_STATE_DIRS) — a provider-agnostic bind would expose pi's auth.json to every sandboxed CLI (adversarial-review PI-SAFE-1). Seatbelt (macOS): ~/.pi is read-denied for ALL providers like ~/.config/amp — pi on macOS must authenticate via env vars (e.g. OPENROUTER_API_KEY) since auth.json is unreadable in-sandbox. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
+        "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --no-extensions --model <provider/id>, piPath global arg, JSONL text/error/usage extractors). Sandboxed pi uses disposable PI_CODING_AGENT_DIR state and environment authentication; the host ~/.pi credential/config tree remains inaccessible. File-backed auth and custom config require explicit sandboxMode:off. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
