@@ -859,6 +859,12 @@ export async function runCli(
     ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
     : cmd;
   const start = performance.now();
+  const childEnv = {
+    ...filterProviderChildEnv(Deno.env.toObject()),
+    ...opts.env,
+  };
+  if (opts.cwd) childEnv.PWD = opts.cwd;
+
   const command = new Deno.Command(effectiveCmd[0], {
     args: effectiveCmd.slice(1),
     stdout: "piped",
@@ -866,10 +872,7 @@ export async function runCli(
     stdin: opts.stdin ? "piped" : "null",
     cwd: opts.cwd,
     clearEnv: true,
-    env: {
-      ...filterProviderChildEnv(Deno.env.toObject()),
-      ...opts.env,
-    },
+    env: childEnv,
   });
 
   const child = command.spawn();
@@ -2723,7 +2726,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.24.1",
+  version: "2026.07.24.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2758,6 +2761,12 @@ export const model = {
     },
     {
       toVersion: "2026.07.24.1",
+      description:
+        "Normalize each provider subprocess PWD to its requested cwd so tools that prefer PWD over the kernel working directory operate in the selected checkout or worktree. Execution-only fix — no schema change or attribute rewrite.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.24.2",
       description:
         "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --no-extensions --model <provider/id>, piPath global arg, JSONL text/error/usage extractors). Sandboxed pi uses disposable PI_CODING_AGENT_DIR state and environment authentication; the host ~/.pi credential/config tree remains inaccessible. File-backed auth and custom config require explicit sandboxMode:off. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
