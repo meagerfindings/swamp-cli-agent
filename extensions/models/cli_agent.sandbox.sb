@@ -82,6 +82,15 @@
   (literal (string-append HOME "/.codex/config.toml"))
   ; Amp CLI settings (may embed an API key)
   (subpath (string-append HOME "/.config/amp"))
+  ; pi coding agent config + auth store (~/.pi/agent/auth.json holds provider
+  ; API keys). Denied for ALL providers including pi itself — Seatbelt
+  ; profiles are static and cannot be provider-scoped (unlike the bwrap
+  ; backend's PI_ONLY_STATE_DIRS), so the safe uniform policy is full deny,
+  ; mirroring ~/.config/amp: pi on macOS must authenticate via env vars
+  ; (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ...) which pass through the env
+  ; filter. Also absent from the write-allow subpaths below, so ~/.pi stays
+  ; read-only-denied AND unwritable in-sandbox.
+  (subpath (string-append HOME "/.pi"))
   ; OpenCode CLI's own auth store
   (literal (string-append HOME "/.local/share/opencode/auth.json"))
   ; Swamp control-plane credentials (FRK-SEC-001): `swamp auth login`
