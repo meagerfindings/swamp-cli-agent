@@ -1,7 +1,8 @@
 /**
  * Multi-provider CLI agent invoker for swamp.
  *
- * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex, grok) with
+ * Runs coding-agent CLI tools (claude, opencode, amp, gemini, codex, grok,
+ * pi) with
  * typed inputs, captures structured outputs including token counts, cost,
  * duration, exit code, and automatic retries on transient failures. Supports
  * slash command resolution from a configurable commands directory and optional
@@ -25,6 +26,7 @@ const ProviderEnum = z.enum([
   "gemini",
   "codex",
   "grok",
+  "pi",
 ]);
 
 /**
@@ -107,6 +109,7 @@ export const GlobalArgsSchema = z.object({
   geminiPath: z.string().default("gemini"),
   codexPath: z.string().default("codex"),
   grokPath: z.string().default("grok"),
+  piPath: z.string().default("pi"),
   idleTimeoutMs: z.number().default(600_000),
   wallTimeoutMs: z.number().default(3_600_000),
   maxRetries: z.number().default(2),
@@ -845,6 +848,7 @@ export async function runCli(
   opts: {
     cwd?: string;
     stdin?: string;
+    env?: Record<string, string>;
     wallTimeoutMs: number;
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
@@ -855,7 +859,10 @@ export async function runCli(
     ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
     : cmd;
   const start = performance.now();
-  const childEnv = filterProviderChildEnv(Deno.env.toObject());
+  const childEnv = {
+    ...filterProviderChildEnv(Deno.env.toObject()),
+    ...opts.env,
+  };
   if (opts.cwd) childEnv.PWD = opts.cwd;
 
   const command = new Deno.Command(effectiveCmd[0], {
@@ -1284,6 +1291,71 @@ export function buildGrokCommand(
 }
 
 /**
+ * Pi tool-profile flag per profile, passed via `--tools`.
+ *
+ * "readonly" allowlists only the `read` tool — pi's other built-ins are
+ * `bash` (arbitrary shell), `edit`, and `write`, so any allowlist containing
+ * them is not read-only. pi has no separate grep/glob built-in tools (it
+ * greps via bash), which makes its readonly profile strictly narrower than
+ * the other providers' — a reviewer that needs to search the repo must run
+ * under "actor".
+ *
+ * "actor" passes no `--tools` flag at all: pi runs yolo (full toolset, no
+ * permission prompts) by default in `--print` mode, so the absence of a flag
+ * IS the actor configuration.
+ */
+const PI_TOOL_ARGS: Record<ToolProfile, string[]> = {
+  readonly: ["--tools", "read"],
+  actor: [],
+};
+
+/**
+ * Build the command array for the pi coding agent CLI.
+ *
+ * `--print` runs non-interactively and exits; `--mode json` emits the JSONL
+ * event stream (session, agent_start, turn_start, message_* events,
+ * turn_end, agent_end)
+ * that {@link extractTextImpl}/{@link extractUsageImpl} parse. `--no-session`
+ * keeps the run ephemeral — batch invocations must not accumulate session
+ * files under `~/.pi/agent/sessions`. `--no-extensions` prevents project or
+ * global extensions from executing inside a supposedly confined invocation.
+ *
+ * Sandboxed runs point `PI_CODING_AGENT_DIR` at fresh disposable state and
+ * authenticate through inherited environment variables (minus `SWAMP_*`, see
+ * {@link filterProviderChildEnv}). With sandboxing explicitly off, pi can use
+ * its normal `~/.pi/agent` auth and model configuration. The `model` arg is
+ * passed to `--model` (pi has no `-m` shorthand) and accepts pi's
+ * `provider/id` form (e.g. `openrouter/moonshotai/kimi-k3`), which selects
+ * provider and model in one flag, so no separate `--provider` flag is threaded
+ * through.
+ *
+ * Exported for unit tests that assert the exact argv contract.
+ */
+export function buildPiCommand(
+  cliPath: string,
+  model: ModelId,
+  resolvedPrompt: string,
+  toolProfile: ToolProfile,
+): { cmd: string[]; stdin?: string } {
+  return {
+    cmd: [
+      cliPath,
+      "--print",
+      "--mode",
+      "json",
+      "--no-session",
+      "--no-extensions",
+      "--model",
+      model,
+      ...PI_TOOL_ARGS[toolProfile],
+    ],
+    // Pi parses positional argv beginning with "-" as options and "@path" as
+    // file attachments. Stdin is consumed directly as prompt text in JSON mode.
+    stdin: resolvedPrompt,
+  };
+}
+
+/**
  * Parse `grok models` human-readable stdout into bare model ids.
  *
  * Real capture shape:
@@ -1396,6 +1468,34 @@ function extractTextImpl(provider: Provider, rawOutput: string): string {
         } catch { /* not JSON */ }
       }
       if (parts.length > 0) return parts.join("");
+      const err = extractErrorImpl(provider, rawOutput);
+      return err ? err.message : rawOutput;
+    }
+    case "pi": {
+      // pi --mode json emits one JSON event per line. The final assistant
+      // message for each turn is carried on `turn_end` (and duplicated on
+      // `agent_end`); its content array holds {type:"text", text} parts
+      // interleaved with {type:"thinking"} parts, which are NOT answer text.
+      // Take the LAST assistant message seen (later turns supersede earlier
+      // ones), joining only its text parts.
+      let text: string | undefined;
+      for (const line of rawOutput.split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (
+            (event.type === "turn_end" || event.type === "message_end") &&
+            event.message?.role === "assistant" &&
+            Array.isArray(event.message?.content)
+          ) {
+            const parts = event.message.content
+              .filter((c: { type?: string }) => c?.type === "text")
+              .map((c: { text?: string }) => c.text ?? "")
+              .join("");
+            if (parts) text = parts;
+          }
+        } catch { /* not JSON */ }
+      }
+      if (text !== undefined) return text;
       const err = extractErrorImpl(provider, rawOutput);
       return err ? err.message : rawOutput;
     }
@@ -1773,6 +1873,79 @@ function extractErrorImpl(
     return null;
   }
 
+  if (provider === "pi") {
+    // pi surfaces LLM/transport failures in-band:
+    // 1) an assistant message with stopReason "error" (or "aborted") and an
+    //    errorMessage field (on turn_end/message_end/agent_end payloads), or
+    // 2) auto_retry_end with success:false and finalError, after pi's own
+    //    internal retries are exhausted.
+    // Pre-start failures (bad model id, missing auth) go to stderr as plain
+    // text with a non-zero exit — those fail via the exit-code path, not here.
+    let terminalError: ProviderError | null = null;
+    let sawEvent = false;
+    let sawSettled = false;
+    let malformed = false;
+    for (const line of rawOutput.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        sawEvent = true;
+        if (event.type === "agent_settled") {
+          sawSettled = true;
+        }
+        if (
+          (event.type === "turn_end" || event.type === "message_end") &&
+          event.message?.role === "assistant" &&
+          (event.message?.stopReason === "error" ||
+            event.message?.stopReason === "aborted" ||
+            typeof event.message?.errorMessage === "string")
+        ) {
+          const message: string = event.message.errorMessage ??
+            `pi turn failed (${event.message.stopReason ?? "unknown"})`;
+          terminalError = {
+            message,
+            code: event.message.stopReason,
+            retryable: looksRateLimited(message),
+          };
+          continue;
+        }
+        if (
+          (event.type === "turn_end" || event.type === "message_end") &&
+          event.message?.role === "assistant" &&
+          typeof event.message?.stopReason === "string"
+        ) {
+          // A later successful message supersedes a provisional failure that
+          // pi retried internally.
+          terminalError = null;
+        }
+        if (
+          event.type === "auto_retry_end" && event.success === false &&
+          typeof event.finalError === "string"
+        ) {
+          terminalError = {
+            message: event.finalError,
+            code: "auto_retry_exhausted",
+            // Pi already exhausted its own retry policy; do not rerun the
+            // complete process through the wrapper's provider-error retry.
+            retryable: false,
+          };
+        } else if (event.type === "auto_retry_end" && event.success === true) {
+          terminalError = null;
+        }
+      } catch {
+        malformed = true;
+      }
+    }
+    if (malformed || !sawEvent || !sawSettled) {
+      return {
+        message: "pi returned an incomplete or malformed JSON event stream",
+        code: "invalid_stream",
+        retryable: false,
+      };
+    }
+    return terminalError;
+  }
+
   // Compile-time exhaustiveness: a new ProviderEnum member fails to narrow to
   // `never` here until a branch above handles it.
   return assertNever(provider);
@@ -1994,6 +2167,51 @@ function extractUsageImpl(provider: Provider, rawOutput: string): UsageData {
     return {};
   }
 
+  if (provider === "pi") {
+    // Usage lives on each assistant message's `usage` object (pi field names:
+    // input/output/cacheRead/cacheWrite/reasoning/totalTokens, plus a
+    // `cost.total` USD figure). Sum across assistant `message_end` events —
+    // one per assistant message — so a multi-turn run is not undercounted.
+    // (`turn_end` duplicates the same message; summing both would double.)
+    let input = 0;
+    let output = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let reasoning = 0;
+    let costUsd = 0;
+    let sawUsage = false;
+
+    for (const line of rawOutput.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (
+          event.type !== "message_end" ||
+          event.message?.role !== "assistant" || !event.message?.usage
+        ) continue;
+        const u = event.message.usage;
+        input += Number(u.input) || 0;
+        output += Number(u.output) || 0;
+        cacheRead += Number(u.cacheRead) || 0;
+        cacheWrite += Number(u.cacheWrite) || 0;
+        reasoning += Number(u.reasoning) || 0;
+        costUsd += Number(u.cost?.total) || 0;
+        sawUsage = true;
+      } catch { /* skip */ }
+    }
+
+    if (!sawUsage) return {};
+    return {
+      // Fold cache reads into input to match the other providers.
+      input: input + cacheRead,
+      output,
+      cacheRead,
+      cacheWrite,
+      reasoning,
+      total: input + output + cacheRead + cacheWrite,
+      costUsd,
+    };
+  }
+
   return assertNever(provider);
 }
 
@@ -2110,6 +2328,24 @@ export const PROVIDERS: Record<Provider, ProviderCapabilities> = {
     extractError: (raw) => extractErrorImpl("grok", raw),
     extractUsage: (raw) => extractUsageImpl("grok", raw),
   },
+  pi: {
+    buildCommand: buildPiCommand,
+    cliPath: (g) => g.piPath,
+    // No registry defaultModel: a pi instance MUST set defaultModel (or pass
+    // model per invoke) to a pi model id, e.g. "openrouter/moonshotai/kimi-k3"
+    // (resolveModel falls back to global defaultModel, which is always passed
+    // via --model).
+    // combineStreams false (PI-CONS-1): pi surfaces in-band errors on stdout
+    // JSONL, and pre-start failures exit non-zero with the message on stderr
+    // (captured by the exit-code failure path, which includes stderr in the
+    // thrown error). There is no stderr-only exit-0 failure class for pi
+    // (unlike Grok), so combining streams would only risk stderr noise
+    // leaking into the extractText rawOutput fallback.
+    combineStreams: false,
+    extractText: (raw) => extractTextImpl("pi", raw),
+    extractError: (raw) => extractErrorImpl("pi", raw),
+    extractUsage: (raw) => extractUsageImpl("pi", raw),
+  },
 };
 
 /**
@@ -2153,6 +2389,11 @@ export function resolveModel(
   // Treat omit / "" / whitespace as "no explicit" (schema also rejects blanks).
   if (isPresentModelId(explicit)) return explicit.trim();
   const providerDefault = PROVIDERS[provider].defaultModel;
+  if (provider === "pi" && globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL) {
+    throw new Error(
+      "pi requires an explicit provider/model id; set defaultModel or pass model to invoke",
+    );
+  }
   if (
     provider !== "claude" &&
     globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL &&
@@ -2270,14 +2511,29 @@ async function runWithRetries(
       resolved,
       toolProfile,
     );
-    lastResult = await runCli(cmd, {
-      cwd: opts.cwd,
-      stdin,
-      wallTimeoutMs: opts.wallTimeoutMs,
-      idleTimeoutMs: opts.idleTimeoutMs,
-      sandbox: opts.sandbox,
-      logger,
-    });
+    // Sandboxed pi must never read or mutate the host's credential-bearing
+    // ~/.pi tree. Point it at fresh disposable state and rely on environment
+    // authentication. Explicit sandboxMode:"off" preserves normal pi config.
+    const piConfigDir = provider === "pi" && opts.sandbox?.mode !== "off"
+      ? `/tmp/swamp-cli-agent-pi-${crypto.randomUUID()}`
+      : undefined;
+    try {
+      lastResult = await runCli(cmd, {
+        cwd: opts.cwd,
+        stdin,
+        env: piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : undefined,
+        wallTimeoutMs: opts.wallTimeoutMs,
+        idleTimeoutMs: opts.idleTimeoutMs,
+        sandbox: opts.sandbox,
+        logger,
+      });
+    } finally {
+      if (piConfigDir) {
+        await Deno.remove(piConfigDir, { recursive: true }).catch((error) => {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        });
+      }
+    }
     // combineStreams (Grok): scan stdout+stderr so stderr-only exit-0 errors
     // cannot silent-succeed. Policy lives on the provider registry.
     const errorSource = caps.combineStreams
@@ -2470,7 +2726,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.24.1",
+  version: "2026.07.24.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2509,6 +2765,12 @@ export const model = {
         "Normalize each provider subprocess PWD to its requested cwd so tools that prefer PWD over the kernel working directory operate in the selected checkout or worktree. Execution-only fix — no schema change or attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.24.2",
+      description:
+        "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --no-extensions --model <provider/id>, piPath global arg, JSONL text/error/usage extractors). Sandboxed pi uses disposable PI_CODING_AGENT_DIR state and environment authentication; the host ~/.pi credential/config tree remains inaccessible. File-backed auth and custom config require explicit sandboxMode:off. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     invocation: {
@@ -2542,7 +2804,7 @@ export const model = {
   methods: {
     invoke: {
       description:
-        "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok) with a prompt and record structured results",
+        "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok, pi) with a prompt and record structured results",
       arguments: InvokeArgsSchema,
       execute: async (
         args: InvokeArgs,

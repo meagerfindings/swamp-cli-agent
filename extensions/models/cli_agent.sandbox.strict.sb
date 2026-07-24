@@ -141,6 +141,10 @@
   (literal (string-append HOME "/.codex/config.toml"))
   ; Amp CLI settings (may embed an API key)
   (subpath (string-append HOME "/.config/amp"))
+  ; pi coding agent config + auth store (~/.pi/agent/auth.json) — denied for
+  ; ALL providers (static profile cannot be provider-scoped); pi on macOS
+  ; must authenticate via env vars. Mirrors the base profile.
+  (subpath (string-append HOME "/.pi"))
   ; OpenCode CLI's own auth store
   (literal (string-append HOME "/.local/share/opencode/auth.json"))
   ; Swamp control-plane credentials (FRK-SEC-001): `swamp auth login`

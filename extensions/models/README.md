@@ -30,7 +30,7 @@ models:
   my-agent:
     type: "@mgreten/cli-agent"
     globalArgs:
-      defaultProvider: claude     # claude | opencode | amp | gemini | codex | grok
+      defaultProvider: claude     # claude | opencode | amp | gemini | codex | grok | pi
       defaultModel: opus          # schema default (Claude-first); see model resolution below
       commandsDir: .claude/commands  # where slash commands live
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
@@ -38,15 +38,22 @@ models:
 ```
 
 CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
-`grokPath`) default to the bare binary name, relying on `$PATH` resolution.
+`grokPath`, `piPath`) default to the bare binary name, relying on `$PATH` resolution.
 Override them if your binaries live in a non-standard location.
 
 **Auth:** each provider CLI must already be installed and authenticated on the
 host (this extension only shells out). For Grok Build: run `grok login` or set
 `XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
-env credentials. Provider subprocesses preserve ordinary environment-based
-authentication and configuration, but do not inherit known Swamp control-plane
-credential variables from the extension method process.
+env credentials. For pi, pass the model in `provider/id` form (for example,
+`openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.
+Pi 0.82.0 or newer is required. Pi extensions are always disabled. Sandboxed
+pi uses fresh disposable config, cannot read or modify the host's `~/.pi`, and
+therefore must authenticate through environment variables such as
+`OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`. Custom providers, file-backed auth,
+and user settings require the explicit trust decision `sandboxMode: off`.
+Provider subprocesses preserve ordinary environment-based authentication and
+configuration, but do not inherit known Swamp control-plane credential
+variables from the extension method process.
 
 **Model resolution** when `invoke` omits `model`:
 
