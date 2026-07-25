@@ -522,6 +522,9 @@ type BwrapArg = string;
  *    usr-merge symlinks debian/ubuntu-style distros expect — binding `/bin`
  *    etc. directly instead of symlinking fails because they ARE symlinks
  *    into `/usr` on the host; bwrap needs the symlink recreated, not shadowed.
+ *    DNS: on systemd-resolved hosts /etc/resolv.conf is a symlink into
+ *    /run/systemd/resolve — that directory is bound read-only so the symlink
+ *    resolves and DNS works inside the sandbox.
  * 3. `--proc /proc`, `--dev /dev`, `--tmpfs /tmp` (ephemeral scratch, not the
  *    real /tmp).
  * 4. **Workspace**: `--bind cwd cwd` — the only unconditionally-writable path
@@ -586,6 +589,15 @@ export function buildBwrapArgs(
     "--ro-bind",
     "/etc",
     "/etc",
+    // DNS: On systemd-resolved systems, /etc/resolv.conf is a symlink to
+    // ../run/systemd/resolve/stub-resolv.conf. The /etc bind preserves the
+    // symlink but /run is absent in the sandbox, so DNS resolution fails with
+    // ENOTFOUND. Bind the resolve directory read-only so the symlink resolves.
+    "--dir",
+    "/run",
+    ...(pathExists("/run/systemd/resolve")
+      ? ["--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve"]
+      : []),
     "--symlink",
     "usr/bin",
     "/bin",
@@ -2828,7 +2840,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.25.1",
+  version: "2026.07.25.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {

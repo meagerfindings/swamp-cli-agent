@@ -1566,6 +1566,46 @@ Deno.test("buildBwrapArgs: excludes secret dirs entirely (no bind emitted) even 
   }
 });
 
+Deno.test("buildBwrapArgs: binds /run/systemd/resolve read-only when it exists (DNS for systemd-resolved)", () => {
+  // On systemd-resolved hosts /etc/resolv.conf is a symlink into
+  // /run/systemd/resolve. Without binding that directory the symlink is
+  // broken inside the sandbox and DNS fails with ENOTFOUND.
+  const exists = (p: string) => p === "/run/systemd/resolve";
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    null,
+    "claude",
+    "provider",
+  );
+
+  const idx = argv.indexOf("/run/systemd/resolve");
+  assertEquals(idx > -1, true, "expected /run/systemd/resolve in argv");
+  assertEquals(argv[idx - 1], "--ro-bind");
+  assertEquals(argv[idx + 1], "/run/systemd/resolve");
+});
+
+Deno.test("buildBwrapArgs: does not bind /run/systemd/resolve when absent (non-systemd hosts)", () => {
+  const exists = () => false;
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    null,
+    "claude",
+    "provider",
+  );
+
+  assertEquals(
+    argv.includes("/run/systemd/resolve"),
+    false,
+    "must not bind /run/systemd/resolve when it does not exist",
+  );
+});
+
 Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing credential files with /dev/null", () => {
   const existing = new Set([
     "/home/agent/.claude",
