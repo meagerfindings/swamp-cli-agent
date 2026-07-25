@@ -968,6 +968,8 @@ Deno.test("wrapWithSandbox: mode 'off' returns cmd unchanged", () => {
   const cmd = ["claude", "--print", "hi"];
   const out = wrapWithSandbox(cmd, "/tmp/wd", {
     mode: "off",
+    provider: "claude",
+    credentialAccess: "isolated",
     profilePath: "/some/profile.sb",
     required: false,
   });
@@ -978,6 +980,8 @@ Deno.test("wrapWithSandbox: mode 'seatbelt' + sandbox-exec available produces th
   const cmd = ["claude", "--print", "hi"];
   const out = wrapWithSandbox(cmd, "/tmp/wd", {
     mode: "seatbelt",
+    provider: "claude",
+    credentialAccess: "isolated",
     profilePath: "/path/to/cli_agent.sandbox.sb",
     required: false,
   });
@@ -999,6 +1003,8 @@ Deno.test("wrapWithSandbox: cwd defaults to Deno.cwd() when omitted", () => {
   const cmd = ["claude"];
   const out = wrapWithSandbox(cmd, undefined, {
     mode: "seatbelt",
+    provider: "claude",
+    credentialAccess: "isolated",
     profilePath: "/profile.sb",
     required: false,
   });
@@ -1020,7 +1026,13 @@ Deno.test("wrapWithSandbox: unavailable sandbox-exec + not required degrades to 
   const out = wrapWithSandbox(
     cmd,
     "/tmp/wd",
-    { mode: "seatbelt", profilePath: "/profile.sb", required: false },
+    {
+      mode: "seatbelt",
+      provider: "claude",
+      credentialAccess: "isolated",
+      profilePath: "/profile.sb",
+      required: false,
+    },
     logger,
     "/nonexistent/sandbox-exec",
   );
@@ -1039,7 +1051,13 @@ Deno.test("wrapWithSandbox: unavailable sandbox-exec + sandboxRequired throws in
       wrapWithSandbox(
         cmd,
         "/tmp/wd",
-        { mode: "seatbelt", profilePath: "/profile.sb", required: true },
+        {
+          mode: "seatbelt",
+          provider: "claude",
+          credentialAccess: "isolated",
+          profilePath: "/profile.sb",
+          required: true,
+        },
         undefined,
         "/nonexistent/sandbox-exec",
       ),
@@ -1169,6 +1187,22 @@ Deno.test("sandboxConfigFrom: explicit sandboxProfile override wins and skips th
 Deno.test("sandboxConfigFrom: sandboxNetwork defaults to 'allow' on GlobalArgsSchema", () => {
   const g = GlobalArgsSchema.parse({});
   assertEquals(g.sandboxNetwork, "allow");
+});
+
+Deno.test("sandboxConfigFrom: selected-provider credential access is the default and can be isolated per invocation", () => {
+  const g = GlobalArgsSchema.parse({ defaultProvider: "claude" });
+  assertEquals(g.sandboxCredentialAccess, "provider");
+
+  const compatible = sandboxConfigFrom(g, () => "");
+  assertEquals(compatible.provider, "claude");
+  assertEquals(compatible.credentialAccess, "provider");
+
+  const isolatedCodex = sandboxConfigFrom(g, () => "", {
+    provider: "codex",
+    sandboxCredentialAccess: "isolated",
+  });
+  assertEquals(isolatedCodex.provider, "codex");
+  assertEquals(isolatedCodex.credentialAccess, "isolated");
 });
 
 Deno.test("sandboxConfigFrom: sandboxNetwork 'allow' (default) resolves the BASE filename, not strict", () => {
@@ -1328,6 +1362,8 @@ Deno.test("wrapWithSandbox: mode 'auto' on darwin resolves to seatbelt and produ
   const cmd = ["claude", "--print", "hi"];
   const out = wrapWithSandbox(cmd, "/tmp/wd", {
     mode: "auto",
+    provider: "claude",
+    credentialAccess: "isolated",
     profilePath: "/path/to/cli_agent.sandbox.sb",
     required: false,
   });
@@ -1360,7 +1396,13 @@ Deno.test("wrapWithSandbox: mode 'bwrap' forced on darwin (OS mismatch) degrades
   const out = wrapWithSandbox(
     cmd,
     "/tmp/wd",
-    { mode: "bwrap", profilePath: "", required: false },
+    {
+      mode: "bwrap",
+      provider: "claude",
+      credentialAccess: "isolated",
+      profilePath: "",
+      required: false,
+    },
     logger,
   );
   assertEquals(out, cmd);
@@ -1374,6 +1416,8 @@ Deno.test("wrapWithSandbox: mode 'bwrap' forced on darwin + sandboxRequired thro
     () =>
       wrapWithSandbox(cmd, "/tmp/wd", {
         mode: "bwrap",
+        provider: "claude",
+        credentialAccess: "isolated",
         profilePath: "",
         required: true,
       }),
@@ -1446,6 +1490,8 @@ Deno.test("buildBwrapArgs: includes the cwd bind, namespaces, network NOT unshar
     "/home/agent",
     exists,
     "/home/agent/.local/share/claude/versions/2.1.218",
+    "claude",
+    "provider",
   );
 
   // cwd is bound read-write for both source and dest.
@@ -1495,6 +1541,8 @@ Deno.test("buildBwrapArgs: excludes secret dirs entirely (no bind emitted) even 
     "/home/agent",
     exists,
     "/usr/bin/echo",
+    "claude",
+    "isolated",
   );
 
   for (
@@ -1531,6 +1579,8 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
     "/home/agent",
     exists,
     "/usr/bin/echo",
+    "claude",
+    "isolated",
   );
 
   // .claude is bound read-write (state dir).
@@ -1550,6 +1600,51 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
   assertEquals(argv.includes("/home/agent/.codex"), false);
 });
 
+Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's credential files", () => {
+  const existing = new Set([
+    "/home/agent/.claude",
+    "/home/agent/.claude.json",
+    "/home/agent/.claude/.credentials.json",
+    "/home/agent/.codex",
+    "/home/agent/.codex/auth.json",
+    "/home/agent/.codex/config.toml",
+    "/home/agent/.local/share/opencode",
+    "/home/agent/.local/share/opencode/auth.json",
+  ]);
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/work",
+    "/home/agent",
+    (path) => existing.has(path),
+    "/usr/bin/claude",
+    "claude",
+    "provider",
+  );
+
+  for (
+    const credential of [
+      "/home/agent/.claude.json",
+      "/home/agent/.claude/.credentials.json",
+    ]
+  ) {
+    const index = argv.indexOf(credential);
+    assertEquals(argv[index - 1], "--bind");
+    assertEquals(argv[index + 1], credential);
+  }
+
+  for (
+    const credential of [
+      "/home/agent/.codex/auth.json",
+      "/home/agent/.codex/config.toml",
+      "/home/agent/.local/share/opencode/auth.json",
+    ]
+  ) {
+    const index = argv.indexOf(credential);
+    assertEquals(argv[index - 2], "--ro-bind");
+    assertEquals(argv[index - 1], "/dev/null");
+  }
+});
+
 Deno.test("buildBwrapArgs: never exposes the host ~/.pi tree", () => {
   const existing = new Set(["/home/agent/.pi"]);
   const exists = (p: string) => existing.has(p);
@@ -1559,6 +1654,8 @@ Deno.test("buildBwrapArgs: never exposes the host ~/.pi tree", () => {
     "/home/agent",
     exists,
     "/usr/bin/echo",
+    "pi",
+    "provider",
   );
   assertEquals(argv.includes("/home/agent/.pi"), false);
 });
@@ -1829,6 +1926,8 @@ Deno.test("buildBwrapArgs: skips binding a credential file or state dir that doe
     "/home/agent",
     exists,
     "/usr/bin/echo",
+    "claude",
+    "provider",
   );
 
   assertEquals(argv.includes("/home/agent/.claude"), false);
@@ -1845,6 +1944,8 @@ Deno.test("buildBwrapArgs: home is bound via tmpfs+remount-ro bracket (order loa
     "/home/agent",
     exists,
     "/usr/bin/echo",
+    "claude",
+    "isolated",
   );
 
   const tmpfsIdx = argv.indexOf("--tmpfs");
@@ -1894,7 +1995,13 @@ Deno.test("wrapWithSandbox: sandbox binary missing + not required degrades and w
   const out = wrapWithSandbox(
     cmd,
     "/tmp/wd",
-    { mode: "seatbelt", profilePath: "/profile.sb", required: false },
+    {
+      mode: "seatbelt",
+      provider: "claude",
+      credentialAccess: "isolated",
+      profilePath: "/profile.sb",
+      required: false,
+    },
     logger,
     "/nonexistent/sandbox-exec",
     "/nonexistent/bwrap",
@@ -1914,7 +2021,13 @@ Deno.test("wrapWithSandbox: sandbox binary missing + sandboxRequired throws inst
       wrapWithSandbox(
         cmd,
         "/tmp/wd",
-        { mode: "seatbelt", profilePath: "/profile.sb", required: true },
+        {
+          mode: "seatbelt",
+          provider: "claude",
+          credentialAccess: "isolated",
+          profilePath: "/profile.sb",
+          required: true,
+        },
         undefined,
         "/nonexistent/sandbox-exec",
         "/nonexistent/bwrap",
@@ -1934,6 +2047,8 @@ Deno.test("buildBwrapArgs: produces a bwrap-shaped argv usable as the tail of a 
     "/home/agent",
     () => false,
     "/usr/bin/sh",
+    "claude",
+    "isolated",
   );
 
   assertEquals(argv[0], "--unshare-user");

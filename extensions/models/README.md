@@ -35,6 +35,7 @@ models:
       commandsDir: .claude/commands  # where slash commands live
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
       maxRetries: 2               # retry count for transient failures
+      sandboxCredentialAccess: provider # provider (normal CLI login) | isolated
 ```
 
 CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
@@ -44,7 +45,19 @@ Override them if your binaries live in a non-standard location.
 **Auth:** each provider CLI must already be installed and authenticated on the
 host (this extension only shells out). For Grok Build: run `grok login` or set
 `XAI_API_KEY`. Claude / Codex / Gemini / Amp / OpenCode use their own login or
-env credentials. For pi, pass the model in `provider/id` form (for example,
+env credentials. On Linux, the default `sandboxCredentialAccess: provider`
+exposes only the selected provider's known credential files inside bwrap, so
+ordinary Claude, Codex, and OpenCode CLI logins remain usable without exposing
+the other providers' credentials. The genuine CLI may update its own credential
+file when refreshing OAuth state. Provider tools run inside that same sandbox,
+so use `sandboxCredentialAccess: isolated` for untrusted prompts; isolated mode
+masks every known credential file and requires environment authentication such
+as an API key or Claude's official `CLAUDE_CODE_OAUTH_TOKEN` generated with
+`claude setup-token`. This setting controls Linux bwrap only. On macOS, the
+existing static Seatbelt policy is unchanged: Claude Code can use its normal
+Keychain-backed login while known file-backed credentials remain masked.
+
+For pi, pass the model in `provider/id` form (for example,
 `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.
 Pi 0.82.0 or newer is required. Pi extensions are always disabled. Sandboxed
 pi uses fresh disposable config, cannot read or modify the host's `~/.pi`, and
@@ -94,6 +107,7 @@ Arguments:
 | `cwd`           | string   | no       | Working directory for the CLI                 |
 | `tags`          | object   | no       | Key-value tags for grouping/filtering         |
 | `wallTimeoutMs` | number   | no       | Override wall timeout in milliseconds         |
+| `sandboxCredentialAccess` | enum | no | `provider` for selected-provider CLI login (default), or `isolated` to mask all known credential files |
 
 ### `invokeAndParse`
 

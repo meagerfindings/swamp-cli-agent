@@ -91,6 +91,15 @@ const SandboxModeEnum = z.enum(["off", "auto", "seatbelt", "bwrap"]);
  */
 const SandboxNetworkEnum = z.enum(["allow", "deny"]);
 
+/**
+ * Access policy for provider-managed credential files inside Linux bwrap.
+ * "provider" keeps ordinary CLI login usable by exposing only the selected
+ * provider's known credential files. "isolated" masks every known credential
+ * file, requiring environment-based authentication such as an API key or an
+ * official long-lived automation token.
+ */
+const SandboxCredentialAccessEnum = z.enum(["provider", "isolated"]);
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -138,6 +147,10 @@ export const GlobalArgsSchema = z.object({
   sandboxNetwork: SandboxNetworkEnum.default("allow").describe(
     "Network egress policy for the OS sandbox. 'allow' (default) uses the permissive base profile — network + repo access, for build/test/deploy agents. 'deny' selects the hardened profile: NO network egress and the per-repo .swamp/secrets vault is denied — for flows running an LLM on UNTRUSTED input (prompt-injection exfiltration defense). Only effective when the sandbox backend is seatbelt.",
   ),
+  sandboxCredentialAccess: SandboxCredentialAccessEnum.default("provider")
+    .describe(
+      "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
+    ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -316,6 +329,10 @@ const SIGKILL_GRACE_MS = 5_000;
 /** Resolved sandbox configuration passed down to {@link wrapWithSandbox}. */
 type SandboxConfig = {
   mode: "off" | "auto" | "seatbelt" | "bwrap";
+  /** Provider whose CLI is being invoked. */
+  provider: Provider;
+  /** Whether the selected provider's known credential files are exposed. */
+  credentialAccess: "provider" | "isolated";
   /**
    * Path to the Seatbelt .sb profile; only read/needed when the EFFECTIVE
    * backend (see {@link resolveEffectiveBackend}) is seatbelt.
@@ -443,12 +460,15 @@ export const BWRAP_PATH = "/usr/bin/bwrap";
  * this finding (subpath read+write deny); this comment documents why the
  * bwrap side needs no corresponding CREDENTIAL_FILES/STATE_DIRS change.
  */
-const CREDENTIAL_FILES: string[] = [
-  ".claude.json",
-  ".claude/.credentials.json",
-  ".codex/auth.json",
-  ".codex/config.toml",
-  ".local/share/opencode/auth.json",
+const PROVIDER_CREDENTIAL_FILES: Partial<Record<Provider, readonly string[]>> =
+  {
+    claude: [".claude.json", ".claude/.credentials.json"],
+    codex: [".codex/auth.json", ".codex/config.toml"],
+    opencode: [".local/share/opencode/auth.json"],
+  };
+
+const CREDENTIAL_FILES: readonly string[] = [
+  ...new Set(Object.values(PROVIDER_CREDENTIAL_FILES).flat()),
 ];
 
 /**
@@ -523,14 +543,13 @@ type BwrapArg = string;
  *    omission, avoiding the mask-precedence trap a broad `--bind home home`
  *    would require carefully layering masks on top of (see task brief).
  * 6. **Credential files**: for each existing path in CREDENTIAL_FILES,
- *    `--ro-bind /dev/null <path>` AFTER its containing STATE_DIRS bind —
- *    this masks both read (the process sees an empty /dev/null, never the
- *    real bytes) and write (`/dev/null` is bound read-only, so a write
- *    attempt gets EROFS) while sibling files in the same directory stay
- *    fully readable/writable. Proved on roccinante: reading returns
- *    "Permission denied", writing returns "Permission denied", the real
- *    file's sha256 is unchanged after the attempt, and a sibling test file
- *    in the same directory still round-trips.
+ *    the selected provider's files are bound writable when credentialAccess
+ *    is `"provider"`, allowing the genuine CLI to refresh its own OAuth state.
+ *    Every other known credential is masked with
+ *    `--ro-bind /dev/null <path>` AFTER its containing STATE_DIRS bind. In
+ *    `"isolated"` mode all known credentials are masked. Because provider
+ *    tools execute in the same sandbox, use isolated mode for untrusted input
+ *    and authenticate through a narrowly-scoped environment credential.
  * 7. **Provider executable**: when the resolved CLI executable is outside the
  *    base system, workspace, and explicit state directories, bind only that
  *    file read-only at `/run/cli-agent/provider` and execute it there. This
@@ -550,6 +569,8 @@ export function buildBwrapArgs(
   home: string,
   pathExists: (p: string) => boolean,
   executablePath: string | null,
+  provider: Provider,
+  credentialAccess: "provider" | "isolated",
 ): string[] {
   const sandboxExecutable = "/run/cli-agent/provider";
   const args: BwrapArg[] = [
@@ -607,10 +628,17 @@ export function buildBwrapArgs(
     }
   }
 
+  const permittedCredentialFiles = credentialAccess === "provider"
+    ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
+    : new Set<string>();
   for (const rel of CREDENTIAL_FILES) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
-      args.push("--ro-bind", "/dev/null", abs);
+      args.push(
+        permittedCredentialFiles.has(rel) ? "--bind" : "--ro-bind",
+        permittedCredentialFiles.has(rel) ? abs : "/dev/null",
+        abs,
+      );
     }
   }
 
@@ -781,6 +809,8 @@ export function wrapWithSandbox(
         home,
         exists,
         executableAlreadyVisible ? null : executablePath,
+        sandbox.provider,
+        sandbox.credentialAccess,
       ),
     ];
   }
@@ -2501,9 +2531,11 @@ export function sandboxConfigFrom(
   g: GlobalArgs,
   resolveProfile: (filename: string) => string,
   overrides?: {
+    provider?: Provider;
     sandboxMode?: "off" | "auto" | "seatbelt" | "bwrap";
     sandboxRequired?: boolean;
     sandboxNetwork?: "allow" | "deny";
+    sandboxCredentialAccess?: "provider" | "isolated";
   },
 ): SandboxConfig {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
@@ -2517,6 +2549,9 @@ export function sandboxConfigFrom(
     (needsProfile ? resolveProfile(defaultFilename) : "");
   return {
     mode,
+    provider: overrides?.provider ?? g.defaultProvider,
+    credentialAccess: overrides?.sandboxCredentialAccess ??
+      g.sandboxCredentialAccess,
     profilePath,
     required: overrides?.sandboxRequired ?? g.sandboxRequired,
   };
@@ -2775,6 +2810,9 @@ const InvokeArgsSchema = z.object({
   sandboxNetwork: SandboxNetworkEnum.optional().describe(
     "Override the global sandboxNetwork for this invocation: 'allow' (default; permissive base profile) or 'deny' (hardened profile — no network egress, per-repo .swamp/secrets vault denied). Set 'deny' only for flows running an LLM on untrusted input.",
   ),
+  sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
+    "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+  ),
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -2790,7 +2828,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.24.3",
+  version: "2026.07.25.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2839,6 +2877,12 @@ export const model = {
       toVersion: "2026.07.24.3",
       description:
         "Make standalone provider CLI executables installed outside Linux bwrap's existing mounts available through an exact read-only file bind. Execution-only fix; no schema change or attribute rewrite.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.25.1",
+      description:
+        "Add sandboxCredentialAccess ('provider'|'isolated', global + per-invocation, default 'provider'). Linux bwrap now permits only the selected provider's known file-backed credentials by default so ordinary CLI login works; isolated preserves full credential masking for environment-authenticated hardened runs. Additive schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2920,9 +2964,11 @@ export const model = {
               context.globalArgs,
               (fn) => context.extensionFile(fn),
               {
+                provider,
                 sandboxMode: args.sandboxMode,
                 sandboxRequired: args.sandboxRequired,
                 sandboxNetwork: args.sandboxNetwork,
+                sandboxCredentialAccess: args.sandboxCredentialAccess,
               },
             ),
           },
@@ -3050,9 +3096,11 @@ export const model = {
               context.globalArgs,
               (fn) => context.extensionFile(fn),
               {
+                provider,
                 sandboxMode: args.sandboxMode,
                 sandboxRequired: args.sandboxRequired,
                 sandboxNetwork: args.sandboxNetwork,
+                sandboxCredentialAccess: args.sandboxCredentialAccess,
               },
             ),
           },
@@ -3202,6 +3250,7 @@ export const model = {
             sandbox: sandboxConfigFrom(
               context.globalArgs,
               (fn) => context.extensionFile(fn),
+              { provider },
             ),
             logger: context.logger,
           },
