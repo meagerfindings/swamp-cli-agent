@@ -1445,6 +1445,7 @@ Deno.test("buildBwrapArgs: includes the cwd bind, namespaces, network NOT unshar
     "/work/dir",
     "/home/agent",
     exists,
+    "/home/agent/.local/share/claude/versions/2.1.218",
   );
 
   // cwd is bound read-write for both source and dest.
@@ -1469,15 +1470,32 @@ Deno.test("buildBwrapArgs: includes the cwd bind, namespaces, network NOT unshar
   // Network is deliberately NOT unshared (egress allowed, matches Seatbelt).
   assertEquals(argv.includes("--unshare-net"), false);
 
-  // The real cmd trails, unmodified, as the final argv elements.
-  assertEquals(argv.slice(-3), ["claude", "--print", "hi"]);
+  // The exact resolved executable is mounted read-only at a stable path. This
+  // keeps provider binaries installed under the otherwise-hidden home usable
+  // without exposing the rest of their installation tree.
+  const executableIdx = argv.indexOf(
+    "/home/agent/.local/share/claude/versions/2.1.218",
+  );
+  assertEquals(argv[executableIdx - 1], "--ro-bind");
+  assertEquals(argv[executableIdx + 1], "/run/cli-agent/provider");
+  assertEquals(argv.slice(-3), [
+    "/run/cli-agent/provider",
+    "--print",
+    "hi",
+  ]);
 });
 
 Deno.test("buildBwrapArgs: excludes secret dirs entirely (no bind emitted) even when they exist on disk", () => {
   // Simulate a box where secret dirs DO exist — the function must never bind
   // them regardless, since they are not in STATE_DIRS/CREDENTIAL_FILES.
   const exists = () => true;
-  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+  const argv = buildBwrapArgs(
+    ["echo", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    "/usr/bin/echo",
+  );
 
   for (
     const secret of [
@@ -1507,7 +1525,13 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
     "/home/agent/.cache",
   ]);
   const exists = (p: string) => existing.has(p);
-  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+  const argv = buildBwrapArgs(
+    ["echo", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    "/usr/bin/echo",
+  );
 
   // .claude is bound read-write (state dir).
   const claudeIdx = argv.indexOf("/home/agent/.claude");
@@ -1534,6 +1558,7 @@ Deno.test("buildBwrapArgs: never exposes the host ~/.pi tree", () => {
     "/work",
     "/home/agent",
     exists,
+    "/usr/bin/echo",
   );
   assertEquals(argv.includes("/home/agent/.pi"), false);
 });
@@ -1798,7 +1823,13 @@ Deno.test("buildBwrapArgs: skips binding a credential file or state dir that doe
   // directory" — confirmed on roccinante for ~/.codex, which is absent
   // there). Every entry must be conditional on pathExists.
   const exists = () => false;
-  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+  const argv = buildBwrapArgs(
+    ["echo", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    "/usr/bin/echo",
+  );
 
   assertEquals(argv.includes("/home/agent/.claude"), false);
   assertEquals(argv.includes("/home/agent/.claude/.credentials.json"), false);
@@ -1808,7 +1839,13 @@ Deno.test("buildBwrapArgs: skips binding a credential file or state dir that doe
 
 Deno.test("buildBwrapArgs: home is bound via tmpfs+remount-ro bracket (order load-bearing)", () => {
   const exists = () => true;
-  const argv = buildBwrapArgs(["echo", "hi"], "/work", "/home/agent", exists);
+  const argv = buildBwrapArgs(
+    ["echo", "hi"],
+    "/work",
+    "/home/agent",
+    exists,
+    "/usr/bin/echo",
+  );
 
   const tmpfsIdx = argv.indexOf("--tmpfs");
   // The home tmpfs must appear (there are two --tmpfs uses: /tmp and home).
@@ -1890,12 +1927,13 @@ Deno.test("wrapWithSandbox: sandbox binary missing + sandboxRequired throws inst
 Deno.test("buildBwrapArgs: produces a bwrap-shaped argv usable as the tail of a bwrap invocation (structural smoke test)", () => {
   // Full structural check mirroring the exact policy proved on roccinante:
   // namespaces + ro-bind base system + symlinks + proc/dev/tmp + cwd bind +
-  // home tmpfs-bracket + trailing real cmd.
+  // home tmpfs-bracket + isolated provider executable + trailing arguments.
   const argv = buildBwrapArgs(
     ["sh", "-c", "echo hi"],
     "/repo",
     "/home/agent",
     () => false,
+    "/usr/bin/sh",
   );
 
   assertEquals(argv[0], "--unshare-user");
@@ -1905,7 +1943,11 @@ Deno.test("buildBwrapArgs: produces a bwrap-shaped argv usable as the tail of a 
   assertEquals(argv.includes("--proc"), true);
   assertEquals(argv.includes("--dev"), true);
   assertEquals(argv.includes("--tmpfs"), true);
-  assertEquals(argv.slice(-3), ["sh", "-c", "echo hi"]);
+  assertEquals(argv.slice(-3), [
+    "/run/cli-agent/provider",
+    "-c",
+    "echo hi",
+  ]);
 });
 
 // --- Failure classification (classifyFailure / SIGNATURE_TABLE) --------------

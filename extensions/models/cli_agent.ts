@@ -531,17 +531,27 @@ type BwrapArg = string;
  *    "Permission denied", writing returns "Permission denied", the real
  *    file's sha256 is unchanged after the attempt, and a sibling test file
  *    in the same directory still round-trips.
+ * 7. **Provider executable**: when the resolved CLI executable is outside the
+ *    base system, workspace, and explicit state directories, bind only that
+ *    file read-only at `/run/cli-agent/provider` and execute it there. This
+ *    keeps standalone CLIs installed under the otherwise-hidden home usable
+ *    without exposing their surrounding installation or unrelated home data.
  *
  * `home` is required (not defaulted to `Deno.env.get("HOME")` internally)
  * so this stays pure and independently testable; callers pass the resolved
  * value the same way `wrapWithSandbox` already resolves `HOME` for Seatbelt.
+ * `executablePath` is the resolved host file to mount at the stable sandbox
+ * path, or null when the command is already reachable through an existing
+ * bind.
  */
 export function buildBwrapArgs(
   cmd: string[],
   cwd: string,
   home: string,
   pathExists: (p: string) => boolean,
+  executablePath: string | null,
 ): string[] {
+  const sandboxExecutable = "/run/cli-agent/provider";
   const args: BwrapArg[] = [
     "--unshare-user",
     "--unshare-pid",
@@ -580,6 +590,16 @@ export function buildBwrapArgs(
     home,
   ];
 
+  if (executablePath) {
+    args.push(
+      "--dir",
+      "/run/cli-agent",
+      "--ro-bind",
+      executablePath,
+      sandboxExecutable,
+    );
+  }
+
   for (const rel of STATE_DIRS) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
@@ -597,7 +617,28 @@ export function buildBwrapArgs(
   args.push("--remount-ro", home);
   args.push("--setenv", "HOME", home);
 
-  return [...args, ...cmd];
+  return [
+    ...args,
+    ...(executablePath ? [sandboxExecutable, ...cmd.slice(1)] : cmd),
+  ];
+}
+
+function resolveExecutablePath(command: string, cwd: string): string | null {
+  const candidates = command.includes("/")
+    ? [command.startsWith("/") ? command : `${cwd}/${command}`]
+    : (Deno.env.get("PATH") ?? "").split(":").filter(Boolean).map((directory) =>
+      `${directory}/${command}`
+    );
+
+  for (const candidate of candidates) {
+    try {
+      const resolved = Deno.realPathSync(candidate);
+      if (Deno.statSync(resolved).isFile) return resolved;
+    } catch {
+      // Continue searching PATH entries.
+    }
+  }
+  return null;
 }
 
 /**
@@ -621,7 +662,9 @@ export function buildBwrapArgs(
  *     `/usr/bin/sandbox-exec` present → prefixes `cmd` with
  *     `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
  *   - effective backend `"bwrap"`, running on Linux, with `bwrap` present →
- *     prefixes `cmd` with the {@link buildBwrapArgs} argv.
+ *     resolves the provider executable, mounts that exact file when it would
+ *     otherwise be hidden, and prefixes `cmd` with the
+ *     {@link buildBwrapArgs} argv.
  *   - effective backend `"none"` (`"auto"` on an unsupported OS), or the
  *     resolved backend doesn't match the running OS, or its binary is
  *     missing → **warn-and-degrade**: log a loud warning and return `cmd`
@@ -715,9 +758,30 @@ export function wrapWithSandbox(
         return false;
       }
     };
+    const executablePath = resolveExecutablePath(cmd[0], resolvedCwd);
+    if (!executablePath) {
+      return degradeOrThrow(
+        `provider CLI executable ${JSON.stringify(cmd[0])} not found`,
+        sandbox,
+        logger,
+        cmd,
+      );
+    }
+    const executableAlreadyVisible = executablePath === resolvedCwd ||
+      executablePath.startsWith(`${resolvedCwd}/`) ||
+      executablePath.startsWith("/usr/") ||
+      STATE_DIRS.some((directory) =>
+        executablePath.startsWith(`${home}/${directory}/`)
+      );
     return [
       bwrapPath,
-      ...buildBwrapArgs(cmd, resolvedCwd, home, exists),
+      ...buildBwrapArgs(
+        cmd,
+        resolvedCwd,
+        home,
+        exists,
+        executableAlreadyVisible ? null : executablePath,
+      ),
     ];
   }
 
@@ -2726,7 +2790,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.24.2",
+  version: "2026.07.24.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2769,6 +2833,12 @@ export const model = {
       toVersion: "2026.07.24.2",
       description:
         "Add 'pi' provider (pi coding agent CLI: --print --mode json --no-session --no-extensions --model <provider/id>, piPath global arg, JSONL text/error/usage extractors). Sandboxed pi uses disposable PI_CODING_AGENT_DIR state and environment authentication; the host ~/.pi credential/config tree remains inaccessible. File-backed auth and custom config require explicit sandboxMode:off. Additive schema change (ProviderEnum member + piPath with default), no attribute rewrite.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.24.3",
+      description:
+        "Make standalone provider CLI executables installed outside Linux bwrap's existing mounts available through an exact read-only file bind. Execution-only fix; no schema change or attribute rewrite.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
