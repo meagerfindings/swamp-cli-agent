@@ -2840,7 +2840,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.25.2",
+  version: "2026.07.25.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2895,6 +2895,12 @@ export const model = {
       toVersion: "2026.07.25.1",
       description:
         "Add sandboxCredentialAccess ('provider'|'isolated', global + per-invocation, default 'provider'). Linux bwrap now permits only the selected provider's known file-backed credentials by default so ordinary CLI login works; isolated preserves full credential masking for environment-authenticated hardened runs. Additive schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.25.3",
+      description:
+        "Fix DNS resolution inside Linux bwrap on systemd-resolved hosts. /etc/resolv.conf is a symlink into /run/systemd/resolve which was absent in the sandbox; now conditionally bound read-only. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
