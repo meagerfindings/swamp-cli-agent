@@ -1606,6 +1606,37 @@ Deno.test("buildBwrapArgs: does not bind /run/systemd/resolve when absent (non-s
   );
 });
 
+Deno.test("buildBwrapArgs: cwd bind is placed after --remount-ro home (not shadowed by tmpfs)", () => {
+  // When cwd is under home (e.g. /home/user/tmp/work), a --bind before
+  // --tmpfs home would be shadowed. The bind must come after --remount-ro.
+  const exists = () => false;
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/home/agent/tmp/work",
+    "/home/agent",
+    exists,
+    null,
+    "claude",
+    "provider",
+  );
+
+  const remountIdx = argv.indexOf("--remount-ro");
+  const bindIdx = argv.indexOf("--bind");
+
+  // --remount-ro home must come before --bind cwd
+  assertEquals(remountIdx > -1, true, "expected --remount-ro in argv");
+  assertEquals(bindIdx > -1, true, "expected --bind in argv");
+  assertEquals(
+    remountIdx < bindIdx,
+    true,
+    "--remount-ro must come before --bind (cwd) so tmpfs doesn't shadow the workspace",
+  );
+
+  // The --bind target is the cwd
+  assertEquals(argv[bindIdx + 1], "/home/agent/tmp/work");
+  assertEquals(argv[bindIdx + 2], "/home/agent/tmp/work");
+});
+
 Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing credential files with /dev/null", () => {
   const existing = new Set([
     "/home/agent/.claude",

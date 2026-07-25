@@ -527,8 +527,9 @@ type BwrapArg = string;
  *    resolves and DNS works inside the sandbox.
  * 3. `--proc /proc`, `--dev /dev`, `--tmpfs /tmp` (ephemeral scratch, not the
  *    real /tmp).
- * 4. **Workspace**: `--bind cwd cwd` — the only unconditionally-writable path
- *    outside home-relative state dirs.
+ * 4. **Workspace**: `--bind cwd cwd` — placed AFTER `--remount-ro home` so it
+ *    is not shadowed when cwd is under home (e.g. /home/user/tmp/work). This
+ *    is the only unconditionally-writable path outside home-relative state dirs.
  * 5. **Home**: `--tmpfs home` FIRST (so `home` becomes a real bwrap mount
  *    point, not merely a synthesized intermediate directory), then the
  *    STATE_DIRS writable sub-binds and CREDENTIAL_FILES masks on top, then
@@ -616,9 +617,6 @@ export function buildBwrapArgs(
     "/dev",
     "--tmpfs",
     "/tmp",
-    "--bind",
-    cwd,
-    cwd,
     "--tmpfs",
     home,
   ];
@@ -655,6 +653,11 @@ export function buildBwrapArgs(
   }
 
   args.push("--remount-ro", home);
+  // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
+  // under home (e.g. /home/user/tmp/...), binding it before --tmpfs home
+  // would shadow it with the tmpfs. Binding after --remount-ro home creates
+  // a writable mount point on top of the read-only home tree.
+  args.push("--bind", cwd, cwd);
   args.push("--setenv", "HOME", home);
 
   return [
@@ -2840,7 +2843,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.25.3",
+  version: "2026.07.25.4",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2898,7 +2901,7 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: "2026.07.25.3",
+      toVersion: "2026.07.25.4",
       description:
         "Fix DNS resolution inside Linux bwrap on systemd-resolved hosts. /etc/resolv.conf is a symlink into /run/systemd/resolve which was absent in the sandbox; now conditionally bound read-only. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
