@@ -652,6 +652,13 @@ export function buildBwrapArgs(
     }
   }
 
+  // Create the cwd directory path on the tmpfs while it's still writable,
+  // so bwrap can bind-mount onto it after --remount-ro home. Without this,
+  // bwrap fails with "Can't mkdir parents: Read-only file system" when cwd
+  // is under home.
+  if (cwd.startsWith(home + "/")) {
+    args.push("--dir", cwd);
+  }
   args.push("--remount-ro", home);
   // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
   // under home (e.g. /home/user/tmp/...), binding it before --tmpfs home
@@ -2843,7 +2850,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.25.4",
+  version: "2026.07.25.5",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2901,7 +2908,7 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: "2026.07.25.4",
+      toVersion: "2026.07.25.5",
       description:
         "Fix DNS resolution inside Linux bwrap on systemd-resolved hosts. /etc/resolv.conf is a symlink into /run/systemd/resolve which was absent in the sandbox; now conditionally bound read-only. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
