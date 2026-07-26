@@ -18,6 +18,7 @@ import {
   extractUsage,
   filterProviderChildEnv,
   GlobalArgsSchema,
+  InvokeArgsSchema,
   InvocationSchema,
   isProvider,
   listProvidersFromRegistry,
@@ -26,6 +27,7 @@ import {
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
   resolveEffectiveBackend,
+  resolveInvocationTimeouts,
   resolveModel,
   runCli,
   SANDBOX_PROFILE_FILENAME,
@@ -34,6 +36,40 @@ import {
   SIGNATURE_TABLE,
   wrapWithSandbox,
 } from "./cli_agent.ts";
+
+Deno.test("InvokeArgsSchema: validates idle and wall timeout overrides independently", () => {
+  const parsed = InvokeArgsSchema.parse({
+    prompt: "make one bounded edit",
+    idleTimeoutMs: 600_000,
+    wallTimeoutMs: 900_000,
+  });
+
+  assertEquals(parsed.idleTimeoutMs, 600_000);
+  assertEquals(parsed.wallTimeoutMs, 900_000);
+  assertEquals(
+    InvokeArgsSchema.safeParse({ prompt: "x", idleTimeoutMs: 999 }).success,
+    false,
+  );
+  assertEquals(
+    InvokeArgsSchema.safeParse({ prompt: "x", wallTimeoutMs: 3_600_001 })
+      .success,
+    false,
+  );
+});
+
+Deno.test("resolveInvocationTimeouts: each invocation override falls back independently", () => {
+  const globals = { idleTimeoutMs: 600_000, wallTimeoutMs: 3_600_000 };
+
+  assertEquals(resolveInvocationTimeouts({}, globals), globals);
+  assertEquals(resolveInvocationTimeouts({ idleTimeoutMs: 300_000 }, globals), {
+    idleTimeoutMs: 300_000,
+    wallTimeoutMs: 3_600_000,
+  });
+  assertEquals(resolveInvocationTimeouts({ wallTimeoutMs: 900_000 }, globals), {
+    idleTimeoutMs: 600_000,
+    wallTimeoutMs: 900_000,
+  });
+});
 
 // --- Fixtures ---------------------------------------------------------------
 

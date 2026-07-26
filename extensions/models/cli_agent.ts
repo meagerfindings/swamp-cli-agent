@@ -100,6 +100,8 @@ const SandboxNetworkEnum = z.enum(["allow", "deny"]);
  */
 const SandboxCredentialAccessEnum = z.enum(["provider", "isolated"]);
 
+const TimeoutMsSchema = z.number().int().min(1_000).max(3_600_000);
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -119,8 +121,8 @@ export const GlobalArgsSchema = z.object({
   codexPath: z.string().default("codex"),
   grokPath: z.string().default("grok"),
   piPath: z.string().default("pi"),
-  idleTimeoutMs: z.number().default(600_000),
-  wallTimeoutMs: z.number().default(3_600_000),
+  idleTimeoutMs: TimeoutMsSchema.default(600_000),
+  wallTimeoutMs: TimeoutMsSchema.default(3_600_000),
   maxRetries: z.number().default(2),
   // Sandbox: OS-level confinement of the spawned CLI subprocess, DEFAULT ON via
   // "auto" (picks Seatbelt on Darwin / bwrap on Linux; warns-and-degrades, or
@@ -2856,7 +2858,7 @@ type MethodContext = {
  * - `listModels` — enumerate the models available to a provider's CLI
  */
 /** Shared invoke / invokeAndParse argument schema (single source for both). */
-const InvokeArgsSchema = z.object({
+export const InvokeArgsSchema = z.object({
   prompt: z.string().describe("The prompt or slash command to execute"),
   provider: ProviderEnum.optional().describe(
     "Override the default provider",
@@ -2871,8 +2873,11 @@ const InvokeArgsSchema = z.object({
   tags: z.record(z.string(), z.string()).optional().describe(
     "Arbitrary key-value tags for grouping/filtering invocations",
   ),
-  wallTimeoutMs: z.number().optional().describe(
+  wallTimeoutMs: TimeoutMsSchema.optional().describe(
     "Override wall timeout in milliseconds",
+  ),
+  idleTimeoutMs: TimeoutMsSchema.optional().describe(
+    "Override idle timeout in milliseconds independently from the wall timeout",
   ),
   toolProfile: ToolProfileEnum.optional().describe(
     "Scoped permission profile: 'readonly' (read/search only) or 'actor' (also edit/write/run shell). Defaults to defaultToolProfile.",
@@ -2892,6 +2897,16 @@ const InvokeArgsSchema = z.object({
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
+export function resolveInvocationTimeouts(
+  args: Pick<InvokeArgs, "idleTimeoutMs" | "wallTimeoutMs">,
+  globalArgs: Pick<GlobalArgs, "idleTimeoutMs" | "wallTimeoutMs">,
+): { idleTimeoutMs: number; wallTimeoutMs: number } {
+  return {
+    idleTimeoutMs: args.idleTimeoutMs ?? globalArgs.idleTimeoutMs,
+    wallTimeoutMs: args.wallTimeoutMs ?? globalArgs.wallTimeoutMs,
+  };
+}
+
 const ListModelsArgsSchema = z.object({
   provider: ProviderEnum.optional().describe(
     "Provider to enumerate (defaults to the configured defaultProvider)",
@@ -2904,7 +2919,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.26.4",
+  version: "2026.07.26.5",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2991,6 +3006,12 @@ export const model = {
         "Expose ~/.gemini only to Gemini CLI in provider credential mode so it can initialize state and use its login while remaining absent for other providers and isolated mode. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.26.5",
+      description:
+        "Add an independently validated per-invocation idleTimeoutMs override so slow local agents can use a longer silence allowance without weakening the finite wall timeout. Additive schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     invocation: {
@@ -3037,9 +3058,10 @@ export const model = {
           context.globalArgs.defaultModel,
         );
         const cwd = args.cwd || Deno.cwd();
-        const wallTimeoutMs = args.wallTimeoutMs ||
-          context.globalArgs.wallTimeoutMs;
-        const idleTimeoutMs = context.globalArgs.idleTimeoutMs;
+        const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
+          args,
+          context.globalArgs,
+        );
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;
@@ -3169,9 +3191,10 @@ export const model = {
           context.globalArgs.defaultModel,
         );
         const cwd = args.cwd || Deno.cwd();
-        const wallTimeoutMs = args.wallTimeoutMs ||
-          context.globalArgs.wallTimeoutMs;
-        const idleTimeoutMs = context.globalArgs.idleTimeoutMs;
+        const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
+          args,
+          context.globalArgs,
+        );
         const maxRetries = context.globalArgs.maxRetries;
         const commandsDir = context.globalArgs.commandsDir;
         const commandSubdirs = context.globalArgs.commandSubdirs;

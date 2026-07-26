@@ -107,6 +107,7 @@ Arguments:
 | `cwd`           | string   | no       | Working directory for the CLI                 |
 | `tags`          | object   | no       | Key-value tags for grouping/filtering         |
 | `wallTimeoutMs` | number   | no       | Override wall timeout in milliseconds         |
+| `idleTimeoutMs` | number   | no       | Override idle timeout independently           |
 | `sandboxCredentialAccess` | enum | no | `provider` for selected-provider CLI login (default), or `isolated` to mask all known credential files |
 
 ### `invokeAndParse`
