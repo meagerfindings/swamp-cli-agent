@@ -1673,6 +1673,26 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
   assertEquals(argv.includes("/home/agent/.codex"), false);
 });
 
+Deno.test("buildBwrapArgs: exposes a home-installed Node runtime for provider scripts", () => {
+  const argv = buildBwrapArgs(
+    ["gemini", "--output-format", "json", "prompt"],
+    "/work",
+    "/home/agent",
+    () => false,
+    "/home/agent/.local/share/gemini/gemini.js",
+    "gemini",
+    "provider",
+    "/home/agent/.local/share/fnm/node",
+  );
+
+  const nodeIndex = argv.indexOf("/home/agent/.local/share/fnm/node");
+  assertEquals(argv[nodeIndex - 1], "--ro-bind");
+  assertEquals(argv[nodeIndex + 1], "/run/cli-agent/node");
+  const pathIndex = argv.indexOf("PATH");
+  assertEquals(argv[pathIndex - 1], "--setenv");
+  assertEquals(argv[pathIndex + 1].startsWith("/run/cli-agent:"), true);
+});
+
 Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's credential files", () => {
   const existing = new Set([
     "/home/agent/.claude",

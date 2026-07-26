@@ -562,6 +562,9 @@ type BwrapArg = string;
  *    file read-only at `/run/cli-agent/provider` and execute it there. This
  *    keeps standalone CLIs installed under the otherwise-hidden home usable
  *    without exposing their surrounding installation or unrelated home data.
+ *    Node-based CLIs also receive the resolved `node` executable at
+ *    `/run/cli-agent/node`, because a provider script using
+ *    `#!/usr/bin/env node` cannot reach a Node installation hidden under home.
  *
  * `home` is required (not defaulted to `Deno.env.get("HOME")` internally)
  * so this stays pure and independently testable; callers pass the resolved
@@ -578,8 +581,10 @@ export function buildBwrapArgs(
   executablePath: string | null,
   provider: Provider,
   credentialAccess: "provider" | "isolated",
+  nodePath: string | null = null,
 ): string[] {
   const sandboxExecutable = "/run/cli-agent/provider";
+  const sandboxNode = "/run/cli-agent/node";
   const args: BwrapArg[] = [
     "--unshare-user",
     "--unshare-pid",
@@ -631,6 +636,18 @@ export function buildBwrapArgs(
       "--ro-bind",
       executablePath,
       sandboxExecutable,
+    );
+  }
+  if (nodePath) {
+    args.push(
+      "--dir",
+      "/run/cli-agent",
+      "--ro-bind",
+      nodePath,
+      sandboxNode,
+      "--setenv",
+      "PATH",
+      `/run/cli-agent:${Deno.env.get("PATH") ?? "/usr/bin:/bin"}`,
     );
   }
 
@@ -826,6 +843,12 @@ export function wrapWithSandbox(
       STATE_DIRS.some((directory) =>
         executablePath.startsWith(`${home}/${directory}/`)
       );
+    const resolvedNodePath = sandbox.provider === "gemini"
+      ? resolveExecutablePath("node", resolvedCwd)
+      : null;
+    const hiddenNodePath = resolvedNodePath?.startsWith("/usr/")
+      ? null
+      : resolvedNodePath;
     return [
       bwrapPath,
       ...buildBwrapArgs(
@@ -836,6 +859,7 @@ export function wrapWithSandbox(
         executableAlreadyVisible ? null : executablePath,
         sandbox.provider,
         sandbox.credentialAccess,
+        hiddenNodePath,
       ),
     ];
   }
@@ -2920,6 +2944,12 @@ export const model = {
       toVersion: "2026.07.26.1",
       description:
         "Bind an existing ~/.local/state directory writable in Linux bwrap so OpenCode's Bun runtime can initialize before inference. No schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.26.2",
+      description:
+        "Bind a home-installed Node runtime into Linux bwrap for Gemini CLI scripts that use /usr/bin/env node. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
