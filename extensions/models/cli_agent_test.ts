@@ -1642,6 +1642,7 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
     "/home/agent/.claude",
     "/home/agent/.claude/.credentials.json",
     "/home/agent/.cache",
+    "/home/agent/.local/state",
   ]);
   const exists = (p: string) => existing.has(p);
   const argv = buildBwrapArgs(
@@ -1668,6 +1669,7 @@ Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing
 
   // .cache is bound (state dir), .codex is absent so no bind for it at all.
   assertEquals(argv.includes("/home/agent/.cache"), true);
+  assertEquals(argv.includes("/home/agent/.local/state"), true);
   assertEquals(argv.includes("/home/agent/.codex"), false);
 });
 

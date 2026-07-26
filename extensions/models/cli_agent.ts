@@ -477,7 +477,9 @@ const CREDENTIAL_FILES: readonly string[] = [
  * (sessions, history, caches) or a shared toolchain cache. Mirrors the
  * macOS profile's `file-write*` re-allow subpaths
  * (`~/.cache`, `~/.deno`, `~/.claude`, `~/.codex`, `~/.config/opencode`,
- * `~/.local/share/opencode`).
+ * `~/.local/share/opencode`, `~/.local/state`). OpenCode's Bun runtime creates
+ * `~/.local/state` before inference even when its other state directories
+ * already exist.
  *
  * Deliberately excludes `~/.config/amp`, `~/.gnupg`, `~/.ssh`, `~/.aws`,
  * etc. — anything not listed here is simply absent inside the sandbox
@@ -490,6 +492,7 @@ const STATE_DIRS: string[] = [
   ".codex",
   ".config/opencode",
   ".local/share/opencode",
+  ".local/state",
 ];
 
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
@@ -2850,7 +2853,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.25.5",
+  version: "2026.07.26.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2911,6 +2914,12 @@ export const model = {
       toVersion: "2026.07.25.5",
       description:
         "Fix DNS resolution inside Linux bwrap on systemd-resolved hosts. /etc/resolv.conf is a symlink into /run/systemd/resolve which was absent in the sandbox; now conditionally bound read-only. No schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.26.1",
+      description:
+        "Bind an existing ~/.local/state directory writable in Linux bwrap so OpenCode's Bun runtime can initialize before inference. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
