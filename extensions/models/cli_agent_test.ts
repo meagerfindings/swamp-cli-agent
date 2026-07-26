@@ -1683,14 +1683,24 @@ Deno.test("buildBwrapArgs: exposes a home-installed Node runtime for provider sc
     "gemini",
     "provider",
     "/home/agent/.local/share/fnm/node",
+    "/home/agent/.local/share/gemini",
   );
 
+  const packageIndex = argv.indexOf("/home/agent/.local/share/gemini");
+  assertEquals(argv[packageIndex - 1], "--ro-bind");
+  assertEquals(argv[packageIndex + 1], "/run/cli-agent/provider-package");
   const nodeIndex = argv.indexOf("/home/agent/.local/share/fnm/node");
   assertEquals(argv[nodeIndex - 1], "--ro-bind");
   assertEquals(argv[nodeIndex + 1], "/run/cli-agent/node");
   const pathIndex = argv.indexOf("PATH");
   assertEquals(argv[pathIndex - 1], "--setenv");
   assertEquals(argv[pathIndex + 1].startsWith("/run/cli-agent:"), true);
+  assertEquals(argv.slice(-4), [
+    "/run/cli-agent/provider-package/gemini.js",
+    "--output-format",
+    "json",
+    "prompt",
+  ]);
 });
 
 Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's credential files", () => {

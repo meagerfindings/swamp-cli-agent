@@ -562,9 +562,10 @@ type BwrapArg = string;
  *    file read-only at `/run/cli-agent/provider` and execute it there. This
  *    keeps standalone CLIs installed under the otherwise-hidden home usable
  *    without exposing their surrounding installation or unrelated home data.
- *    Node-based CLIs also receive the resolved `node` executable at
- *    `/run/cli-agent/node`, because a provider script using
- *    `#!/usr/bin/env node` cannot reach a Node installation hidden under home.
+ *    Node-based CLIs also receive the resolved `node` executable and their
+ *    package directory at `/run/cli-agent`, because a provider script using
+ *    `#!/usr/bin/env node` cannot reach a Node installation or sibling ESM
+ *    chunks hidden under home.
  *
  * `home` is required (not defaulted to `Deno.env.get("HOME")` internally)
  * so this stays pure and independently testable; callers pass the resolved
@@ -582,8 +583,12 @@ export function buildBwrapArgs(
   provider: Provider,
   credentialAccess: "provider" | "isolated",
   nodePath: string | null = null,
+  executableDirectoryPath: string | null = null,
 ): string[] {
-  const sandboxExecutable = "/run/cli-agent/provider";
+  const executableName = executablePath?.split("/").at(-1) ?? "provider";
+  const sandboxExecutable = executableDirectoryPath
+    ? `/run/cli-agent/provider-package/${executableName}`
+    : "/run/cli-agent/provider";
   const sandboxNode = "/run/cli-agent/node";
   const args: BwrapArg[] = [
     "--unshare-user",
@@ -629,7 +634,15 @@ export function buildBwrapArgs(
     home,
   ];
 
-  if (executablePath) {
+  if (executablePath && executableDirectoryPath) {
+    args.push(
+      "--dir",
+      "/run/cli-agent",
+      "--ro-bind",
+      executableDirectoryPath,
+      "/run/cli-agent/provider-package",
+    );
+  } else if (executablePath) {
     args.push(
       "--dir",
       "/run/cli-agent",
@@ -849,6 +862,10 @@ export function wrapWithSandbox(
     const hiddenNodePath = resolvedNodePath?.startsWith("/usr/")
       ? null
       : resolvedNodePath;
+    const executableDirectoryPath = sandbox.provider === "gemini" &&
+        !executableAlreadyVisible
+      ? executablePath.slice(0, executablePath.lastIndexOf("/"))
+      : null;
     return [
       bwrapPath,
       ...buildBwrapArgs(
@@ -860,6 +877,7 @@ export function wrapWithSandbox(
         sandbox.provider,
         sandbox.credentialAccess,
         hiddenNodePath,
+        executableDirectoryPath,
       ),
     ];
   }
@@ -2877,7 +2895,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.26.2",
+  version: "2026.07.26.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2950,6 +2968,12 @@ export const model = {
       toVersion: "2026.07.26.2",
       description:
         "Bind a home-installed Node runtime into Linux bwrap for Gemini CLI scripts that use /usr/bin/env node. No schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.26.3",
+      description:
+        "Bind Gemini CLI's bundle directory read-only in Linux bwrap so its entry script can import sibling ESM chunks. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
