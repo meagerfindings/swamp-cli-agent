@@ -1703,6 +1703,35 @@ Deno.test("buildBwrapArgs: exposes a home-installed Node runtime for provider sc
   ]);
 });
 
+Deno.test("buildBwrapArgs: exposes Gemini state only to Gemini in provider credential mode", () => {
+  const build = (
+    provider: "gemini" | "claude",
+    access: "provider" | "isolated",
+  ) =>
+    buildBwrapArgs(
+      [provider, "prompt"],
+      "/work",
+      "/home/agent",
+      (path) => path === "/home/agent/.gemini",
+      null,
+      provider,
+      access,
+    );
+
+  assertEquals(
+    build("gemini", "provider").includes("/home/agent/.gemini"),
+    true,
+  );
+  assertEquals(
+    build("gemini", "isolated").includes("/home/agent/.gemini"),
+    false,
+  );
+  assertEquals(
+    build("claude", "provider").includes("/home/agent/.gemini"),
+    false,
+  );
+});
+
 Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's credential files", () => {
   const existing = new Set([
     "/home/agent/.claude",

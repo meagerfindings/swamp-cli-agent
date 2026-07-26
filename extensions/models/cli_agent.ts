@@ -495,6 +495,10 @@ const STATE_DIRS: string[] = [
   ".local/state",
 ];
 
+const PROVIDER_STATE_DIRS: Partial<Record<Provider, readonly string[]>> = {
+  gemini: [".gemini"],
+};
+
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
 type BwrapArg = string;
 
@@ -546,9 +550,11 @@ type BwrapArg = string;
  *    `--remount-ro` fails with "Unable to find destination in mount table".
  *    Everything NOT explicitly bound under home (`.ssh`, `.aws`,
  *    `.config/gcloud`, `.config/gh`, `.gnupg`, `.config/op`, `.docker`,
- *    `.gemini`, `.npmrc`, ...) is therefore simply absent — allowlist by
- *    omission, avoiding the mask-precedence trap a broad `--bind home home`
- *    would require carefully layering masks on top of (see task brief).
+ *    `.npmrc`, ...) is therefore simply absent — allowlist by omission,
+ *    avoiding the mask-precedence trap a broad `--bind home home` would
+ *    require carefully layering masks on top of (see task brief). Provider-
+ *    specific state such as `.gemini` is added only for that provider in
+ *    provider credential mode.
  * 6. **Credential files**: for each existing path in CREDENTIAL_FILES,
  *    the selected provider's files are bound writable when credentialAccess
  *    is `"provider"`, allowing the genuine CLI to refresh its own OAuth state.
@@ -664,7 +670,10 @@ export function buildBwrapArgs(
     );
   }
 
-  for (const rel of STATE_DIRS) {
+  const providerStateDirs = credentialAccess === "provider"
+    ? PROVIDER_STATE_DIRS[provider] ?? []
+    : [];
+  for (const rel of [...STATE_DIRS, ...providerStateDirs]) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
@@ -2895,7 +2904,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.26.3",
+  version: "2026.07.26.4",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -2974,6 +2983,12 @@ export const model = {
       toVersion: "2026.07.26.3",
       description:
         "Bind Gemini CLI's bundle directory read-only in Linux bwrap so its entry script can import sibling ESM chunks. No schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.26.4",
+      description:
+        "Expose ~/.gemini only to Gemini CLI in provider credential mode so it can initialize state and use its login while remaining absent for other providers and isolated mode. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
