@@ -102,6 +102,7 @@ Arguments:
 | Name            | Type     | Required | Description                                  |
 | --------------- | -------- | -------- | -------------------------------------------- |
 | `prompt`        | string   | yes      | The prompt or slash command to execute        |
+| `invocationId`  | string   | no       | Stable caller-owned identity for at-most-once launch/replay |
 | `provider`      | enum     | no       | Override the default provider                 |
 | `model`         | string   | no       | Override the default model                    |
 | `cwd`           | string   | no       | Working directory for the CLI                 |
@@ -122,6 +123,21 @@ swamp model method run my-agent invokeAndParse \
 ```
 
 Takes the same arguments as `invoke`.
+
+When `invocationId` is supplied, a durable claim is written before launch. Reuse
+with different execution inputs fails; consistent terminal records replay without
+launching again, while partial or inconsistent records fail closed. Omitting it
+preserves generated-UUID behavior.
+
+A successful replay returns no `dataHandles`: method-result handles represent
+only artifacts persisted during that execution, and replay persists nothing.
+Consumers retrieve the existing deterministic `invocation-<invocationId>` and
+`transcript-<invocationId>` resources instead.
+
+CLI-agent launch claims and terminal evidence are retained for 30 days, so this
+extension's at-most-once guarantee has that scope. Longer-lived at-most-once
+factory prevention is owned by the factory execution claim; retention here is
+intentionally not infinite.
 
 ### `listProviders`
 
@@ -204,7 +220,7 @@ Each invocation is persisted with these fields:
 | `model`           | string  | Model name passed to the CLI             |
 | `prompt`          | string  | First 500 chars of the original prompt   |
 | `promptTruncated` | boolean | Whether `prompt` was capped at 500 chars |
-| `promptHash`      | string  | Base-36 hash for deduplication           |
+| `promptHash`      | string  | SHA-256 of the fully resolved prompt      |
 | `exitCode`        | number  | Process exit code                        |
 | `success`         | boolean | Whether the invocation succeeded         |
 | `durationMs`      | number  | Wall-clock duration in milliseconds      |

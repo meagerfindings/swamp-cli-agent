@@ -6,25 +6,31 @@
  * They are the ground truth for the per-provider parsing in `cli_agent.ts`.
  */
 
-import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import {
   arbitrateSignalOutcome,
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
   buildPiCommand,
+  canonicalCwd,
   classifyFailure,
+  createOnceOrVerify,
   extractError,
   extractTextFromOutput,
   extractUsage,
   filterProviderChildEnv,
   GlobalArgsSchema,
+  hashPrompt,
   InvocationIdSchema,
+  InvocationLaunchClaimSchema,
   InvocationSchema,
   InvokeArgsSchema,
   isProvider,
+  launchCallerInvocation,
   listProvidersFromRegistry,
   ModelIdSchema,
+  normalizeTags,
   parseGrokModelsList,
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
@@ -99,6 +105,367 @@ Deno.test("resolveInvocationId: preserves caller identity and generates a UUID w
   const generated = resolveInvocationId();
   assertEquals(InvocationIdSchema.safeParse(generated).success, true);
   assertEquals(generated.length, 36);
+});
+
+type Stored = Map<string, Record<string, unknown>>;
+
+function resourceContext(
+  stored: Stored = new Map(),
+  events: string[] = [],
+  afterWrite?: (name: string, data: Record<string, unknown>) => void,
+) {
+  return {
+    stored,
+    context: {
+      readResource: (name: string) => {
+        events.push(`read:${name}`);
+        return Promise.resolve(stored.get(name) ?? null);
+      },
+      writeResource: (
+        spec: string,
+        name: string,
+        data: Record<string, unknown>,
+      ) => {
+        events.push(`write:${spec}:${name}`);
+        stored.set(name, structuredClone(data));
+        afterWrite?.(name, data);
+        return Promise.resolve({ name });
+      },
+    },
+  };
+}
+
+async function claim(
+  operation: "invoke" | "invokeAndParse" = "invoke",
+  overrides: Record<string, unknown> = {},
+) {
+  return InvocationLaunchClaimSchema.parse({
+    operation,
+    invocationId: "owned-1",
+    provider: "claude",
+    model: "sonnet",
+    cwd: "/tmp/repo",
+    promptHash: await hashPrompt("prompt"),
+    tags: { a: "1", z: "2" },
+    definition: {
+      id: "def-1",
+      name: "agent",
+      version: 1,
+      tags: { environment: "test" },
+    },
+    methodName: operation,
+    cliPath: "claude",
+    idleTimeoutMs: 600_000,
+    wallTimeoutMs: 3_600_000,
+    maxRetries: 2,
+    toolProfile: "actor",
+    sandbox: {
+      mode: "auto",
+      provider: "claude",
+      credentialAccess: "provider",
+      network: "allow",
+      profilePath: "/resolved/sandbox.sb",
+      required: false,
+    },
+    ...overrides,
+  });
+}
+
+function terminal(
+  launchClaim: Awaited<ReturnType<typeof claim>>,
+  success = true,
+) {
+  return {
+    invocationId: launchClaim.invocationId,
+    provider: launchClaim.provider,
+    model: launchClaim.model,
+    prompt: "prompt",
+    promptTruncated: false,
+    promptHash: launchClaim.promptHash,
+    cwd: launchClaim.cwd,
+    exitCode: success ? 0 : 1,
+    success,
+    durationMs: 1,
+    outputBytes: 2,
+    outputPreview: "ok",
+    retries: 0,
+    timedOut: false,
+    failureReason: success ? undefined : "exit_1",
+    failureClass: success ? undefined : "infrastructure",
+    invokedAt: "2026-07-27T00:00:00.000Z",
+    tags: launchClaim.tags,
+  };
+}
+
+Deno.test("launch claim is durable before provider launch", async () => {
+  const events: string[] = [];
+  const { context } = resourceContext(new Map(), events);
+  await launchCallerInvocation(context, await claim(), () => {
+    events.push("spawn");
+    return Promise.resolve("ok");
+  });
+  assertEquals(
+    events.indexOf("spawn") > events.indexOf(
+      "write:invocationLaunchClaim:launch-claim-owned-1",
+    ),
+    true,
+  );
+  assertEquals(
+    events.indexOf("spawn") > events.lastIndexOf(
+      "read:launch-claim-owned-1",
+    ),
+    true,
+  );
+});
+
+Deno.test("matching successful replay does not spawn", async () => {
+  const c = await claim();
+  const stored: Stored = new Map<string, Record<string, unknown>>([
+    ["launch-claim-owned-1", c],
+    ["invocation-owned-1", terminal(c)],
+    ["transcript-owned-1", {
+      invocationId: "owned-1",
+      prompt: "prompt",
+      output: "ok",
+    }],
+  ]);
+  let spawns = 0;
+  const result = await launchCallerInvocation(
+    resourceContext(stored).context,
+    c,
+    () => {
+      spawns++;
+      return Promise.resolve("unexpected");
+    },
+  );
+  assertEquals(result, { replayed: true });
+  assertEquals(spawns, 0);
+});
+
+Deno.test("matching failed replay does not spawn and preserves failure class", async () => {
+  const c = await claim();
+  const stored: Stored = new Map<string, Record<string, unknown>>([
+    ["launch-claim-owned-1", c],
+    ["invocation-owned-1", terminal(c, false)],
+    ["transcript-owned-1", {
+      invocationId: "owned-1",
+      prompt: "prompt",
+      output: "ok",
+    }],
+  ]);
+  let spawns = 0;
+  const error = await assertRejects(
+    () =>
+      launchCallerInvocation(resourceContext(stored).context, c, () => {
+        spawns++;
+        return Promise.resolve("unexpected");
+      }),
+    Error,
+    "infrastructure",
+  );
+  assertEquals(
+    (error as { failureClass?: string }).failureClass,
+    "infrastructure",
+  );
+  assertEquals(spawns, 0);
+});
+
+Deno.test("partial or malformed terminal evidence fails closed", async () => {
+  const c = await claim();
+  for (const invocation of [undefined, { bad: true }]) {
+    const stored: Stored = new Map<string, Record<string, unknown>>([
+      ["launch-claim-owned-1", c],
+      ["transcript-owned-1", {
+        invocationId: "owned-1",
+        prompt: "prompt",
+        output: "ok",
+      }],
+    ]);
+    if (invocation) stored.set("invocation-owned-1", invocation);
+    await assertRejects(
+      () =>
+        launchCallerInvocation(
+          resourceContext(stored).context,
+          c,
+          () => Promise.resolve("no"),
+        ),
+      Error,
+      "Ambiguous prior launch",
+    );
+  }
+});
+
+Deno.test("claim conflicts fail closed for fields and operation", async () => {
+  const c = await claim();
+  for (
+    const differing of [
+      await claim("invoke", { provider: "amp" }),
+      await claim("invokeAndParse", { methodName: "invokeAndParse" }),
+      await claim("invoke", {
+        definition: {
+          id: "def-1",
+          name: "agent",
+          version: 1,
+          tags: { environment: "production" },
+        },
+      }),
+      await claim("invoke", {
+        sandbox: {
+          mode: "auto",
+          provider: "claude",
+          credentialAccess: "provider",
+          network: "allow",
+          profilePath: "/different/resolved/sandbox.sb",
+          required: false,
+        },
+      }),
+    ]
+  ) {
+    const stored: Stored = new Map([["launch-claim-owned-1", c]]);
+    await assertRejects(
+      () =>
+        launchCallerInvocation(
+          resourceContext(stored).context,
+          differing,
+          () => Promise.resolve("no"),
+        ),
+      Error,
+      "Conflicting durable resource",
+    );
+  }
+});
+
+Deno.test("tags normalize independent of insertion order", () => {
+  assertEquals(normalizeTags({ z: "2", a: "1" }), { a: "1", z: "2" });
+  assertEquals(normalizeTags(), {});
+});
+
+Deno.test("canonicalCwd resolves symlink aliases", async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const target = `${root}/target`;
+    const alias = `${root}/alias`;
+    await Deno.mkdir(target);
+    await Deno.symlink(target, alias);
+    assertEquals(await canonicalCwd(alias), await Deno.realPath(target));
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("SHA-256 prompt hashes are stable and full length", async () => {
+  assertEquals(
+    await hashPrompt("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+  assertEquals((await hashPrompt("abc")).length, 64);
+});
+
+Deno.test("createOnceOrVerify accepts equality and rejects conflicts", async () => {
+  const stored: Stored = new Map([["thing", { a: 1, b: 2 }]]);
+  assertEquals(
+    await createOnceOrVerify(resourceContext(stored).context, "spec", "thing", {
+      b: 2,
+      a: 1,
+    }),
+    { created: false },
+  );
+  await assertRejects(
+    () =>
+      createOnceOrVerify(resourceContext(stored).context, "spec", "thing", {
+        a: 2,
+      }),
+    Error,
+    "Conflicting durable resource",
+  );
+});
+
+Deno.test("createOnceOrVerify ignores undefined object properties after JSON persistence", async () => {
+  const stored: Stored = new Map();
+  const context = {
+    readResource: (name: string) => Promise.resolve(stored.get(name) ?? null),
+    writeResource: (
+      _spec: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      stored.set(name, JSON.parse(JSON.stringify(data)));
+      return Promise.resolve({ name });
+    },
+  };
+  assertEquals(
+    await createOnceOrVerify(context, "spec", "thing", {
+      optional: undefined,
+      nested: { omitted: undefined, kept: null },
+      array: [null],
+    }),
+    { created: true, handle: { name: "thing" } },
+  );
+});
+
+Deno.test("replay rejects transcript output inconsistent with outputPreview", async () => {
+  const c = await claim();
+  const stored: Stored = new Map<string, Record<string, unknown>>([
+    ["launch-claim-owned-1", c],
+    ["invocation-owned-1", terminal(c)],
+    ["transcript-owned-1", {
+      invocationId: "owned-1",
+      prompt: "prompt",
+      output: "different",
+    }],
+  ]);
+  await assertRejects(
+    () =>
+      launchCallerInvocation(
+        resourceContext(stored).context,
+        c,
+        () => Promise.resolve("no"),
+      ),
+    Error,
+    "Conflicting terminal evidence",
+  );
+});
+
+Deno.test("successful invokeAndParse replay requires parsedResponse", async () => {
+  const c = await claim("invokeAndParse");
+  for (const parsedResponse of [undefined, null]) {
+    const invocation: Record<string, unknown> = terminal(c);
+    if (parsedResponse !== undefined) {
+      invocation.parsedResponse = parsedResponse;
+    }
+    const stored: Stored = new Map<string, Record<string, unknown>>([
+      ["launch-claim-owned-1", c],
+      ["invocation-owned-1", invocation],
+      ["transcript-owned-1", {
+        invocationId: "owned-1",
+        prompt: "prompt",
+        output: "ok",
+      }],
+    ]);
+    await assertRejects(
+      () =>
+        launchCallerInvocation(
+          resourceContext(stored).context,
+          c,
+          () => Promise.resolve("no"),
+        ),
+      Error,
+      "Conflicting terminal evidence",
+    );
+  }
+});
+
+Deno.test("createOnceOrVerify rejects a differing read-back", async () => {
+  const stored: Stored = new Map();
+  // Use an explicit context so the post-write mutation affects its backing map.
+  const explicit = resourceContext(stored, [], (name) => {
+    stored.set(name, { changed: true });
+  }).context;
+  await assertRejects(
+    () => createOnceOrVerify(explicit, "spec", "thing", { expected: true }),
+    Error,
+    "read-back mismatch",
+  );
 });
 
 Deno.test("resolveInvocationTimeouts: each invocation override falls back independently", () => {

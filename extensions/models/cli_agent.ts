@@ -228,6 +228,40 @@ const TranscriptSchema = z.object({
   output: z.string(),
 });
 
+/** Durable identity of a caller-owned launch, written before provider spawn. */
+export const InvocationLaunchClaimSchema = z.object({
+  operation: z.enum(["invoke", "invokeAndParse"]),
+  invocationId: InvocationIdSchema,
+  provider: ProviderEnum,
+  model: ModelIdSchema,
+  cwd: z.string().min(1),
+  promptHash: z.string().regex(/^[0-9a-f]{64}$/),
+  tags: z.record(z.string(), z.string()),
+  definition: z.object({
+    id: z.string(),
+    name: z.string(),
+    version: z.number(),
+    tags: z.record(z.string(), z.string()),
+  }).strict(),
+  methodName: z.string().min(1),
+  cliPath: z.string().min(1),
+  idleTimeoutMs: TimeoutMsSchema,
+  wallTimeoutMs: TimeoutMsSchema,
+  maxRetries: z.number(),
+  toolProfile: ToolProfileEnum,
+  sandbox: z.object({
+    mode: SandboxModeEnum,
+    provider: ProviderEnum,
+    credentialAccess: SandboxCredentialAccessEnum,
+    network: SandboxNetworkEnum,
+    profilePath: z.string(),
+    required: z.boolean(),
+  }).strict(),
+}).strict();
+export type InvocationLaunchClaim = z.infer<
+  typeof InvocationLaunchClaimSchema
+>;
+
 /** Schema for the result of enumerating a provider's available models. */
 const ModelListSchema = z.object({
   provider: ProviderEnum,
@@ -260,15 +294,15 @@ const ProviderListSchema = z.object({
 /** Exit codes that indicate a transient failure eligible for retry. */
 const TRANSIENT_EXIT_CODES: Set<number> = new Set([137, 143]);
 
-/** Compute a simple numeric hash of a prompt string, returned as base-36. */
-function hashPrompt(prompt: string): string {
-  let hash = 0;
-  for (let i = 0; i < prompt.length; i++) {
-    const char = prompt.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash |= 0;
-  }
-  return Math.abs(hash).toString(36);
+/** Compute the lowercase SHA-256 digest of the fully resolved prompt. */
+export async function hashPrompt(prompt: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(prompt),
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /** Generate a v4 UUID. */
@@ -350,6 +384,8 @@ type SandboxConfig = {
   provider: Provider;
   /** Whether the selected provider's known credential files are exposed. */
   credentialAccess: "provider" | "isolated";
+  /** Effective network policy used to select the sandbox profile. */
+  network?: "allow" | "deny";
   /**
    * Path to the Seatbelt .sb profile; only read/needed when the EFFECTIVE
    * backend (see {@link resolveEffectiveBackend}) is seatbelt.
@@ -2795,7 +2831,7 @@ export function sandboxConfigFrom(
     sandboxNetwork?: "allow" | "deny";
     sandboxCredentialAccess?: "provider" | "isolated";
   },
-): SandboxConfig {
+): SandboxConfig & { network: "allow" | "deny" } {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
   const network = overrides?.sandboxNetwork ?? g.sandboxNetwork;
   const needsProfile = resolveEffectiveBackend(mode, Deno.build.os) ===
@@ -2810,6 +2846,7 @@ export function sandboxConfigFrom(
     provider: overrides?.provider ?? g.defaultProvider,
     credentialAccess: overrides?.sandboxCredentialAccess ??
       g.sandboxCredentialAccess,
+    network,
     profilePath,
     required: overrides?.sandboxRequired ?? g.sandboxRequired,
   };
@@ -3008,6 +3045,13 @@ function buildInvocationBase(
 /** Execution context provided by swamp to each method invocation. */
 type MethodContext = {
   globalArgs: z.infer<typeof GlobalArgsSchema>;
+  definition: {
+    id: string;
+    name: string;
+    version: number;
+    tags: Record<string, string>;
+  };
+  methodName: string;
   logger: {
     info: (msg: string, props?: Record<string, unknown>) => void;
     warning: (msg: string, props?: Record<string, unknown>) => void;
@@ -3018,6 +3062,10 @@ type MethodContext = {
     instanceName: string,
     data: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>;
+  readResource: (
+    instanceName: string,
+    version?: number,
+  ) => Promise<Record<string, unknown> | null>;
   /**
    * Resolve a manifest-relative bundled file (an `additionalFiles`/`binaries`
    * entry) to an absolute on-disk path. Swamp injects this; it resolves against
@@ -3027,6 +3075,115 @@ type MethodContext = {
    */
   extensionFile: (relPath: string) => string;
 };
+
+type ResourceContext = Pick<MethodContext, "readResource" | "writeResource">;
+
+function stableValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableValue(entry)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Return tags in deterministic key order, treating omission as an empty map. */
+export function normalizeTags(
+  tags?: Record<string, string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(tags ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+  );
+}
+
+/**
+ * Under Swamp's per-model method lock, create a resource once or verify that
+ * the existing/read-back value is exactly the expected value. This is not a
+ * datastore CAS and must not be used without that serialization guarantee.
+ */
+export async function createOnceOrVerify(
+  context: ResourceContext,
+  specName: string,
+  instanceName: string,
+  expected: Record<string, unknown>,
+): Promise<{ created: boolean; handle?: Record<string, unknown> }> {
+  const before = await context.readResource(instanceName);
+  if (before !== null) {
+    if (stableValue(before) !== stableValue(expected)) {
+      throw new Error(`Conflicting durable resource: ${instanceName}`);
+    }
+    return { created: false };
+  }
+  const handle = await context.writeResource(specName, instanceName, expected);
+  const after = await context.readResource(instanceName);
+  if (after === null || stableValue(after) !== stableValue(expected)) {
+    throw new Error(`Durable resource read-back mismatch: ${instanceName}`);
+  }
+  return { created: true, handle };
+}
+
+export class ReplayedInvocationError extends Error {
+  constructor(public readonly failureClass: string) {
+    super(`Replayed invocation failed (${failureClass})`);
+    this.name = "ReplayedInvocationError";
+  }
+}
+
+/** Claim a caller-owned launch and either launch or replay terminal evidence. */
+export async function launchCallerInvocation<T>(
+  context: ResourceContext,
+  claim: InvocationLaunchClaim,
+  launch: () => Promise<T>,
+): Promise<{ replayed: false; value: T } | { replayed: true }> {
+  const parsedClaim = InvocationLaunchClaimSchema.parse(claim);
+  const claimName = `launch-claim-${claim.invocationId}`;
+  const { created } = await createOnceOrVerify(
+    context,
+    "invocationLaunchClaim",
+    claimName,
+    parsedClaim,
+  );
+  if (created) return { replayed: false, value: await launch() };
+
+  const rawInvocation = await context.readResource(
+    `invocation-${claim.invocationId}`,
+  );
+  const rawTranscript = await context.readResource(
+    `transcript-${claim.invocationId}`,
+  );
+  const invocation = InvocationSchema.safeParse(rawInvocation);
+  const transcript = TranscriptSchema.safeParse(rawTranscript);
+  if (!invocation.success || !transcript.success) {
+    throw new Error(`Ambiguous prior launch: ${claim.invocationId}`);
+  }
+  const i = invocation.data;
+  const t = transcript.data;
+  const consistent = i.invocationId === claim.invocationId &&
+    t.invocationId === claim.invocationId && i.provider === claim.provider &&
+    i.model === claim.model && i.cwd === claim.cwd &&
+    i.promptHash === claim.promptHash &&
+    stableValue(normalizeTags(i.tags)) === stableValue(claim.tags) &&
+    i.prompt === t.prompt.slice(0, 500) &&
+    i.promptTruncated === (t.prompt.length > 500) &&
+    i.outputPreview === t.output.slice(0, 1000) &&
+    (claim.operation !== "invokeAndParse" ||
+      !i.success ||
+      i.parsedResponse !== null && i.parsedResponse !== undefined);
+  if (!consistent) {
+    throw new Error(`Conflicting terminal evidence: ${claim.invocationId}`);
+  }
+  if (!i.success) {
+    throw new ReplayedInvocationError(i.failureClass ?? "unknown");
+  }
+  return { replayed: true };
+}
+
+export async function canonicalCwd(cwd: string): Promise<string> {
+  return await Deno.realPath(cwd);
+}
 
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
@@ -3102,7 +3259,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.27.1",
+  version: "2026.07.27.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3207,8 +3364,21 @@ export const model = {
         "Allow invoke and invokeAndParse callers to supply an optional artifact-safe invocationId for exact workflow correlation; omitted identities retain generated UUID behavior. Additive method argument change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.27.2",
+      description:
+        "Add durable caller-owned invocation launch claims and create-once-or-verify terminal persistence for at-most-once provider launches under Swamp's per-model serialization. New prompt hashes use SHA-256; existing invocation records remain readable. Additive resources only; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
+    invocationLaunchClaim: {
+      description:
+        "Durable pre-spawn identity claim for a caller-owned invocationId",
+      schema: InvocationLaunchClaimSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 100,
+    },
     invocation: {
       description:
         "Structured record of a CLI agent invocation with provider, tokens, cost, and output",
@@ -3246,13 +3416,18 @@ export const model = {
         args: InvokeArgs,
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const callerOwned = args.invocationId !== undefined;
+        const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
         const modelName = resolveModel(
           provider,
           args.model,
           context.globalArgs.defaultModel,
         );
-        const cwd = args.cwd || Deno.cwd();
+        const requestedCwd = args.cwd || Deno.cwd();
+        const cwd = callerOwned
+          ? await canonicalCwd(requestedCwd)
+          : requestedCwd;
         const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
           args,
           context.globalArgs,
@@ -3269,36 +3444,68 @@ export const model = {
           commandSubdirs,
           cwd,
         );
-        const promptHash = hashPrompt(resolved);
+        const promptHash = await hashPrompt(resolved);
         const cliPath = cliPathFor(provider, context.globalArgs);
-
-        const outcome = await runWithRetries(
-          provider,
-          cliPath,
-          modelName,
-          resolved,
-          toolProfile,
+        const sandbox = sandboxConfigFrom(
+          context.globalArgs,
+          (fn) => context.extensionFile(fn),
           {
-            cwd,
-            wallTimeoutMs,
-            idleTimeoutMs,
-            maxRetries,
-            sandbox: sandboxConfigFrom(
-              context.globalArgs,
-              (fn) => context.extensionFile(fn),
-              {
-                provider,
-                sandboxMode: args.sandboxMode,
-                sandboxRequired: args.sandboxRequired,
-                sandboxNetwork: args.sandboxNetwork,
-                sandboxCredentialAccess: args.sandboxCredentialAccess,
-              },
-            ),
+            provider,
+            sandboxMode: args.sandboxMode,
+            sandboxRequired: args.sandboxRequired,
+            sandboxNetwork: args.sandboxNetwork,
+            sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
-          context.logger,
         );
 
-        const invocationId = resolveInvocationId(args.invocationId);
+        const launch = () =>
+          runWithRetries(
+            provider,
+            cliPath,
+            modelName,
+            resolved,
+            toolProfile,
+            {
+              cwd,
+              wallTimeoutMs,
+              idleTimeoutMs,
+              maxRetries,
+              sandbox,
+            },
+            context.logger,
+          );
+        let outcome: RunOutcome;
+        if (callerOwned) {
+          const claimed = await launchCallerInvocation(context, {
+            operation: "invoke",
+            invocationId,
+            provider,
+            model: modelName,
+            cwd,
+            promptHash,
+            tags: normalizeTags(args.tags),
+            definition: {
+              id: context.definition.id,
+              name: context.definition.name,
+              version: context.definition.version,
+              tags: normalizeTags(context.definition.tags),
+            },
+            methodName: context.methodName,
+            cliPath,
+            idleTimeoutMs,
+            wallTimeoutMs,
+            maxRetries,
+            toolProfile,
+            sandbox,
+          }, launch);
+          // Deterministic terminal resources already exist on a successful
+          // replay, so no duplicate handles are required.
+          if (claimed.replayed) return { dataHandles: [] };
+          outcome = claimed.value;
+        } else {
+          outcome = await launch();
+        }
+
         const invocation = buildInvocationBase(
           invocationId,
           provider,
@@ -3310,12 +3517,14 @@ export const model = {
           outcome,
         );
 
-        const handle = await context.writeResource(
+        const invocationWrite = await createOnceOrVerify(
+          context,
           "invocation",
           `invocation-${invocationId}`,
           invocation,
         );
-        const transcriptHandle = await context.writeResource(
+        const transcriptWrite = await createOnceOrVerify(
+          context,
           "transcript",
           `transcript-${invocationId}`,
           {
@@ -3367,7 +3576,11 @@ export const model = {
           );
         }
 
-        return { dataHandles: [handle, transcriptHandle] };
+        return {
+          dataHandles: [invocationWrite.handle, transcriptWrite.handle].filter(
+            (handle): handle is Record<string, unknown> => handle !== undefined,
+          ),
+        };
       },
     },
 
@@ -3379,13 +3592,18 @@ export const model = {
         args: InvokeArgs,
         context: MethodContext,
       ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const callerOwned = args.invocationId !== undefined;
+        const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
         const modelName = resolveModel(
           provider,
           args.model,
           context.globalArgs.defaultModel,
         );
-        const cwd = args.cwd || Deno.cwd();
+        const requestedCwd = args.cwd || Deno.cwd();
+        const cwd = callerOwned
+          ? await canonicalCwd(requestedCwd)
+          : requestedCwd;
         const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
           args,
           context.globalArgs,
@@ -3402,34 +3620,65 @@ export const model = {
           commandSubdirs,
           cwd,
         );
-        const promptHash = hashPrompt(resolved);
+        const promptHash = await hashPrompt(resolved);
         const cliPath = cliPathFor(provider, context.globalArgs);
-
-        const outcome = await runWithRetries(
-          provider,
-          cliPath,
-          modelName,
-          resolved,
-          toolProfile,
+        const sandbox = sandboxConfigFrom(
+          context.globalArgs,
+          (fn) => context.extensionFile(fn),
           {
-            cwd,
-            wallTimeoutMs,
-            idleTimeoutMs,
-            maxRetries,
-            sandbox: sandboxConfigFrom(
-              context.globalArgs,
-              (fn) => context.extensionFile(fn),
-              {
-                provider,
-                sandboxMode: args.sandboxMode,
-                sandboxRequired: args.sandboxRequired,
-                sandboxNetwork: args.sandboxNetwork,
-                sandboxCredentialAccess: args.sandboxCredentialAccess,
-              },
-            ),
+            provider,
+            sandboxMode: args.sandboxMode,
+            sandboxRequired: args.sandboxRequired,
+            sandboxNetwork: args.sandboxNetwork,
+            sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
-          context.logger,
         );
+
+        const launch = () =>
+          runWithRetries(
+            provider,
+            cliPath,
+            modelName,
+            resolved,
+            toolProfile,
+            {
+              cwd,
+              wallTimeoutMs,
+              idleTimeoutMs,
+              maxRetries,
+              sandbox,
+            },
+            context.logger,
+          );
+        let outcome: RunOutcome;
+        if (callerOwned) {
+          const claimed = await launchCallerInvocation(context, {
+            operation: "invokeAndParse",
+            invocationId,
+            provider,
+            model: modelName,
+            cwd,
+            promptHash,
+            tags: normalizeTags(args.tags),
+            definition: {
+              id: context.definition.id,
+              name: context.definition.name,
+              version: context.definition.version,
+              tags: normalizeTags(context.definition.tags),
+            },
+            methodName: context.methodName,
+            cliPath,
+            idleTimeoutMs,
+            wallTimeoutMs,
+            maxRetries,
+            toolProfile,
+            sandbox,
+          }, launch);
+          if (claimed.replayed) return { dataHandles: [] };
+          outcome = claimed.value;
+        } else {
+          outcome = await launch();
+        }
         const { result, extractedText, providerError } = outcome;
 
         // Parse JSON from extracted text
@@ -3446,7 +3695,6 @@ export const model = {
           } catch { /* not valid JSON */ }
         }
 
-        const invocationId = resolveInvocationId(args.invocationId);
         // invokeAndParse additionally requires a parseable JSON payload. A run
         // that otherwise succeeded but produced no valid JSON is a
         // contract-violation; a run that already failed keeps the base class.
@@ -3475,12 +3723,14 @@ export const model = {
           parsedResponse: parsedJson,
         };
 
-        const handle = await context.writeResource(
+        const invocationWrite = await createOnceOrVerify(
+          context,
           "invocation",
           `invocation-${invocationId}`,
           invocation,
         );
-        const transcriptHandle = await context.writeResource(
+        const transcriptWrite = await createOnceOrVerify(
+          context,
           "transcript",
           `transcript-${invocationId}`,
           { invocationId, prompt: args.prompt, output: extractedText },
@@ -3519,7 +3769,11 @@ export const model = {
           },
         );
 
-        return { dataHandles: [handle, transcriptHandle] };
+        return {
+          dataHandles: [invocationWrite.handle, transcriptWrite.handle].filter(
+            (handle): handle is Record<string, unknown> => handle !== undefined,
+          ),
+        };
       },
     },
 
