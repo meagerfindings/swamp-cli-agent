@@ -1009,12 +1009,45 @@ export function filterProviderChildEnv(
  * When `opts.sandbox` is set (mode !== "off"), `cmd` is passed through
  * {@link wrapWithSandbox} first — this is the single choke point every
  * provider CLI spawns through, so the OS-level confinement applies uniformly.
- * The child Deno.Command then becomes `sandbox-exec`, which execs the real
- * CLI as a grandchild; SIGTERM/SIGKILL still target the direct child
- * (sandbox-exec), and the existing `cancelStreams` handling above already
- * tolerates surviving grandchildren holding the pipe open, so no changes were
- * needed to the kill/drain logic below for this to work correctly.
+ * On POSIX the direct child leads a dedicated process group, so timeout
+ * signaling covers it and ordinary descendants in that group. Windows retains
+ * direct-child-only signaling. Reader cancellation is the final pipe-drain
+ * backstop on every platform.
  */
+export type SignalOutcome =
+  | { kind: "sent" }
+  | { kind: "gone" }
+  | { kind: "error"; error: Error };
+
+/** Decide timeout attribution after the watchdog has observed a signal outcome. */
+export function timeoutAttribution(
+  outcome: SignalOutcome,
+  reason: string,
+): { killed: boolean; timeoutReason?: string } {
+  return outcome.kind === "sent"
+    ? { killed: true, timeoutReason: reason }
+    : { killed: false };
+}
+
+/** Send a signal and make one best-effort direct hard-kill fallback on error. */
+export function arbitrateSignalOutcome(
+  send: () => SignalOutcome,
+  fallbackDirectKill: () => SignalOutcome,
+): SignalOutcome {
+  const outcome = send();
+  if (outcome.kind !== "error") return outcome;
+
+  const fallback = fallbackDirectKill();
+  if (fallback.kind !== "error") return outcome;
+  return {
+    kind: "error",
+    error: new AggregateError(
+      [outcome.error, fallback.error],
+      `${outcome.error.message}; direct SIGKILL fallback also failed`,
+    ),
+  };
+}
+
 export async function runCli(
   cmd: string[],
   opts: {
@@ -1045,79 +1078,188 @@ export async function runCli(
     cwd: opts.cwd,
     clearEnv: true,
     env: childEnv,
+    // POSIX children lead a dedicated group shared by ordinary descendants.
+    // Windows retains direct-child-only supervision.
+    detached: Deno.build.os !== "windows",
   });
 
   const child = command.spawn();
-
-  let lastOutputAt = performance.now();
-  let timeoutReason: string | undefined;
+  let childExited = false;
+  let done = false;
   let killed = false;
-
-  // Cancel the output streams so the drain loops below terminate even when a
-  // SURVIVING GRANDCHILD still holds the pipe's write end open. Killing the
-  // direct child does NOT close pipes inherited by its descendants, so without
-  // this `for await … of child.stdout` would block forever and the caller (and
-  // the swamp model lock) would hang despite the kill — the exact wedge this
-  // function exists to prevent.
-  const cancelStreams = () => {
-    child.stdout.cancel().catch(() => {});
-    child.stderr.cancel().catch(() => {});
-  };
-
-  // Escalating kill: SIGTERM, then SIGKILL if the child doesn't exit promptly,
-  // then cancel the streams to unblock the drains regardless of grandchildren.
-  const killChild = async (reason: string) => {
-    if (killed) return;
-    killed = true;
-    timeoutReason = reason;
-    try {
-      child.kill("SIGTERM");
-    } catch { /* already dead */ }
-    await new Promise((r) => setTimeout(r, SIGKILL_GRACE_MS));
-    try {
-      child.kill("SIGKILL");
-    } catch { /* already dead */ }
-    cancelStreams();
-  };
-
-  // Drain a stream into a buffer, stamping lastOutputAt on every chunk so the
-  // idle watchdog sees progress. A cancelled stream throws here; swallow it.
+  let timeoutReason: string | undefined;
+  let lastOutputAt = performance.now();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const pendingTimerResolves = new Map<
+    ReturnType<typeof setTimeout>,
+    () => void
+  >();
   const chunks: Uint8Array[] = [];
   const errChunks: Uint8Array[] = [];
+  const stdoutReader = child.stdout.getReader();
+  const stderrReader = child.stderr.getReader();
+  const stdinWriter = opts.stdin && child.stdin
+    ? child.stdin.getWriter()
+    : undefined;
+  let stdinWriterReleased = false;
+
+  const statusPromise = child.status.then((status) => {
+    childExited = true;
+    done = true;
+    return status;
+  });
+
+  const delay = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        pendingTimerResolves.delete(timer);
+        resolve();
+      }, ms);
+      timers.add(timer);
+      pendingTimerResolves.set(timer, resolve);
+    });
+  const clearAllTimers = () => {
+    for (const timer of timers) {
+      clearTimeout(timer);
+      pendingTimerResolves.get(timer)?.();
+    }
+    timers.clear();
+    pendingTimerResolves.clear();
+  };
+
+  const asError = (error: unknown): Error =>
+    error instanceof Error ? error : new Error(String(error));
+  const signalError = (
+    target: "process group" | "direct child",
+    signal: Deno.Signal,
+    error: unknown,
+  ) =>
+    new Error(
+      `Failed to send ${signal} to provider ${target} ${child.pid}: ${
+        asError(error).message
+      }`,
+      { cause: error },
+    );
+  const signalDirect = (signal: Deno.Signal): SignalOutcome => {
+    try {
+      child.kill(signal);
+      return { kind: "sent" };
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound || childExited) {
+        return { kind: "gone" };
+      }
+      return {
+        kind: "error",
+        error: signalError("direct child", signal, error),
+      };
+    }
+  };
+  const directKillFallback = (): SignalOutcome => signalDirect("SIGKILL");
+  const signalTarget = (signal: Deno.Signal): SignalOutcome => {
+    const send = (): SignalOutcome => {
+      if (Deno.build.os === "windows") return signalDirect(signal);
+      try {
+        Deno.kill(-child.pid, signal);
+        return { kind: "sent" };
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) return { kind: "gone" };
+        return {
+          kind: "error",
+          error: signalError("process group", signal, error),
+        };
+      }
+    };
+    return arbitrateSignalOutcome(send, directKillFallback);
+  };
+
+  const killChild = async (reason: string): Promise<void> => {
+    if (killed || childExited) return;
+    const term = signalTarget("SIGTERM");
+    if (term.kind === "error") throw term.error;
+    const attribution = timeoutAttribution(term, reason);
+    killed = attribution.killed;
+    timeoutReason = attribution.timeoutReason;
+    if (!attribution.killed) {
+      await statusPromise;
+      return;
+    }
+    const graceElapsed = await Promise.race([
+      statusPromise.then(() => false),
+      delay(SIGKILL_GRACE_MS).then(() => true),
+    ]);
+    if (Deno.build.os !== "windows" || graceElapsed) {
+      const forced = signalTarget("SIGKILL");
+      if (forced.kind === "error") {
+        const fallback = directKillFallback();
+        throw fallback.kind === "error"
+          ? new AggregateError(
+            [forced.error, fallback.error],
+            `${forced.error.message}; direct SIGKILL fallback also failed`,
+          )
+          : forced.error;
+      }
+    }
+  };
+
+  let cancellingReaders = false;
+  const cancelReaders = () => {
+    cancellingReaders = true;
+    return Promise.allSettled([
+      stdoutReader.cancel(),
+      stderrReader.cancel(),
+    ]);
+  };
   const drain = async (
-    stream: ReadableStream<Uint8Array>,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
     sink: Uint8Array[],
   ) => {
     try {
-      for await (const chunk of stream) {
+      while (true) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) return;
         lastOutputAt = performance.now();
-        sink.push(chunk);
+        sink.push(value);
       }
-    } catch { /* stream cancelled on kill */ }
+    } catch (error) {
+      if (!cancellingReaders) throw error;
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   };
 
-  // Start drains + watchdog BEFORE writing stdin. Writing a large
-  // prompt while the child already emits on stdout/stderr can fill the OS pipe
-  // buffers and deadlock if nobody is reading yet.
-  const drains = Promise.all([
-    drain(child.stdout, chunks),
-    drain(child.stderr, errChunks),
-  ]);
+  const stdoutDrain = drain(stdoutReader, chunks);
+  const stderrDrain = drain(stderrReader, errChunks);
+  const drains = Promise.all([stdoutDrain, stderrDrain]);
+  const inputPump = stdinWriter
+    ? (async () => {
+      try {
+        await stdinWriter.write(new TextEncoder().encode(opts.stdin!));
+        await stdinWriter.close();
+      } finally {
+        stdinWriter.releaseLock();
+        stdinWriterReleased = true;
+      }
+    })()
+    : Promise.resolve();
+  // Successful input completion is not subprocess completion; only rejection
+  // participates in the main observation race.
+  const inputFailure = inputPump.then(
+    () => new Promise<never>(() => {}),
+    (error) => Promise.reject(error),
+  );
 
-  // Watchdog: poll for wall/idle timeouts on a 1s tick. `done` stops the loop
-  // the moment the child exits so we don't leave a dangling timer keeping the
-  // isolate alive.
-  let done = false;
   const watch = (async () => {
-    const idleMs = opts.idleTimeoutMs;
     while (!done) {
-      await new Promise((r) => setTimeout(r, 1_000));
+      await delay(1_000);
       if (done) return;
       const now = performance.now();
       if (now - start >= opts.wallTimeoutMs) {
         await killChild("wall_time_exceeded");
         return;
       }
+      const idleMs = opts.idleTimeoutMs;
       if (idleMs && idleMs > 0 && now - lastOutputAt >= idleMs) {
         await killChild("idle_time_exceeded");
         return;
@@ -1125,41 +1267,64 @@ export async function runCli(
     }
   })();
 
-  if (opts.stdin && child.stdin) {
-    const writer = child.stdin.getWriter();
-    await writer.write(new TextEncoder().encode(opts.stdin));
-    await writer.close();
+  let result: CmdResult | undefined;
+  let primaryError: unknown;
+  let hasPrimaryError = false;
+  let cleanupError: Error | undefined;
+  try {
+    const status = await Promise.race([
+      statusPromise,
+      watch.then(() => statusPromise),
+      inputFailure,
+      drains.then(() => statusPromise),
+    ]);
+    await Promise.race([
+      drains,
+      delay(2_000).then(async () => {
+        await cancelReaders();
+      }),
+    ]);
+    await drains;
+    await watch;
+
+    result = {
+      stdout: new TextDecoder().decode(concatChunks(chunks)),
+      stderr: new TextDecoder().decode(concatChunks(errChunks)),
+      code: status.code,
+      success: status.success && !killed,
+      timedOut: killed,
+      timeoutReason,
+      durationMs: Math.round(performance.now() - start),
+    };
+  } catch (error) {
+    primaryError = error;
+    hasPrimaryError = true;
+  } finally {
+    done = true;
+    clearAllTimers();
+
+    // Any exceptional path that reaches cleanup while the child is still live
+    // gets one immediate, best-effort hard stop. Never wait on child.status
+    // here: a failed stdin pump or stream operation must not leak a provider or
+    // turn the original failure into an indefinite wait.
+    if (!childExited) {
+      const forced = signalTarget("SIGKILL");
+      if (forced.kind === "error") cleanupError = forced.error;
+    }
+
+    if (stdinWriter && !stdinWriterReleased) {
+      // Do not let a broken child pipe delay propagation of the primary error.
+      stdinWriter.abort().catch(() => {});
+    }
+    await cancelReaders();
+    await Promise.allSettled([stdoutDrain, stderrDrain, watch]);
   }
 
-  // child.status resolves when the DIRECT child exits, even if grandchildren
-  // survive. On a normal exit the pipes close and the drains EOF on their own;
-  // on a kill, cancelStreams() (in killChild) forces them to finish. As a final
-  // backstop, cancel the streams if the drains haven't settled shortly after
-  // the child exits — so a wedged drain can never outlive the process.
-  const status = await child.status;
-  done = true;
-  await Promise.race([
-    drains,
-    new Promise<void>((resolve) =>
-      setTimeout(() => {
-        cancelStreams();
-        resolve();
-      }, 2_000)
-    ),
-  ]);
-  await watch;
-
-  const durationMs = Math.round(performance.now() - start);
-
-  return {
-    stdout: new TextDecoder().decode(concatChunks(chunks)),
-    stderr: new TextDecoder().decode(concatChunks(errChunks)),
-    code: status.code,
-    success: status.success && !killed,
-    timedOut: killed,
-    timeoutReason,
-    durationMs,
-  };
+  // Cleanup must never mask the error that caused it. On an otherwise clean
+  // path a synchronous signaling failure remains useful diagnostic context.
+  if (hasPrimaryError) throw primaryError;
+  if (cleanupError) throw cleanupError;
+  return result!;
 }
 
 /** Concatenate an array of byte chunks into a single Uint8Array. */
@@ -2919,7 +3084,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.26.5",
+  version: "2026.07.26.6",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3010,6 +3175,12 @@ export const model = {
       toVersion: "2026.07.26.5",
       description:
         "Add an independently validated per-invocation idleTimeoutMs override so slow local agents can use a longer silence allowance without weakening the finite wall timeout. Additive schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.07.26.6",
+      description:
+        "Terminate the dedicated POSIX provider process group on wall or idle timeout, covering ordinary descendants and escalating survivors to SIGKILL while retaining direct-child-only cleanup on Windows. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

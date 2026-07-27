@@ -8,6 +8,7 @@
 
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  arbitrateSignalOutcome,
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
@@ -18,8 +19,8 @@ import {
   extractUsage,
   filterProviderChildEnv,
   GlobalArgsSchema,
-  InvokeArgsSchema,
   InvocationSchema,
+  InvokeArgsSchema,
   isProvider,
   listProvidersFromRegistry,
   ModelIdSchema,
@@ -34,6 +35,7 @@ import {
   SANDBOX_STRICT_PROFILE_FILENAME,
   sandboxConfigFrom,
   SIGNATURE_TABLE,
+  timeoutAttribution,
   wrapWithSandbox,
 } from "./cli_agent.ts";
 
@@ -903,6 +905,447 @@ Deno.test("runCli: child PWD matches its requested working directory", async () 
     await Deno.remove(parentDir, { recursive: true });
     await Deno.remove(requestedDir, { recursive: true });
   }
+});
+
+const posixOnly = Deno.build.os === "windows";
+
+function denoEval(source: string): string[] {
+  return [Deno.execPath(), "eval", source];
+}
+
+async function processExists(pid: number): Promise<boolean> {
+  if (Deno.build.os === "windows") {
+    const output = await new Deno.Command("tasklist.exe", {
+      args: ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (!output.success) {
+      throw new Error(new TextDecoder().decode(output.stderr).trim());
+    }
+    const row = new TextDecoder().decode(output.stdout).trim();
+    return row !== "" && !row.startsWith("INFO:") &&
+      row.split(",")[1]?.replaceAll('"', "") === String(pid);
+  }
+
+  const status = await new Deno.Command("/bin/kill", {
+    args: ["-0", String(pid)],
+    stdout: "null",
+    stderr: "null",
+  }).output();
+  return status.success;
+}
+
+function forceProcessExit(pid: number | undefined): Promise<void> {
+  return Promise.resolve().then(() => {
+    if (pid === undefined) return;
+    try {
+      Deno.kill(pid, "SIGKILL");
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  });
+}
+
+async function readPidFiles(paths: string[]): Promise<number[]> {
+  const values = await Promise.all(paths.map(async (path) => {
+    try {
+      const value = Number((await Deno.readTextFile(path)).trim());
+      return Number.isInteger(value) && value > 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }));
+  return values.filter((value): value is number => value !== undefined);
+}
+
+async function guardedInvocation<T>(
+  invocation: Promise<T>,
+  pidFiles: string[],
+  timeoutMs = 12_000,
+): Promise<T> {
+  const completed = invocation.then(
+    (value) => ({ kind: "fulfilled" as const, value }),
+    (error) => ({ kind: "rejected" as const, error }),
+  );
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<{ kind: "deadline" }>((resolve) => {
+    deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), timeoutMs);
+  });
+  const first = await Promise.race([completed, deadline]);
+  if (first.kind === "fulfilled") {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    return first.value;
+  }
+  if (first.kind === "rejected") {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    throw first.error;
+  }
+
+  const pids = await readPidFiles(pidFiles);
+  for (const pid of pids) {
+    if (Deno.build.os !== "windows") {
+      try {
+        Deno.kill(-pid, "SIGKILL");
+      } catch { /* group may not be led by this fixture pid */ }
+    }
+    await forceProcessExit(pid).catch(() => {});
+  }
+
+  // Cleanup gets one short settlement window, but expiration has already won:
+  // reject even if the invocation settles after the independent deadline.
+  let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    completed.then(() => {
+      if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+    }),
+    new Promise<void>((resolve) => {
+      settlementTimer = setTimeout(resolve, 250);
+    }),
+  ]);
+  throw new Error(`runCli exceeded independent ${timeoutMs}ms test guard`);
+}
+
+async function withPidFiles<T>(
+  count: number,
+  fn: (paths: string[]) => Promise<T>,
+): Promise<T> {
+  const dir = await Deno.makeTempDir();
+  const paths = Array.from(
+    { length: count },
+    (_, index) => `${dir}/process-${index}.pid`,
+  );
+  await Promise.all(paths.map((path) => Deno.writeTextFile(path, "")));
+  try {
+    return await fn(paths);
+  } finally {
+    const pids = await readPidFiles(paths);
+    await Promise.allSettled(pids.map(forceProcessExit));
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = performance.now() + 2_000;
+  while (await processExists(pid)) {
+    if (performance.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assertEquals(
+    await processExists(pid),
+    false,
+    `process ${pid} survived timeout cleanup`,
+  );
+}
+
+Deno.test("timeoutAttribution: gone after watchdog before TERM is a natural exit", () => {
+  assertEquals(timeoutAttribution({ kind: "gone" }, "wall_time_exceeded"), {
+    killed: false,
+  });
+});
+
+Deno.test("timeoutAttribution: only a sent signal receives timeout attribution", () => {
+  assertEquals(timeoutAttribution({ kind: "sent" }, "wall_time_exceeded"), {
+    killed: true,
+    timeoutReason: "wall_time_exceeded",
+  });
+});
+
+Deno.test("arbitrateSignalOutcome: gone is preserved without fallback", () => {
+  let fallbackCalls = 0;
+  const outcome = arbitrateSignalOutcome(
+    () => ({ kind: "gone" }),
+    () => {
+      fallbackCalls++;
+      return { kind: "sent" };
+    },
+  );
+  assertEquals(outcome.kind, "gone");
+  assertEquals(fallbackCalls, 0);
+});
+
+Deno.test("arbitrateSignalOutcome: sent is preserved without fallback", () => {
+  let fallbackCalls = 0;
+  const outcome = arbitrateSignalOutcome(
+    () => ({ kind: "sent" }),
+    () => {
+      fallbackCalls++;
+      return { kind: "gone" };
+    },
+  );
+  assertEquals(outcome.kind, "sent");
+  assertEquals(fallbackCalls, 0);
+});
+
+Deno.test("arbitrateSignalOutcome: dual errors retain both failures", () => {
+  const groupError = new Error("group signal denied");
+  const directError = new Error("direct kill denied");
+  const outcome = arbitrateSignalOutcome(
+    () => ({ kind: "error", error: groupError }),
+    () => ({ kind: "error", error: directError }),
+  );
+
+  assertEquals(outcome.kind, "error");
+  if (outcome.kind === "error") {
+    assertEquals(outcome.error instanceof AggregateError, true);
+    assertEquals((outcome.error as AggregateError).errors, [
+      groupError,
+      directError,
+    ]);
+  }
+});
+
+Deno.test("arbitrateSignalOutcome: signal error attempts direct KILL fallback", () => {
+  let fallbackCalls = 0;
+  const original = new Error("group TERM denied");
+  const outcome = arbitrateSignalOutcome(
+    () => ({ kind: "error", error: original }),
+    () => {
+      fallbackCalls++;
+      return { kind: "sent" };
+    },
+  );
+  assertEquals(outcome.kind, "error");
+  assertEquals(fallbackCalls, 1);
+  if (outcome.kind === "error") assertEquals(outcome.error, original);
+});
+
+Deno.test("runCli: normal process exit is not marked timed out", async () => {
+  const result = await guardedInvocation(
+    runCli(denoEval('console.log("done")'), {
+      wallTimeoutMs: 2_000,
+      idleTimeoutMs: 2_000,
+    }),
+    [],
+  );
+
+  assertEquals(result.success, true);
+  assertEquals(result.timedOut, false);
+  assertEquals(result.timeoutReason, undefined);
+  assertEquals(result.stdout.trim(), "done");
+});
+
+Deno.test("runCli: wall timeout terminates a hanging direct child", async () => {
+  await withPidFiles(1, async ([pidFile]) => {
+    const source = `
+      await Deno.writeTextFile(${JSON.stringify(pidFile)}, String(Deno.pid));
+      console.log("ready");
+      setInterval(() => {}, 60_000);
+    `;
+    const result = await guardedInvocation(
+      runCli(denoEval(source), {
+        wallTimeoutMs: 1_000,
+        idleTimeoutMs: 10_000,
+      }),
+      [pidFile],
+    );
+
+    assertEquals(result.success, false);
+    assertEquals(result.timedOut, true);
+    assertEquals(result.timeoutReason, "wall_time_exceeded");
+    assertEquals(result.stdout.trim(), "ready");
+  });
+});
+
+Deno.test({
+  name: "runCli: stdin failure rejects and kills a hanging child",
+  ignore: posixOnly,
+  async fn() {
+    await withPidFiles(1, async ([pidFile]) => {
+      const command = [
+        "/bin/sh",
+        "-c",
+        'printf "%s" "$$" > "$1"; exec 0<&-; sleep 60',
+        "stdin-fixture",
+        pidFile,
+      ];
+      let rejection: unknown;
+      try {
+        await guardedInvocation(
+          runCli(command, {
+            stdin: "x".repeat(8 * 1024 * 1024),
+            wallTimeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+          }),
+          [pidFile],
+        );
+      } catch (error) {
+        rejection = error;
+      }
+      const [pid] = await readPidFiles([pidFile]);
+
+      assertEquals(rejection instanceof Error, true);
+      assertEquals(
+        (rejection as Error).message.includes("independent 12000ms test guard"),
+        false,
+      );
+      await waitForProcessExit(pid);
+    });
+  },
+});
+
+Deno.test({
+  name: "runCli: POSIX timeout terminates child and pipe-holding grandchild",
+  ignore: posixOnly,
+  async fn() {
+    await withPidFiles(2, async ([childFile, grandchildFile]) => {
+      const grandchildSource = `
+        await Deno.writeTextFile(${
+        JSON.stringify(grandchildFile)
+      }, String(Deno.pid));
+        setInterval(() => {}, 60_000);
+      `;
+      const source = `
+        await Deno.writeTextFile(${
+        JSON.stringify(childFile)
+      }, String(Deno.pid));
+        const grandchild = new Deno.Command(Deno.execPath(), {
+          args: ["eval", ${JSON.stringify(grandchildSource)}],
+          stdout: "inherit", stderr: "inherit"
+        }).spawn();
+        await grandchild.status;
+      `;
+      const result = await guardedInvocation(
+        runCli(denoEval(source), {
+          wallTimeoutMs: 1_000,
+          idleTimeoutMs: 10_000,
+        }),
+        [childFile, grandchildFile],
+      );
+      const pids = await readPidFiles([childFile, grandchildFile]);
+      assertEquals(pids.length, 2, "fixture did not publish both process PIDs");
+      const [childPid, grandchildPid] = pids;
+
+      assertEquals(result.success, false);
+      assertEquals(result.timedOut, true);
+      await Promise.all([
+        waitForProcessExit(childPid),
+        waitForProcessExit(grandchildPid),
+      ]);
+    });
+  },
+});
+
+Deno.test({
+  name:
+    "runCli: POSIX idle timeout terminates child and pipe-holding descendant",
+  ignore: posixOnly,
+  async fn() {
+    await withPidFiles(2, async ([childFile, descendantFile]) => {
+      const descendantSource = `
+        await Deno.writeTextFile(${
+        JSON.stringify(descendantFile)
+      }, String(Deno.pid));
+        setInterval(() => {}, 60_000);
+      `;
+      const source = `
+        await Deno.writeTextFile(${
+        JSON.stringify(childFile)
+      }, String(Deno.pid));
+        new Deno.Command(Deno.execPath(), {
+          args: ["eval", ${JSON.stringify(descendantSource)}],
+          stdout: "inherit", stderr: "inherit"
+        }).spawn();
+        console.log("ready");
+        setInterval(() => {}, 60_000);
+      `;
+      const result = await guardedInvocation(
+        runCli(denoEval(source), {
+          wallTimeoutMs: 10_000,
+          idleTimeoutMs: 1_000,
+        }),
+        [childFile, descendantFile],
+      );
+      const pids = await readPidFiles([childFile, descendantFile]);
+      assertEquals(pids.length, 2, "fixture did not publish both process PIDs");
+      const [childPid, descendantPid] = pids;
+
+      assertEquals(result.success, false);
+      assertEquals(result.timedOut, true);
+      assertEquals(result.timeoutReason, "idle_time_exceeded");
+      await Promise.all([
+        waitForProcessExit(childPid),
+        waitForProcessExit(descendantPid),
+      ]);
+    });
+  },
+});
+
+Deno.test({
+  name: "runCli: POSIX TERM-responsive process returns without full grace",
+  ignore: posixOnly,
+  async fn() {
+    await withPidFiles(1, async ([pidFile]) => {
+      const source = `
+        await Deno.writeTextFile(${JSON.stringify(pidFile)}, String(Deno.pid));
+        Deno.addSignalListener("SIGTERM", () => Deno.exit(0));
+        setInterval(() => {}, 60_000);
+      `;
+      const started = performance.now();
+      const result = await guardedInvocation(
+        runCli(denoEval(source), {
+          wallTimeoutMs: 1_000,
+          idleTimeoutMs: 10_000,
+        }),
+        [pidFile],
+      );
+
+      assertEquals(result.success, false);
+      assertEquals(result.timedOut, true);
+      assertEquals(performance.now() - started < 4_000, true);
+    });
+  },
+});
+
+Deno.test({
+  name: "runCli: POSIX TERM-resistant process is escalated to KILL",
+  ignore: posixOnly,
+  async fn() {
+    await withPidFiles(1, async ([pidFile]) => {
+      const source = `
+        await Deno.writeTextFile(${JSON.stringify(pidFile)}, String(Deno.pid));
+        Deno.addSignalListener("SIGTERM", () => {});
+        setInterval(() => {}, 60_000);
+      `;
+      const result = await guardedInvocation(
+        runCli(denoEval(source), {
+          wallTimeoutMs: 1_000,
+          idleTimeoutMs: 10_000,
+        }),
+        [pidFile],
+      );
+      const [pid] = await readPidFiles([pidFile]);
+
+      assertEquals(result.success, false);
+      assertEquals(result.timedOut, true);
+      await waitForProcessExit(pid);
+    });
+  },
+});
+
+Deno.test("runCli: output activity resets idle timeout", async () => {
+  await withPidFiles(1, async ([pidFile]) => {
+    const source = `
+      await Deno.writeTextFile(${JSON.stringify(pidFile)}, String(Deno.pid));
+      for (let i = 0; i < 4; i++) {
+        console.log(i);
+        await new Promise((resolve) => setTimeout(resolve, 600));
+      }
+      setInterval(() => {}, 60_000);
+    `;
+    const result = await guardedInvocation(
+      runCli(denoEval(source), {
+        wallTimeoutMs: 3_000,
+        idleTimeoutMs: 1_000,
+      }),
+      [pidFile],
+    );
+
+    assertEquals(result.success, false);
+    assertEquals(result.timedOut, true);
+    assertEquals(result.timeoutReason, "wall_time_exceeded");
+    assertEquals(result.stdout.trim().split("\n").length, 4);
+  });
 });
 
 Deno.test("ModelIdSchema: trims; rejects empty and whitespace-only", () => {
