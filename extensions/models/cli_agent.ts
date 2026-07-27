@@ -49,6 +49,16 @@ export const ModelIdSchema = z.string().trim().min(1).describe(
 );
 export type ModelId = z.infer<typeof ModelIdSchema>;
 
+/**
+ * Stable caller-provided identity used to correlate an invocation with an
+ * external workflow attempt. Restricted to artifact-safe characters because
+ * it is embedded in swamp resource instance names.
+ */
+export const InvocationIdSchema = z.string().min(1).max(128).regex(
+  /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+  "must start with an alphanumeric character and contain only alphanumeric characters, dots, underscores, or hyphens",
+);
+
 /** True when `m` is present and non-blank (after trim). */
 function isPresentModelId(m: string | undefined): m is ModelId {
   return m !== undefined && m.trim().length > 0;
@@ -264,6 +274,11 @@ function hashPrompt(prompt: string): string {
 /** Generate a v4 UUID. */
 function uuid(): string {
   return crypto.randomUUID();
+}
+
+/** Preserve a caller correlation identity, or generate one for legacy callers. */
+export function resolveInvocationId(invocationId?: string): string {
+  return invocationId ?? uuid();
 }
 
 /**
@@ -3025,6 +3040,9 @@ type MethodContext = {
 /** Shared invoke / invokeAndParse argument schema (single source for both). */
 export const InvokeArgsSchema = z.object({
   prompt: z.string().describe("The prompt or slash command to execute"),
+  invocationId: InvocationIdSchema.optional().describe(
+    "Stable caller correlation identity. When omitted, CLI-agent generates a UUID. Callers must not reuse an identity for a distinct invocation.",
+  ),
   provider: ProviderEnum.optional().describe(
     "Override the default provider",
   ),
@@ -3084,7 +3102,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.26.6",
+  version: "2026.07.27.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3183,6 +3201,12 @@ export const model = {
         "Terminate the dedicated POSIX provider process group on wall or idle timeout, covering ordinary descendants and escalating survivors to SIGKILL while retaining direct-child-only cleanup on Windows. No schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.27.1",
+      description:
+        "Allow invoke and invokeAndParse callers to supply an optional artifact-safe invocationId for exact workflow correlation; omitted identities retain generated UUID behavior. Additive method argument change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     invocation: {
@@ -3274,7 +3298,7 @@ export const model = {
           context.logger,
         );
 
-        const invocationId = uuid();
+        const invocationId = resolveInvocationId(args.invocationId);
         const invocation = buildInvocationBase(
           invocationId,
           provider,
@@ -3422,7 +3446,7 @@ export const model = {
           } catch { /* not valid JSON */ }
         }
 
-        const invocationId = uuid();
+        const invocationId = resolveInvocationId(args.invocationId);
         // invokeAndParse additionally requires a parseable JSON payload. A run
         // that otherwise succeeded but produced no valid JSON is a
         // contract-violation; a run that already failed keeps the base class.

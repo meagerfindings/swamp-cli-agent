@@ -19,6 +19,7 @@ import {
   extractUsage,
   filterProviderChildEnv,
   GlobalArgsSchema,
+  InvocationIdSchema,
   InvocationSchema,
   InvokeArgsSchema,
   isProvider,
@@ -28,6 +29,7 @@ import {
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
   resolveEffectiveBackend,
+  resolveInvocationId,
   resolveInvocationTimeouts,
   resolveModel,
   runCli,
@@ -57,6 +59,46 @@ Deno.test("InvokeArgsSchema: validates idle and wall timeout overrides independe
       .success,
     false,
   );
+});
+
+Deno.test("InvocationIdSchema: accepts workflow-safe correlation identities", () => {
+  for (
+    const invocationId of [
+      "SF-52D-2-attempt-1",
+      "work_item.123_attempt_2",
+      "550e8400-e29b-41d4-a716-446655440000",
+    ]
+  ) {
+    assertEquals(InvocationIdSchema.parse(invocationId), invocationId);
+    assertEquals(
+      InvokeArgsSchema.parse({ prompt: "bounded edit", invocationId })
+        .invocationId,
+      invocationId,
+    );
+  }
+});
+
+Deno.test("InvocationIdSchema: rejects unsafe or ambiguous artifact identities", () => {
+  for (
+    const invocationId of [
+      "",
+      " leading-space",
+      "../escape",
+      "contains/slash",
+      "contains space",
+      "-leading-hyphen",
+      "a".repeat(129),
+    ]
+  ) {
+    assertEquals(InvocationIdSchema.safeParse(invocationId).success, false);
+  }
+});
+
+Deno.test("resolveInvocationId: preserves caller identity and generates a UUID when omitted", () => {
+  assertEquals(resolveInvocationId("SF-52D-2-attempt-1"), "SF-52D-2-attempt-1");
+  const generated = resolveInvocationId();
+  assertEquals(InvocationIdSchema.safeParse(generated).success, true);
+  assertEquals(generated.length, 36);
 });
 
 Deno.test("resolveInvocationTimeouts: each invocation override falls back independently", () => {
