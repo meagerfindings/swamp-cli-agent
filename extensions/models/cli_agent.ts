@@ -112,6 +112,13 @@ const SandboxCredentialAccessEnum = z.enum(["provider", "isolated"]);
 
 const TimeoutMsSchema = z.number().int().min(1_000).max(3_600_000);
 
+export const RepositoryExpectationSchema = z.object({
+  attachedBranch: z.string().min(1),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  stateHash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -235,6 +242,7 @@ export const InvocationLaunchClaimSchema = z.object({
   provider: ProviderEnum,
   model: ModelIdSchema,
   cwd: z.string().min(1),
+  repositoryExpectation: RepositoryExpectationSchema.optional(),
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
   tags: z.record(z.string(), z.string()),
   definition: z.object({
@@ -3185,6 +3193,125 @@ export async function canonicalCwd(cwd: string): Promise<string> {
   return await Deno.realPath(cwd);
 }
 
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  let output: Deno.CommandOutput;
+  try {
+    output = await new Deno.Command("git", {
+      args,
+      cwd,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+  } catch (error) {
+    throw new Error(
+      `repository expectation Git failure: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (!output.success) {
+    const detail = new TextDecoder().decode(output.stderr).trim();
+    throw new Error(
+      `repository expectation Git failure: git ${args.join(" ")} failed${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+  }
+  return new TextDecoder().decode(output.stdout);
+}
+
+function frameHashParts(parts: Uint8Array[]): Uint8Array {
+  const size = parts.reduce((total, part) => total + 8 + part.length, 0);
+  const framed = new Uint8Array(size);
+  const view = new DataView(framed.buffer);
+  let offset = 0;
+  for (const part of parts) {
+    view.setBigUint64(offset, BigInt(part.length), false);
+    offset += 8;
+    framed.set(part, offset);
+    offset += part.length;
+  }
+  return framed;
+}
+
+async function contentHash(parts: Uint8Array[]): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", frameHashParts(parts).slice().buffer),
+  );
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Compatibility: intentionally matches factory-runtime's tracked-diff-v1 byte-for-byte. */
+export async function repositoryStateHash(cwd: string): Promise<string> {
+  const diff = await gitOutput(cwd, [
+    "diff",
+    "--binary",
+    "--full-index",
+    "HEAD",
+    "--",
+  ]);
+  const untracked = await gitOutput(cwd, [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ]);
+  const encoder = new TextEncoder();
+  const parts = [encoder.encode("tracked-diff-v1"), encoder.encode(diff)];
+  for (const path of untracked.split("\0").filter(Boolean).sort()) {
+    parts.push(encoder.encode(path));
+    try {
+      parts.push(await Deno.readFile(`${cwd}/${path}`));
+    } catch (error) {
+      throw new Error(
+        `repository expectation state failure reading ${path}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  return await contentHash(parts);
+}
+
+/** Fail closed if the repository changed since its caller-owned preflight. */
+export async function verifyRepositoryExpectation(
+  cwd: string,
+  expectation: RepositoryExpectation,
+): Promise<void> {
+  const canonical = await canonicalCwd(cwd);
+  if (canonical !== cwd) {
+    throw new Error("repository expectation cwd is not canonical");
+  }
+  const topLevel = (await gitOutput(cwd, ["rev-parse", "--show-toplevel"]))
+    .trim();
+  if (topLevel !== cwd) {
+    throw new Error(
+      "repository expectation cwd is not the Git repository root",
+    );
+  }
+  const branch =
+    (await gitOutput(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .trim();
+  const headSha =
+    (await gitOutput(cwd, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+  const stateHash = await repositoryStateHash(cwd);
+  if (branch !== expectation.attachedBranch) {
+    throw new Error(
+      `repository expectation branch mismatch: expected ${expectation.attachedBranch}, got ${branch}`,
+    );
+  }
+  if (headSha !== expectation.headSha) {
+    throw new Error(
+      `repository expectation HEAD mismatch: expected ${expectation.headSha}, got ${headSha}`,
+    );
+  }
+  if (stateHash !== expectation.stateHash) {
+    throw new Error(
+      `repository expectation state mismatch: expected ${expectation.stateHash}, got ${stateHash}`,
+    );
+  }
+}
+
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
  *
@@ -3210,6 +3337,9 @@ export const InvokeArgsSchema = z.object({
   cwd: z.string().optional().describe(
     "Working directory for the CLI (defaults to Deno.cwd())",
   ),
+  repositoryExpectation: RepositoryExpectationSchema.optional().describe(
+    "All-or-none repository identity captured by caller preflight. Immediately before launch, canonical cwd must be the repository root and attachedBranch, headSha, and stateHash must still match.",
+  ),
   tags: z.record(z.string(), z.string()).optional().describe(
     "Arbitrary key-value tags for grouping/filtering invocations",
   ),
@@ -3234,6 +3364,17 @@ export const InvokeArgsSchema = z.object({
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
   ),
+}).superRefine((args, ctx) => {
+  if (
+    args.repositoryExpectation !== undefined && args.invocationId === undefined
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["invocationId"],
+      message:
+        "invocationId is required when repositoryExpectation is supplied",
+    });
+  }
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -3259,7 +3400,7 @@ type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.27.2",
+  version: "2026.07.27.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3370,6 +3511,12 @@ export const model = {
         "Add durable caller-owned invocation launch claims and create-once-or-verify terminal persistence for at-most-once provider launches under Swamp's per-model serialization. New prompt hashes use SHA-256; existing invocation records remain readable. Additive resources only; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.27.3",
+      description:
+        "Add optional repositoryExpectation to caller-owned invocation launch claims and verify it immediately before provider spawn. Additive method and resource schema change; no attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     invocationLaunchClaim: {
@@ -3425,7 +3572,7 @@ export const model = {
           context.globalArgs.defaultModel,
         );
         const requestedCwd = args.cwd || Deno.cwd();
-        const cwd = callerOwned
+        const cwd = callerOwned || args.repositoryExpectation !== undefined
           ? await canonicalCwd(requestedCwd)
           : requestedCwd;
         const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
@@ -3458,8 +3605,11 @@ export const model = {
           },
         );
 
-        const launch = () =>
-          runWithRetries(
+        const launch = async () => {
+          if (args.repositoryExpectation) {
+            await verifyRepositoryExpectation(cwd, args.repositoryExpectation);
+          }
+          return await runWithRetries(
             provider,
             cliPath,
             modelName,
@@ -3474,6 +3624,7 @@ export const model = {
             },
             context.logger,
           );
+        };
         let outcome: RunOutcome;
         if (callerOwned) {
           const claimed = await launchCallerInvocation(context, {
@@ -3482,6 +3633,7 @@ export const model = {
             provider,
             model: modelName,
             cwd,
+            repositoryExpectation: args.repositoryExpectation,
             promptHash,
             tags: normalizeTags(args.tags),
             definition: {
@@ -3601,7 +3753,7 @@ export const model = {
           context.globalArgs.defaultModel,
         );
         const requestedCwd = args.cwd || Deno.cwd();
-        const cwd = callerOwned
+        const cwd = callerOwned || args.repositoryExpectation !== undefined
           ? await canonicalCwd(requestedCwd)
           : requestedCwd;
         const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
@@ -3634,8 +3786,11 @@ export const model = {
           },
         );
 
-        const launch = () =>
-          runWithRetries(
+        const launch = async () => {
+          if (args.repositoryExpectation) {
+            await verifyRepositoryExpectation(cwd, args.repositoryExpectation);
+          }
+          return await runWithRetries(
             provider,
             cliPath,
             modelName,
@@ -3650,6 +3805,7 @@ export const model = {
             },
             context.logger,
           );
+        };
         let outcome: RunOutcome;
         if (callerOwned) {
           const claimed = await launchCallerInvocation(context, {
@@ -3658,6 +3814,7 @@ export const model = {
             provider,
             model: modelName,
             cwd,
+            repositoryExpectation: args.repositoryExpectation,
             promptHash,
             tags: normalizeTags(args.tags),
             definition: {

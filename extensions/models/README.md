@@ -106,6 +106,7 @@ Arguments:
 | `provider`      | enum     | no       | Override the default provider                 |
 | `model`         | string   | no       | Override the default model                    |
 | `cwd`           | string   | no       | Working directory for the CLI                 |
+| `repositoryExpectation` | object | no | All-or-none preflight identity: attached branch, 40-char HEAD SHA, and 64-char repository state hash |
 | `tags`          | object   | no       | Key-value tags for grouping/filtering         |
 | `wallTimeoutMs` | number   | no       | Override wall timeout in milliseconds         |
 | `idleTimeoutMs` | number   | no       | Override idle timeout independently           |
@@ -128,6 +129,20 @@ When `invocationId` is supplied, a durable claim is written before launch. Reuse
 with different execution inputs fails; consistent terminal records replay without
 launching again, while partial or inconsistent records fail closed. Omitting it
 preserves generated-UUID behavior.
+
+`repositoryExpectation` is optional and strict/all-or-none. It may only be
+supplied with a caller-owned `invocationId`; generated invocation IDs are rejected
+by both `invoke` and `invokeAndParse`. When supplied, the method canonicalizes `cwd` and, under Swamp's per-model method serialization,
+on a new launch verifies that it is the Git repository root on the expected
+attached branch and 40-character HEAD SHA, and that its 64-character state hash
+still matches. For caller-owned IDs this verification occurs after durable claim
+persistence and immediately before provider spawn; terminal replay skips it. The
+hash is factory-runtime's
+`tracked-diff-v1`: SHA-256 over length-framed tracked `git diff --binary
+--full-index HEAD --` output plus sorted untracked paths and exact file bytes.
+Detached HEADs, Git/read failures, and any mismatch fail before launch. For a
+caller-owned `invocationId`, normalized expectations are part of the durable
+claim, so changed expectations conflict and exact terminal replay does not spawn.
 
 A successful replay returns no `dataHandles`: method-result handles represent
 only artifacts persisted during that execution, and replay persists nothing.

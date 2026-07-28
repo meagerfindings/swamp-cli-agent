@@ -6,7 +6,12 @@
  * They are the ground truth for the per-provider parsing in `cli_agent.ts`.
  */
 
-import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
+import {
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+  assertThrows,
+} from "jsr:@std/assert@1";
 import {
   arbitrateSignalOutcome,
   buildBwrapArgs,
@@ -29,11 +34,14 @@ import {
   isProvider,
   launchCallerInvocation,
   listProvidersFromRegistry,
+  model,
   ModelIdSchema,
   normalizeTags,
   parseGrokModelsList,
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
+  RepositoryExpectationSchema,
+  repositoryStateHash,
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
@@ -44,6 +52,7 @@ import {
   sandboxConfigFrom,
   SIGNATURE_TABLE,
   timeoutAttribution,
+  verifyRepositoryExpectation,
   wrapWithSandbox,
 } from "./cli_agent.ts";
 
@@ -65,6 +74,156 @@ Deno.test("InvokeArgsSchema: validates idle and wall timeout overrides independe
       .success,
     false,
   );
+});
+
+Deno.test("RepositoryExpectationSchema requires complete strict constraints", () => {
+  const complete = {
+    attachedBranch: "main",
+    headSha: "a".repeat(40),
+    stateHash: "b".repeat(64),
+  };
+  assertEquals(RepositoryExpectationSchema.safeParse(complete).success, true);
+  for (const missing of ["attachedBranch", "headSha", "stateHash"] as const) {
+    const partial: Record<string, unknown> = { ...complete };
+    delete partial[missing];
+    assertEquals(RepositoryExpectationSchema.safeParse(partial).success, false);
+  }
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "x",
+      invocationId: "repository-owned",
+      repositoryExpectation: complete,
+    }).success,
+    true,
+  );
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "x",
+      repositoryExpectation: { attachedBranch: "main" },
+    }).success,
+    false,
+  );
+  assertEquals(
+    InvokeArgsSchema.parse({ prompt: "x" }).repositoryExpectation,
+    undefined,
+  );
+});
+
+Deno.test("invoke and invokeAndParse both require caller-owned IDs for repository expectations", () => {
+  const repositoryExpectation = {
+    attachedBranch: "main",
+    headSha: "a".repeat(40),
+    stateHash: "b".repeat(64),
+  };
+  for (const methodName of ["invoke", "invokeAndParse"] as const) {
+    const schema = model.methods[methodName].arguments;
+    const generatedIdCombination = schema.safeParse({
+      prompt: "x",
+      repositoryExpectation,
+    });
+    assertEquals(generatedIdCombination.success, false);
+    if (!generatedIdCombination.success) {
+      assertEquals(generatedIdCombination.error.issues[0].path, [
+        "invocationId",
+      ]);
+      assertStringIncludes(
+        generatedIdCombination.error.issues[0].message,
+        "invocationId is required",
+      );
+    }
+    assertEquals(
+      schema.safeParse({
+        prompt: "x",
+        invocationId: "repository-owned",
+        repositoryExpectation,
+      }).success,
+      true,
+    );
+  }
+});
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const output = await new Deno.Command("git", {
+    cwd,
+    args,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (!output.success) throw new Error(new TextDecoder().decode(output.stderr));
+  return new TextDecoder().decode(output.stdout).trim();
+}
+
+async function withRepository(
+  test: (
+    cwd: string,
+    expectation: { attachedBranch: string; headSha: string; stateHash: string },
+  ) => Promise<void>,
+): Promise<void> {
+  const cwd = await Deno.makeTempDir();
+  try {
+    await git(cwd, "init", "-b", "main");
+    await git(cwd, "config", "user.email", "test@example.com");
+    await git(cwd, "config", "user.name", "Test");
+    await Deno.writeTextFile(`${cwd}/tracked.txt`, "initial\n");
+    await git(cwd, "add", "tracked.txt");
+    await git(cwd, "commit", "-m", "initial");
+    await test(cwd, {
+      attachedBranch: "main",
+      headSha: await git(cwd, "rev-parse", "HEAD"),
+      stateHash: await repositoryStateHash(cwd),
+    });
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+}
+
+Deno.test("repository expectation accepts matching attached branch, HEAD, and state", async () => {
+  await withRepository(async (cwd, expectation) => {
+    await verifyRepositoryExpectation(cwd, expectation);
+  });
+});
+
+Deno.test("repository expectation rejects dirty state before launch", async () => {
+  await withRepository(async (cwd, expectation) => {
+    await Deno.writeTextFile(`${cwd}/tracked.txt`, "changed\n");
+    let launches = 0;
+    const launch = async () => {
+      await verifyRepositoryExpectation(cwd, expectation);
+      launches++;
+    };
+    await assertRejects(
+      launch,
+      Error,
+      "state mismatch",
+    );
+    assertEquals(launches, 0);
+
+    await Deno.writeTextFile(`${cwd}/tracked.txt`, "initial\n");
+    await launch();
+    assertEquals(launches, 1);
+  });
+});
+
+Deno.test("repository expectation rejects branch and HEAD mismatch before launch", async () => {
+  await withRepository(async (cwd, expectation) => {
+    for (
+      const differing of [
+        { ...expectation, attachedBranch: "other" },
+        { ...expectation, headSha: "0".repeat(40) },
+      ]
+    ) {
+      let launches = 0;
+      await assertRejects(
+        async () => {
+          await verifyRepositoryExpectation(cwd, differing);
+          launches++;
+        },
+        Error,
+        "mismatch",
+      );
+      assertEquals(launches, 0);
+    }
+  });
 });
 
 Deno.test("InvocationIdSchema: accepts workflow-safe correlation identities", () => {
@@ -145,6 +304,11 @@ async function claim(
     provider: "claude",
     model: "sonnet",
     cwd: "/tmp/repo",
+    repositoryExpectation: {
+      attachedBranch: "main",
+      headSha: "a".repeat(40),
+      stateHash: "b".repeat(64),
+    },
     promptHash: await hashPrompt("prompt"),
     tags: { a: "1", z: "2" },
     definition: {
@@ -197,10 +361,43 @@ function terminal(
   };
 }
 
-Deno.test("launch claim is durable before provider launch", async () => {
+Deno.test("launch claim remains backward compatible when repository expectation is omitted", async () => {
+  const c = await claim("invoke", { repositoryExpectation: undefined });
+  assertEquals(c.repositoryExpectation, undefined);
+});
+
+Deno.test("exact constrained replay skips the launch callback", async () => {
+  const c = await claim();
+  const stored: Stored = new Map();
+  let callbacks = 0;
+  const context = resourceContext(stored).context;
+  const first = await launchCallerInvocation(context, c, () => {
+    callbacks++;
+    return Promise.resolve("ok");
+  });
+  assertEquals(first, { replayed: false, value: "ok" });
+  stored.set("invocation-owned-1", terminal(c));
+  stored.set("transcript-owned-1", {
+    invocationId: "owned-1",
+    prompt: "prompt",
+    output: "ok",
+  });
+  assertEquals(
+    await launchCallerInvocation(context, c, () => {
+      callbacks++;
+      throw new Error("replay must not verify or launch");
+    }),
+    { replayed: true },
+  );
+  assertEquals(callbacks, 1);
+});
+
+Deno.test("launch claim is durable before expectation verification and provider launch", async () => {
   const events: string[] = [];
   const { context } = resourceContext(new Map(), events);
-  await launchCallerInvocation(context, await claim(), () => {
+  await launchCallerInvocation(context, await claim(), async () => {
+    events.push("verify");
+    await Promise.resolve();
     events.push("spawn");
     return Promise.resolve("ok");
   });
@@ -215,6 +412,52 @@ Deno.test("launch claim is durable before provider launch", async () => {
       "read:launch-claim-owned-1",
     ),
     true,
+  );
+  assertEquals(events.indexOf("verify") < events.indexOf("spawn"), true);
+});
+
+Deno.test("expectation mismatch leaves a durable partial claim without provider launch", async () => {
+  const c = await claim();
+  const stored: Stored = new Map();
+  let launches = 0;
+  const context = resourceContext(stored).context;
+
+  await assertRejects(
+    () =>
+      launchCallerInvocation(context, c, () => {
+        throw new Error("repository expectation state mismatch");
+      }),
+    Error,
+    "state mismatch",
+  );
+  assertEquals(stored.get("launch-claim-owned-1"), c);
+  assertEquals(launches, 0);
+
+  await assertRejects(
+    () =>
+      launchCallerInvocation(context, c, () => {
+        launches++;
+        return Promise.resolve("unexpected");
+      }),
+    Error,
+    "Ambiguous prior launch",
+  );
+  assertEquals(launches, 0);
+
+  await assertRejects(
+    async () =>
+      launchCallerInvocation(
+        context,
+        await claim("invoke", {
+          repositoryExpectation: {
+            ...c.repositoryExpectation,
+            stateHash: "c".repeat(64),
+          },
+        }),
+        () => Promise.resolve("unexpected"),
+      ),
+    Error,
+    "Conflicting durable resource",
   );
 });
 
@@ -300,6 +543,13 @@ Deno.test("claim conflicts fail closed for fields and operation", async () => {
   for (
     const differing of [
       await claim("invoke", { provider: "amp" }),
+      await claim("invoke", {
+        repositoryExpectation: {
+          attachedBranch: "main",
+          headSha: "a".repeat(40),
+          stateHash: "c".repeat(64),
+        },
+      }),
       await claim("invokeAndParse", { methodName: "invokeAndParse" }),
       await claim("invoke", {
         definition: {
