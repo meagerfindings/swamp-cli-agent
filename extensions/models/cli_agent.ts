@@ -3315,7 +3315,8 @@ export async function verifyRepositoryExpectation(
 /**
  * Swamp model definition for `@mgreten/cli-agent`.
  *
- * Provides four methods:
+ * Provides native usage collection plus the existing invocation/catalog methods:
+ * - `collectLocalUsage` — aggregate one local day from native client stores
  * - `invoke` — run a CLI agent and record structured results
  * - `invokeAndParse` — run a CLI agent and parse JSON from the output
  * - `listProviders` — list providers from the closed PROVIDERS registry
@@ -3398,9 +3399,695 @@ type ListModelsArgs = z.infer<typeof ListModelsArgsSchema>;
 const ListProvidersArgsSchema = z.object({});
 type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
 
+const DailyProviderEnum = z.enum(["claude", "amp", "codex"]);
+const DailyUsageCountsSchema = z.object({
+  provider: DailyProviderEnum,
+  sessionCount: z.number().int().nonnegative(),
+  eventCount: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative(),
+  cacheWriteTokens: z.number().int().nonnegative(),
+  reasoningTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+});
+/** Token and activity totals attributed to one native CLI provider. */
+export type DailyUsageCounts = z.infer<typeof DailyUsageCountsSchema>;
+
+/** Persisted provider and combined usage totals for one local calendar day. */
+export const LocalUsageSchema = z.object({
+  date: z.string(),
+  timeZone: z.string(),
+  measuredAt: z.string(),
+  providers: z.tuple([
+    DailyUsageCountsSchema.extend({ provider: z.literal("claude") }),
+    DailyUsageCountsSchema.extend({ provider: z.literal("amp") }),
+    DailyUsageCountsSchema.extend({ provider: z.literal("codex") }),
+  ]),
+  combined: DailyUsageCountsSchema.omit({ provider: true }),
+});
+
+/** Optional date and IANA timezone selection for local usage collection. */
+export const CollectLocalUsageArgsSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, {
+    message: "date must use YYYY-MM-DD format (for example, 2026-07-31)",
+  }).optional(),
+  timeZone: z.string().min(1, "timeZone must be a non-empty IANA name")
+    .optional(),
+});
+type CollectLocalUsageArgs = z.infer<typeof CollectLocalUsageArgsSchema>;
+
+type JsonRecord = Record<string, unknown>;
+type UsageCounters = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning: number;
+};
+const USAGE_NUMBER_KEYS = [
+  "sessionCount",
+  "eventCount",
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "reasoningTokens",
+  "totalTokens",
+] as const;
+
+function emptyDailyUsage(
+  provider: "claude" | "amp" | "codex",
+): DailyUsageCounts {
+  return {
+    provider,
+    sessionCount: 0,
+    eventCount: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function record(value: unknown): JsonRecord | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonRecord
+    : undefined;
+}
+
+function validCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function timestampMillis(value: unknown): number | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const millis = new Date(value).valueOf();
+  return Number.isNaN(millis) ? undefined : millis;
+}
+
+function optionalCount(
+  source: JsonRecord,
+  keys: string[],
+): { valid: boolean; value: number } {
+  for (const key of keys) {
+    if (!(key in source)) continue;
+    const value = validCount(source[key]);
+    return value === undefined
+      ? { valid: false, value: 0 }
+      : { valid: true, value };
+  }
+  return { valid: true, value: 0 };
+}
+
+function usageCounters(
+  source: JsonRecord,
+  inputKey: string,
+  outputKey: string,
+  cacheReadKeys: string[],
+  cacheWriteKeys: string[],
+  reasoningKeys: string[],
+): UsageCounters | undefined {
+  const input = validCount(source[inputKey]);
+  const output = validCount(source[outputKey]);
+  const cacheRead = optionalCount(source, cacheReadKeys);
+  const cacheWrite = optionalCount(source, cacheWriteKeys);
+  const reasoning = optionalCount(source, reasoningKeys);
+  if (
+    input === undefined || output === undefined || !cacheRead.valid ||
+    !cacheWrite.valid || !reasoning.valid
+  ) return undefined;
+  return {
+    input,
+    output,
+    cacheRead: cacheRead.value,
+    cacheWrite: cacheWrite.value,
+    reasoning: reasoning.value,
+  };
+}
+
+/** Convert an instant to its local calendar date without depending on host TZ. */
+export function dateInTimeZone(
+  timestamp: unknown,
+  timeZone: string,
+): string | undefined {
+  if (typeof timestamp !== "string" && typeof timestamp !== "number") {
+    return undefined;
+  }
+  const instant = new Date(timestamp);
+  if (Number.isNaN(instant.valueOf())) return undefined;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((entry) => entry.type === type)?.value;
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+/** Resolve and validate the local calendar day requested by the caller. */
+export function resolveLocalUsageDay(
+  args: CollectLocalUsageArgs,
+  now = new Date(),
+): { date: string; timeZone: string } {
+  const timeZone = args.timeZone ??
+    Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(now);
+  } catch {
+    throw new Error(
+      `Invalid timeZone '${timeZone}'; provide an IANA name such as America/Denver`,
+    );
+  }
+  const date = args.date ?? dateInTimeZone(now.toISOString(), timeZone)!;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!match) {
+    throw new Error("Invalid date; use YYYY-MM-DD (for example, 2026-07-31)");
+  }
+  const normalized = new Date(Date.UTC(+match[1], +match[2] - 1, +match[3]))
+    .toISOString().slice(0, 10);
+  if (normalized !== date) {
+    throw new Error(
+      `Invalid calendar date '${date}'; use a real YYYY-MM-DD date`,
+    );
+  }
+  return { date, timeZone };
+}
+
+/** Parse Claude transcript records and globally deduplicate assistant messages. */
+export function aggregateClaudeUsage(
+  records: unknown[],
+  date: string,
+  timeZone: string,
+): DailyUsageCounts {
+  const latest = new Map<string, {
+    counters: UsageCounters;
+    order: number;
+    sessionId?: string;
+    timestamp: number;
+  }>();
+  records.forEach((value, order) => {
+    const row = record(value);
+    const message = record(row?.message);
+    const usage = record(message?.usage);
+    const id = row?.requestId ?? row?.request_id ?? message?.id;
+    if (
+      !row || !message || !usage || message.role !== "assistant" ||
+      typeof id !== "string"
+    ) return;
+    const timestamp = row.timestamp ?? message.timestamp;
+    const millis = timestampMillis(timestamp);
+    const direct = usageCounters(
+      usage,
+      "input_tokens",
+      "output_tokens",
+      ["cache_read_input_tokens"],
+      ["cache_creation_input_tokens"],
+      ["reasoning_output_tokens", "reasoning_tokens"],
+    );
+    if (millis === undefined || !direct) return;
+    const counters = {
+      ...direct,
+      input: direct.input + direct.cacheRead + direct.cacheWrite,
+    };
+    const rawSessionId = row.sessionId ?? row.session_id;
+    const sessionId = typeof rawSessionId === "string"
+      ? rawSessionId
+      : undefined;
+    const prior = latest.get(id);
+    if (
+      !prior || millis > prior.timestamp ||
+      millis === prior.timestamp && order > prior.order
+    ) {
+      latest.set(id, { counters, order, sessionId, timestamp: millis });
+    }
+  });
+  const result = emptyDailyUsage("claude");
+  const sessions = new Set<string>();
+  for (const event of latest.values()) {
+    if (dateInTimeZone(event.timestamp, timeZone) !== date) continue;
+    const { counters } = event;
+    result.eventCount++;
+    result.inputTokens += counters.input;
+    result.outputTokens += counters.output;
+    result.cacheReadTokens += counters.cacheRead;
+    result.cacheWriteTokens += counters.cacheWrite;
+    result.reasoningTokens += counters.reasoning;
+    result.totalTokens += counters.input + counters.output;
+    if (event.sessionId) sessions.add(event.sessionId);
+  }
+  result.sessionCount = sessions.size;
+  return result;
+}
+
+type CodexOptionalPresence = {
+  cacheRead: boolean;
+  cacheWrite: boolean;
+  reasoning: boolean;
+};
+type CodexSnapshot = UsageCounters & {
+  order: number;
+  present: CodexOptionalPresence;
+  timestamp: number;
+};
+
+function codexSnapshot(
+  value: unknown,
+  order: number,
+): CodexSnapshot | undefined {
+  const row = record(value);
+  const payload = record(row?.payload);
+  const info = record(payload?.info);
+  const usage = record(info?.total_token_usage);
+  if (payload?.type !== "token_count" || !usage) return undefined;
+  const counters = usageCounters(
+    usage,
+    "input_tokens",
+    "output_tokens",
+    ["cached_input_tokens"],
+    ["cache_write_input_tokens", "cache_write_tokens"],
+    ["reasoning_output_tokens", "reasoning_tokens"],
+  );
+  const timestamp = timestampMillis(row?.timestamp ?? payload.timestamp);
+  const present = {
+    cacheRead: "cached_input_tokens" in usage,
+    cacheWrite: "cache_write_input_tokens" in usage ||
+      "cache_write_tokens" in usage,
+    reasoning: "reasoning_output_tokens" in usage ||
+      "reasoning_tokens" in usage,
+  };
+  return counters &&
+      counters.cacheRead + counters.cacheWrite <= counters.input &&
+      timestamp !== undefined
+    ? { ...counters, timestamp, order, present }
+    : undefined;
+}
+
+/** Delta cumulative Codex token snapshots across the selected local day. */
+export function aggregateCodexUsage(
+  sessions: unknown[][],
+  date: string,
+  timeZone: string,
+): DailyUsageCounts {
+  const result = emptyDailyUsage("codex");
+  for (const rows of sessions) {
+    const snapshots = rows.map(codexSnapshot).filter((
+      snapshot,
+    ): snapshot is CodexSnapshot => snapshot !== undefined).sort((
+      left,
+      right,
+    ) => left.timestamp - right.timestamp || left.order - right.order);
+    let prior: CodexSnapshot | undefined;
+    let contributed = false;
+    for (const current of snapshots) {
+      const localDate = dateInTimeZone(current.timestamp, timeZone);
+      if (!localDate) continue;
+      if (localDate > date) break;
+      if (localDate < date) {
+        prior = current;
+        continue;
+      }
+      const optionalDecrease = (key: keyof CodexOptionalPresence) =>
+        prior?.present[key] === true && current.present[key] &&
+        current[key] < prior[key];
+      const reset = prior !== undefined && (
+        current.input < prior.input || current.output < prior.output ||
+        optionalDecrease("cacheRead") || optionalDecrease("cacheWrite") ||
+        optionalDecrease("reasoning")
+      );
+      const coreDelta = (key: "input" | "output") =>
+        !prior || reset ? current[key] : current[key] - prior[key];
+      const optionalDelta = (key: keyof CodexOptionalPresence) => {
+        if (!current.present[key]) return 0;
+        if (!prior || reset) return current[key];
+        return prior.present[key] ? current[key] - prior[key] : 0;
+      };
+      const input = coreDelta("input");
+      const output = coreDelta("output");
+      const cacheRead = optionalDelta("cacheRead");
+      const cacheWrite = optionalDelta("cacheWrite");
+      const reasoning = optionalDelta("reasoning");
+      if (cacheRead + cacheWrite > input) continue;
+      if (input > 0 || output > 0) {
+        result.eventCount++;
+        contributed = true;
+        result.inputTokens += input;
+        result.outputTokens += output;
+        result.cacheReadTokens += cacheRead;
+        result.cacheWriteTokens += cacheWrite;
+        result.reasoningTokens += reasoning;
+        result.totalTokens += input + output;
+      }
+      prior = current;
+    }
+    if (contributed) result.sessionCount++;
+  }
+  return result;
+}
+
+function visitObjects(
+  value: unknown,
+  visitor: (value: JsonRecord) => void,
+): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) visitObjects(entry, visitor);
+    return;
+  }
+  const object = record(value);
+  if (!object) return;
+  visitor(object);
+  for (const child of Object.values(object)) visitObjects(child, visitor);
+}
+
+/** Parse Amp exports and globally deduplicate native protocol messages. */
+export function aggregateAmpUsage(
+  threads: Array<{ threadId: string; export: unknown }>,
+  date: string,
+  timeZone: string,
+): DailyUsageCounts {
+  const events = new Map<string, {
+    counters: UsageCounters;
+    tiebreak: string;
+    timestamp: number;
+    version: number;
+  }>();
+  const threadIds = new Set<string>();
+  for (const thread of threads) {
+    visitObjects(thread.export, (message) => {
+      const usage = record(message.usage);
+      const id = message.protocolMessageID ?? message.protocolMessageId ??
+        message.messageId ?? message.id;
+      const role = message.role ?? message.type;
+      if (!usage || role !== "assistant" || typeof id !== "string") return;
+      if (dateInTimeZone(usage.timestamp, timeZone) !== date) return;
+      const counters = usageCounters(
+        usage,
+        "totalInputTokens",
+        "outputTokens",
+        ["cacheReadInputTokens", "cacheReadTokens"],
+        ["cacheCreationInputTokens", "cacheWriteTokens"],
+        ["reasoningTokens"],
+      );
+      if (
+        !counters || counters.cacheRead + counters.cacheWrite > counters.input
+      ) return;
+      const rawVersion = message.protocolMessageVersion ??
+        message.messageVersion;
+      const version = rawVersion === undefined ? 0 : validCount(rawVersion);
+      const timestamp = timestampMillis(usage.timestamp);
+      if (version === undefined || timestamp === undefined) return;
+      threadIds.add(thread.threadId);
+      const tiebreak = JSON.stringify([
+        counters.input,
+        counters.output,
+        counters.cacheRead,
+        counters.cacheWrite,
+        counters.reasoning,
+      ]);
+      const prior = events.get(id);
+      if (
+        !prior || version > prior.version ||
+        version === prior.version && timestamp > prior.timestamp ||
+        version === prior.version && timestamp === prior.timestamp &&
+          tiebreak > prior.tiebreak
+      ) events.set(id, { counters, tiebreak, timestamp, version });
+    });
+  }
+  const result = emptyDailyUsage("amp");
+  for (const { counters } of events.values()) {
+    result.eventCount++;
+    result.inputTokens += counters.input;
+    result.outputTokens += counters.output;
+    result.cacheReadTokens += counters.cacheRead;
+    result.cacheWriteTokens += counters.cacheWrite;
+    result.reasoningTokens += counters.reasoning;
+    result.totalTokens += counters.input + counters.output;
+  }
+  result.sessionCount = threadIds.size;
+  return result;
+}
+
+/** Sum provider counters while preserving each provider's separate totals. */
+export function combineDailyUsage(
+  providers: DailyUsageCounts[],
+): Omit<DailyUsageCounts, "provider"> {
+  const combined = Object.fromEntries(
+    USAGE_NUMBER_KEYS.map((key) => [key, 0]),
+  ) as Omit<DailyUsageCounts, "provider">;
+  for (const provider of providers) {
+    for (const key of USAGE_NUMBER_KEYS) combined[key] += provider[key];
+  }
+  return combined;
+}
+
+/** Visit valid JSONL values while allowing malformed lines to be skipped. */
+export function scanJsonLines(
+  text: string,
+  visitor: (value: unknown) => void,
+): void {
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      visitor(JSON.parse(line));
+    } catch {
+      /* malformed individual native records are intentionally skipped */
+    }
+  }
+}
+
+async function jsonlFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  async function walk(path: string): Promise<void> {
+    let entries: Deno.DirEntry[];
+    try {
+      entries = [];
+      for await (const entry of Deno.readDir(path)) entries.push(entry);
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const child = `${path}/${entry.name}`;
+      if (entry.isDirectory) await walk(child);
+      else if (entry.isFile && entry.name.endsWith(".jsonl")) files.push(child);
+    }
+  }
+  await walk(root);
+  return files.sort();
+}
+
+function projectClaudeRecord(value: unknown): unknown | undefined {
+  const row = record(value);
+  const message = record(row?.message);
+  const usage = record(message?.usage);
+  if (!row || !message || !usage || message.role !== "assistant") {
+    return undefined;
+  }
+  const projectedUsage: JsonRecord = {
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+  };
+  for (
+    const key of [
+      "cache_read_input_tokens",
+      "cache_creation_input_tokens",
+      "reasoning_output_tokens",
+      "reasoning_tokens",
+    ]
+  ) {
+    if (key in usage) projectedUsage[key] = usage[key];
+  }
+  return {
+    timestamp: row.timestamp ?? message.timestamp,
+    sessionId: row.sessionId ?? row.session_id,
+    requestId: row.requestId ?? row.request_id,
+    message: {
+      id: message.id,
+      role: message.role,
+      usage: projectedUsage,
+    },
+  };
+}
+
+async function aggregateClaudeUsageFiles(
+  paths: string[],
+  date: string,
+  timeZone: string,
+): Promise<DailyUsageCounts> {
+  const projected: unknown[] = [];
+  for (const path of paths) {
+    scanJsonLines(await Deno.readTextFile(path), (value) => {
+      const row = projectClaudeRecord(value);
+      if (row) projected.push(row);
+    });
+  }
+  return aggregateClaudeUsage(projected, date, timeZone);
+}
+
+function addUsage(target: DailyUsageCounts, source: DailyUsageCounts): void {
+  for (const key of USAGE_NUMBER_KEYS) target[key] += source[key];
+}
+
+async function aggregateCodexUsageFiles(
+  paths: string[],
+  date: string,
+  timeZone: string,
+): Promise<DailyUsageCounts> {
+  const result = emptyDailyUsage("codex");
+  for (const path of paths) {
+    const snapshots: unknown[] = [];
+    scanJsonLines(await Deno.readTextFile(path), (value) => {
+      if (codexSnapshot(value, snapshots.length)) snapshots.push(value);
+    });
+    addUsage(result, aggregateCodexUsage([snapshots], date, timeZone));
+  }
+  return result;
+}
+
+const AMP_USAGE_TIMEOUT_MS = 30_000;
+async function runAmpUsageCommand(
+  ampPath: string,
+  args: string[],
+  operation: string,
+): Promise<string> {
+  let output: Deno.CommandOutput;
+  try {
+    output = await new Deno.Command(ampPath, {
+      args,
+      stdout: "piped",
+      stderr: "piped",
+      signal: AbortSignal.timeout(AMP_USAGE_TIMEOUT_MS),
+    }).output();
+  } catch (error) {
+    const detail =
+      error instanceof DOMException && error.name === "TimeoutError"
+        ? `timed out after ${AMP_USAGE_TIMEOUT_MS}ms`
+        : error instanceof Error
+        ? error.message
+        : String(error);
+    throw new Error(
+      `Amp ${operation} failed: ${detail}; verify ampPath and Amp authentication`,
+    );
+  }
+  if (!output.success) {
+    throw new Error(
+      `Amp ${operation} failed with exit ${output.code}; verify Amp authentication and retry`,
+    );
+  }
+  return new TextDecoder().decode(output.stdout);
+}
+
+function ampListRows(value: unknown): JsonRecord[] {
+  if (Array.isArray(value)) {
+    return value.map(record).filter((row): row is JsonRecord =>
+      row !== undefined
+    );
+  }
+  const object = record(value);
+  for (const key of ["threads", "items", "data"]) {
+    if (Array.isArray(object?.[key])) {
+      return object[key].map(record).filter((row): row is JsonRecord =>
+        row !== undefined
+      );
+    }
+  }
+  throw new Error(
+    "Amp threads list returned an unsupported JSON shape; update Amp or cli-agent",
+  );
+}
+
+/** Select unique Amp threads that may contain events from the target local day. */
+export function selectAmpCandidateIds(
+  rows: JsonRecord[],
+  date: string,
+  timeZone: string,
+  seen = new Set<string>(),
+): string[] {
+  const selected: string[] = [];
+  for (const row of rows) {
+    const id = row.id ?? row.threadId ?? row.threadID;
+    if (typeof id !== "string") {
+      throw new Error(
+        "Amp thread listing omitted a thread ID; update Amp or cli-agent",
+      );
+    }
+    if (seen.has(id)) continue;
+    const updated = row.updated ?? row.updatedAt ?? row.updated_at ??
+      row.lastModified ?? row.lastModifiedAt;
+    const updatedDate = dateInTimeZone(updated, timeZone);
+    if (updatedDate === undefined || updatedDate >= date) {
+      seen.add(id);
+      selected.push(id);
+    }
+  }
+  return selected;
+}
+
+type AmpUsageRunner = (args: string[], operation: string) => Promise<string>;
+
+/** List and export Amp threads that may contain usage for a local day. */
+export async function collectAmpExports(
+  ampPath: string,
+  date: string,
+  timeZone: string,
+  injectedRunner?: AmpUsageRunner,
+): Promise<Array<{ threadId: string; export: unknown }>> {
+  const runner = injectedRunner ??
+    ((args, operation) => runAmpUsageCommand(ampPath, args, operation));
+  const limit = 100;
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0;; offset += limit) {
+    const stdout = await runner([
+      "threads",
+      "list",
+      "--include-archived",
+      "--json",
+      "--limit",
+      String(limit),
+      "--offset",
+      String(offset),
+    ], "thread listing");
+    let rows: JsonRecord[];
+    try {
+      rows = ampListRows(JSON.parse(stdout));
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(
+          "Amp thread listing returned invalid JSON; update Amp or retry",
+        );
+      }
+      throw error;
+    }
+    candidates.push(...selectAmpCandidateIds(rows, date, timeZone, seen));
+    if (rows.length < limit) break;
+  }
+  const exports: Array<{ threadId: string; export: unknown }> = [];
+  for (const threadId of candidates) {
+    const stdout = await runner(
+      ["threads", "export", threadId],
+      "thread export",
+    );
+    try {
+      exports.push({ threadId, export: JSON.parse(stdout) });
+    } catch {
+      throw new Error(
+        "Amp thread export returned invalid JSON; update Amp or retry",
+      );
+    }
+  }
+  return exports;
+}
+
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.27.3",
+  version: "2026.07.31.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -3517,8 +4204,21 @@ export const model = {
         "Add optional repositoryExpectation to caller-owned invocation launch claims and verify it immediately before provider spawn. Additive method and resource schema change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.07.31.1",
+      description:
+        "Add read-only native daily token usage collection for Claude Code, Amp, and Codex CLI. No global argument schema changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
+    localUsage: {
+      description:
+        "Daily native-client token usage aggregated from local Claude Code, Amp, and Codex sessions",
+      schema: LocalUsageSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 400,
+    },
     invocationLaunchClaim: {
       description:
         "Durable pre-spawn identity claim for a caller-owned invocationId",
@@ -3555,6 +4255,69 @@ export const model = {
     },
   },
   methods: {
+    collectLocalUsage: {
+      description:
+        "Aggregate one local calendar day of native Claude Code, Amp, and Codex CLI token usage without reading cli-agent invocation resources",
+      arguments: CollectLocalUsageArgsSchema,
+      execute: async (
+        args: CollectLocalUsageArgs,
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const { date, timeZone } = resolveLocalUsageDay(args);
+        context.logger.info(
+          "Collecting native local usage for {date} in {timeZone}",
+          {
+            date,
+            timeZone,
+          },
+        );
+
+        const home = Deno.env.get("HOME");
+        if (!home) {
+          throw new Error(
+            "Cannot collect local usage because HOME is not set; set HOME to the native clients' home directory",
+          );
+        }
+
+        // Read native stores only. In particular, do not read cli-agent's
+        // invocation resources: sessions launched by cli-agent are already in
+        // these provider-native stores and summing both would double-count.
+        const claudePaths = await jsonlFiles(`${home}/.claude/projects`);
+        const codexPaths = await jsonlFiles(`${home}/.codex/sessions`);
+        const ampExports = await collectAmpExports(
+          context.globalArgs.ampPath,
+          date,
+          timeZone,
+        );
+        const providers = [
+          await aggregateClaudeUsageFiles(claudePaths, date, timeZone),
+          aggregateAmpUsage(ampExports, date, timeZone),
+          await aggregateCodexUsageFiles(codexPaths, date, timeZone),
+        ] as const;
+        const usage = LocalUsageSchema.parse({
+          date,
+          timeZone,
+          measuredAt: new Date().toISOString(),
+          providers,
+          combined: combineDailyUsage([...providers]),
+        });
+        const handle = await context.writeResource(
+          "localUsage",
+          `local-usage-${date}`,
+          usage,
+        );
+        context.logger.info(
+          "Completed native local usage collection for {date} with {sessions} sessions and {events} events",
+          {
+            date,
+            sessions: usage.combined.sessionCount,
+            events: usage.combined.eventCount,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
     invoke: {
       description:
         "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok, pi) with a prompt and record structured results",

@@ -13,6 +13,9 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  aggregateAmpUsage,
+  aggregateClaudeUsage,
+  aggregateCodexUsage,
   arbitrateSignalOutcome,
   buildBwrapArgs,
   buildClaudeCommand,
@@ -20,6 +23,9 @@ import {
   buildPiCommand,
   canonicalCwd,
   classifyFailure,
+  combineDailyUsage,
+  collectAmpExports,
+  CollectLocalUsageArgsSchema,
   createOnceOrVerify,
   extractError,
   extractTextFromOutput,
@@ -42,6 +48,7 @@ import {
   PROVIDERS,
   RepositoryExpectationSchema,
   repositoryStateHash,
+  resolveLocalUsageDay,
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
@@ -50,11 +57,330 @@ import {
   SANDBOX_PROFILE_FILENAME,
   SANDBOX_STRICT_PROFILE_FILENAME,
   sandboxConfigFrom,
+  scanJsonLines,
+  selectAmpCandidateIds,
   SIGNATURE_TABLE,
   timeoutAttribution,
   verifyRepositoryExpectation,
   wrapWithSandbox,
 } from "./cli_agent.ts";
+
+Deno.test("local usage: timezone filtering and date validation", () => {
+  assertEquals(
+    aggregateClaudeUsage([{
+      timestamp: "2026-08-01T05:30:00Z",
+      sessionId: "session-a",
+      message: {
+        id: "message-a",
+        role: "assistant",
+        usage: { input_tokens: 2, output_tokens: 3 },
+      },
+    }], "2026-07-31", "America/Denver").eventCount,
+    1,
+  );
+  assertThrows(
+    () => resolveLocalUsageDay({ date: "2026-02-30", timeZone: "UTC" }),
+    Error,
+    "Invalid calendar date",
+  );
+  assertThrows(
+    () => resolveLocalUsageDay({ timeZone: "Not/AZone" }),
+    Error,
+    "Invalid timeZone",
+  );
+  assertEquals(CollectLocalUsageArgsSchema.safeParse({ date: "07/31/2026" }).success, false);
+});
+
+Deno.test("local usage: Claude globally deduplicates latest message and folds cache into processed input", () => {
+  const message = (timestamp: string, input_tokens: number) => ({
+    timestamp,
+    sessionId: "session-a",
+    message: {
+      id: "message-a",
+      role: "assistant",
+      usage: {
+        input_tokens,
+        cache_read_input_tokens: 7,
+        cache_creation_input_tokens: 11,
+        output_tokens: 5,
+      },
+    },
+  });
+  const usage = aggregateClaudeUsage([
+    message("2026-07-31T12:00:00Z", 2),
+    message("2026-07-31T12:01:00Z", 3),
+    { malformed: true },
+  ], "2026-07-31", "UTC");
+  assertEquals(usage.sessionCount, 1);
+  assertEquals(usage.eventCount, 1);
+  assertEquals(usage.inputTokens, 21);
+  assertEquals(usage.totalTokens, 26);
+  assertEquals(usage.totalTokens, usage.inputTokens + usage.outputTokens);
+  assertEquals(usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens, true);
+});
+
+Deno.test("local usage: Claude assigns a request to its latest valid completion", () => {
+  const row = (timestamp: unknown, input: unknown) => ({
+    timestamp,
+    sessionId: "session-a",
+    requestId: "request-a",
+    message: {
+      id: "message-a",
+      role: "assistant",
+      usage: { input_tokens: input, output_tokens: 3 },
+    },
+  });
+  const records = [
+    row("2026-07-31T23:59:00Z", 2),
+    row("2026-08-01T00:01:00Z", 5),
+    row(null, 999),
+    row("2026-08-01T00:02:00Z", "bad"),
+  ];
+  assertEquals(aggregateClaudeUsage(records, "2026-07-31", "UTC").eventCount, 0);
+  const usage = aggregateClaudeUsage(records, "2026-08-01", "UTC");
+  assertEquals(usage.eventCount, 1);
+  assertEquals(usage.inputTokens, 5);
+  assertEquals(usage.totalTokens, 8);
+});
+
+Deno.test("local usage: Codex deltas cumulative snapshots across midnight", () => {
+  const snapshot = (
+    timestamp: string,
+    input: number,
+    cached: number,
+    output: number,
+    reasoning: number,
+    cacheWrite: number,
+  ) => ({
+    timestamp,
+    payload: {
+      type: "token_count",
+      info: { total_token_usage: {
+        input_tokens: input,
+        cached_input_tokens: cached,
+        cache_write_input_tokens: cacheWrite,
+        output_tokens: output,
+        reasoning_output_tokens: reasoning,
+        total_tokens: input + output,
+      } },
+    },
+  });
+  const usage = aggregateCodexUsage([[
+    snapshot("2026-07-30T23:00:00Z", 100, 30, 20, 5, 4),
+    snapshot("2026-07-31T10:00:00Z", 150, 40, 30, 8, 6),
+    snapshot("2026-07-31T10:30:00Z", 150, 40, 30, 8, 6),
+    snapshot("2026-07-31T11:00:00Z", 210, 70, 50, 15, 11),
+    snapshot("2026-08-01T11:00:00Z", 300, 90, 70, 20, 14),
+  ]], "2026-07-31", "UTC");
+  assertEquals(usage.sessionCount, 1);
+  assertEquals(usage.eventCount, 2);
+  assertEquals(usage.inputTokens, 110);
+  assertEquals(usage.outputTokens, 30);
+  assertEquals(usage.cacheReadTokens, 40);
+  assertEquals(usage.cacheWriteTokens, 7);
+  assertEquals(usage.reasoningTokens, 10);
+  assertEquals(usage.totalTokens, 140);
+  assertEquals(usage.totalTokens, usage.inputTokens + usage.outputTokens);
+});
+
+Deno.test("local usage: Codex handles resets and skips malformed baselines", () => {
+  const snapshot = (timestamp: string, input: unknown, output: number, cached = 0) => ({
+    timestamp,
+    payload: {
+      type: "token_count",
+      info: { total_token_usage: {
+        input_tokens: input,
+        cached_input_tokens: cached,
+        output_tokens: output,
+      } },
+    },
+  });
+  const usage = aggregateCodexUsage([[
+    snapshot("2026-07-30T23:00:00Z", 100, 20, 30),
+    snapshot("2026-07-31T01:00:00Z", 120, 25, 35),
+    snapshot("2026-07-31T02:00:00Z", "bad", 999),
+    snapshot("2026-07-31T03:00:00Z", 10, 2, 2),
+    snapshot("2026-07-31T04:00:00Z", 15, 3, 3),
+  ]], "2026-07-31", "UTC");
+  assertEquals(usage.sessionCount, 1);
+  assertEquals(usage.eventCount, 3);
+  assertEquals(usage.inputTokens, 35);
+  assertEquals(usage.outputTokens, 8);
+  assertEquals(usage.cacheReadTokens, 8);
+  assertEquals(usage.totalTokens, 43);
+
+  const zero = aggregateCodexUsage([[
+    snapshot("2026-07-30T23:00:00Z", 100, 20),
+    snapshot("2026-07-31T01:00:00Z", 100, 20),
+  ]], "2026-07-31", "UTC");
+  assertEquals(zero.sessionCount, 0);
+  assertEquals(zero.eventCount, 0);
+});
+
+Deno.test("local usage: Codex optional counters cannot fake resets or exceed input deltas", () => {
+  const row = (timestamp: unknown, usage: Record<string, unknown>) => ({
+    timestamp,
+    payload: { type: "token_count", info: { total_token_usage: usage } },
+  });
+  const optionalDisappears = aggregateCodexUsage([[
+    row("2026-07-30T23:00:00Z", {
+      input_tokens: 100,
+      output_tokens: 20,
+      cached_input_tokens: 20,
+      reasoning_output_tokens: 5,
+    }),
+    row("2026-07-31T01:00:00Z", { input_tokens: 110, output_tokens: 22 }),
+  ]], "2026-07-31", "UTC");
+  assertEquals(optionalDisappears.inputTokens, 10);
+  assertEquals(optionalDisappears.outputTokens, 2);
+  assertEquals(optionalDisappears.cacheReadTokens, 0);
+
+  const inconsistent = aggregateCodexUsage([[
+    row("2026-07-30T23:00:00Z", {
+      input_tokens: 100,
+      output_tokens: 20,
+      cached_input_tokens: 0,
+    }),
+    row("2026-07-31T01:00:00Z", {
+      input_tokens: 105,
+      output_tokens: 22,
+      cached_input_tokens: 10,
+    }),
+    row(null, { input_tokens: 999, output_tokens: 999 }),
+    row("2026-07-31T02:00:00Z", {
+      input_tokens: 120,
+      output_tokens: 25,
+      cached_input_tokens: 12,
+    }),
+  ]], "2026-07-31", "UTC");
+  assertEquals(inconsistent.eventCount, 1);
+  assertEquals(inconsistent.inputTokens, 20);
+  assertEquals(inconsistent.outputTokens, 5);
+  assertEquals(inconsistent.cacheReadTokens, 12);
+  assertEquals(inconsistent.totalTokens, 25);
+  assertEquals(inconsistent.cacheReadTokens <= inconsistent.inputTokens, true);
+});
+
+Deno.test("local usage: Amp dedup is versioned, deterministic, and counts sessions", () => {
+  const assistant = (
+    protocolMessageID: string,
+    protocolMessageVersion: number,
+    totalInputTokens: number,
+  ) => ({
+    role: "assistant",
+    protocolMessageID,
+    protocolMessageVersion,
+    usage: {
+      timestamp: "2026-07-31T15:00:00Z",
+      totalInputTokens,
+      outputTokens: 4,
+      cacheReadInputTokens: 5,
+      cacheCreationInputTokens: 2,
+      reasoningTokens: 3,
+    },
+  });
+  const threads = [
+    { threadId: "thread-a", export: { messages: [assistant("protocol-a", 1, 10)] } },
+    {
+      threadId: "thread-b",
+      export: { messages: [assistant("protocol-a", 2, 12), assistant("protocol-b", 1, 20)] },
+    },
+  ];
+  const usage = aggregateAmpUsage(threads, "2026-07-31", "UTC");
+  assertEquals(usage.sessionCount, 2);
+  assertEquals(usage.eventCount, 2);
+  assertEquals(usage.inputTokens, 32);
+  assertEquals(usage.outputTokens, 8);
+  assertEquals(usage.cacheReadTokens, 10);
+  assertEquals(usage.cacheWriteTokens, 4);
+  assertEquals(usage.totalTokens, 40);
+  assertEquals(
+    aggregateAmpUsage([...threads].reverse(), "2026-07-31", "UTC"),
+    usage,
+  );
+  const malformedHigherVersion = {
+    ...assistant("protocol-a", 3, 99),
+    protocolMessageVersion: "bad",
+  };
+  assertEquals(
+    aggregateAmpUsage([{
+      threadId: "thread-a",
+      export: { messages: [assistant("protocol-a", 2, 12), malformedHigherVersion] },
+    }], "2026-07-31", "UTC").inputTokens,
+    12,
+  );
+  assertEquals(usage.totalTokens, usage.inputTokens + usage.outputTokens);
+  assertEquals(usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens, true);
+});
+
+Deno.test("local usage: JSONL scanning skips malformed and continues", () => {
+  const values: unknown[] = [];
+  scanJsonLines('\n{"valid":1}\nnot-json\n{"valid":2}\n', (value) => values.push(value));
+  assertEquals(values, [{ valid: 1 }, { valid: 2 }]);
+});
+
+Deno.test("local usage: Amp candidates honor real updated field and timezone", () => {
+  const seen = new Set<string>();
+  assertEquals(selectAmpCandidateIds([
+    { id: "old", updated: "2026-07-31T05:59:59Z" },
+    { id: "today", updated: "2026-07-31T06:00:00Z" },
+    { id: "later", updated: "2026-08-01T06:00:00Z" },
+    { id: "unknown" },
+  ], "2026-07-31", "America/Denver", seen), ["today", "later", "unknown"]);
+  assertEquals(selectAmpCandidateIds([
+    { id: "today", updated: "2026-07-31T12:00:00Z" },
+  ], "2026-07-31", "America/Denver", seen), []);
+  assertEquals(selectAmpCandidateIds([
+    { id: "moves", updated: "2026-07-31T05:00:00Z" },
+    { id: "moves", updated: "2026-07-31T07:00:00Z" },
+  ], "2026-07-31", "America/Denver"), ["moves"]);
+});
+
+Deno.test("local usage: Amp pagination deduplicates exports", async () => {
+  const calls: string[][] = [];
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    id: `thread-${index}`,
+    updated: "2026-07-31T12:00:00Z",
+  }));
+  const runner = (args: string[]) => {
+    calls.push(args);
+    if (args[1] === "list") {
+      const offset = args.at(-1);
+      return Promise.resolve(JSON.stringify(offset === "0" ? firstPage : [firstPage[0]]));
+    }
+    return Promise.resolve(JSON.stringify({ messages: [] }));
+  };
+  const exports = await collectAmpExports("amp", "2026-07-31", "UTC", runner);
+  assertEquals(exports.length, 100);
+  assertEquals(calls.filter((args) => args[1] === "list").length, 2);
+  assertEquals(calls.filter((args) => args[1] === "export").length, 100);
+});
+
+Deno.test("local usage: combined totals are elementwise provider sums", () => {
+  const providers = [
+    aggregateClaudeUsage([], "2026-07-31", "UTC"),
+    aggregateAmpUsage([], "2026-07-31", "UTC"),
+    aggregateCodexUsage([], "2026-07-31", "UTC"),
+  ];
+  providers[0].sessionCount = 1;
+  providers[0].inputTokens = 10;
+  providers[0].outputTokens = 1;
+  providers[0].totalTokens = 11;
+  providers[1].sessionCount = 2;
+  providers[1].inputTokens = 20;
+  providers[1].outputTokens = 2;
+  providers[1].totalTokens = 22;
+  providers[2].sessionCount = 3;
+  providers[2].inputTokens = 30;
+  providers[2].outputTokens = 3;
+  providers[2].totalTokens = 33;
+  const combined = combineDailyUsage(providers);
+  assertEquals(combined.sessionCount, 6);
+  assertEquals(combined.inputTokens, 60);
+  assertEquals(combined.outputTokens, 6);
+  assertEquals(combined.totalTokens, 66);
+  assertEquals(combined.totalTokens, combined.inputTokens + combined.outputTokens);
+});
 
 Deno.test("InvokeArgsSchema: validates idle and wall timeout overrides independently", () => {
   const parsed = InvokeArgsSchema.parse({

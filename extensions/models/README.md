@@ -189,6 +189,30 @@ Arguments:
 | ---------- | ---- | -------- | ---------------------------------------------------- |
 | `provider` | enum | no       | Provider to enumerate (defaults to `defaultProvider`) |
 
+### `collectLocalUsage`
+
+Aggregate one local calendar day of native token usage from Claude Code
+(`~/.claude/projects/**/*.jsonl`), Codex CLI
+(`~/.codex/sessions/**/*.jsonl`), and Amp (including archived threads). The
+default date is today in the system timezone; both may be selected explicitly:
+
+```sh
+swamp model method run my-agent collectLocalUsage \
+  --args '{"date":"2026-07-31","timeZone":"America/Denver"}'
+```
+
+The stable `local-usage-YYYY-MM-DD` resource contains provider rows in fixed
+`claude`, `amp`, `codex` order plus elementwise combined totals. `inputTokens`
+is processed input; cache-read/write counts are informational subsets and are
+not added to totals a second time. Sessions launched through cli-agent are
+already present in these native-client stores. Do **not** add cli-agent
+`invocation` resources to this result, or those sessions will be double-counted.
+
+| Name       | Type   | Required | Description |
+| ---------- | ------ | -------- | ----------- |
+| `date`     | string | no | Local calendar date as `YYYY-MM-DD`; defaults to today |
+| `timeZone` | string | no | IANA timezone; defaults to the system timezone |
+
 ## How It Works
 
 1. **Slash command resolution** — prompts starting with `/` are resolved
