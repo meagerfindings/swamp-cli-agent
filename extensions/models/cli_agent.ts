@@ -3098,6 +3098,41 @@ function stableValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/**
+ * Redaction-tolerant deep equality for durable-resource verification.
+ *
+ * Swamp's durable-resource layer redacts secret-bearing values to the literal
+ * sentinel `"***"` when persisting. An invocation record therefore never reads
+ * back byte-identical to the in-memory `expected` object (which holds the real
+ * secret values). Comparing via this function treats the `"***"` sentinel as a
+ * wildcard on either side, so a freshly-written-but-redacted resource still
+ * verifies, while genuinely different content still conflicts.
+ */
+const DURABLE_REDACTION_SENTINEL = "***";
+function durableEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === DURABLE_REDACTION_SENTINEL || b === DURABLE_REDACTION_SENTINEL) {
+    return true;
+  }
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length &&
+      a.every((value, i) => durableEqual(value, b[i]));
+  }
+  if (a !== null && b !== null && typeof a === "object" &&
+    typeof b === "object") {
+    const ak = Object.keys(a as Record<string, unknown>);
+    const bk = Object.keys(b as Record<string, unknown>);
+    return ak.length === bk.length &&
+      ak.every((key) =>
+        durableEqual(
+          (a as Record<string, unknown>)[key],
+          (b as Record<string, unknown>)[key],
+        )
+      );
+  }
+  return false;
+}
+
 /** Return tags in deterministic key order, treating omission as an empty map. */
 export function normalizeTags(
   tags?: Record<string, string>,
@@ -3120,14 +3155,20 @@ export async function createOnceOrVerify(
 ): Promise<{ created: boolean; handle?: Record<string, unknown> }> {
   const before = await context.readResource(instanceName);
   if (before !== null) {
-    if (stableValue(before) !== stableValue(expected)) {
+    if (!durableEqual(before, expected)) {
       throw new Error(`Conflicting durable resource: ${instanceName}`);
     }
     return { created: false };
   }
   const handle = await context.writeResource(specName, instanceName, expected);
   const after = await context.readResource(instanceName);
-  if (after === null || stableValue(after) !== stableValue(expected)) {
+  // Verify durability by existence, not content equality. Swamp's durable
+  // resource layer redacts secret-bearing values (and secret substrings inside
+  // string fields like `prompt`) before persisting, so the read-back can never
+  // byte-match the in-memory `expected`. The `durableEqual` check below would
+  // false-positive on e.g. a redacted `prompt`, so a fresh write is verified
+  // only to have persisted (non-null).
+  if (after === null) {
     throw new Error(`Durable resource read-back mismatch: ${instanceName}`);
   }
   return { created: true, handle };
