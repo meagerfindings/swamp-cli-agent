@@ -1448,10 +1448,16 @@ function buildOpencodeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
-  _toolProfile: ToolProfile,
+  toolProfile: ToolProfile,
 ): { cmd: string[]; stdin?: string } {
+  // The `actor` profile edits files and runs shell commands; running headless
+  // (no TTY to approve) without `--auto` makes opencode auto-reject every
+  // permission request, so the agent can never write an analysis/fix. `--auto`
+  // auto-approves permissions not explicitly denied — the opencode analogue of
+  // claude's `--permission-mode dontAsk`. The `readonly` profile gets no flag.
+  const approve = toolProfile === "actor" ? ["--auto"] : [];
   return {
-    cmd: [cliPath, "run", "--format", "json", "--model", model, resolvedPrompt],
+    cmd: [cliPath, "run", "--format", "json", ...approve, "--model", model, resolvedPrompt],
   };
 }
 
