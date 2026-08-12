@@ -17,9 +17,11 @@ import {
   aggregateClaudeUsage,
   aggregateCodexUsage,
   arbitrateSignalOutcome,
+  buildAmpCommand,
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
+  readGlobalAmpMcpServers,
   buildPiCommand,
   canonicalCwd,
   classifyFailure,
@@ -485,7 +487,11 @@ async function withRepository(
     expectation: { attachedBranch: string; headSha: string; stateHash: string },
   ) => Promise<void>,
 ): Promise<void> {
-  const cwd = await Deno.makeTempDir();
+  // Canonicalize: on macOS Deno.makeTempDir() returns a /var/folders path that
+  // symlinks to /private/var, which verifyRepositoryExpectation rejects as
+  // non-canonical. Mirror the production canonicalCwd() so the test exercises
+  // the real path contract instead of failing on the symlink.
+  const cwd = await canonicalCwd(await Deno.makeTempDir());
   try {
     await git(cwd, "init", "-b", "main");
     await git(cwd, "config", "user.email", "test@example.com");
@@ -3902,4 +3908,127 @@ Deno.test("InvocationSchema: a legacy pre-failureClass payload still parses", ()
   const parsed = InvocationSchema.parse(legacy);
   assertEquals(parsed.failureClass, undefined);
   assertEquals(parsed.success, false);
+});
+
+Deno.test("readGlobalAmpMcpServers: returns amp.mcpServers from global settings", async () => {
+  const tmpHome = await Deno.makeTempDir({ prefix: "amp-home-" });
+  await Deno.mkdir(`${tmpHome}/.config/amp`, { recursive: true });
+  await Deno.writeTextFile(
+    `${tmpHome}/.config/amp/settings.json`,
+    JSON.stringify({
+      "amp.mcpServers": { granola: { url: "https://mcp.granola.ai/mcp" } },
+      "amp.somethingElse": true,
+    }),
+  );
+  const prevHome = Deno.env.get("HOME");
+  Deno.env.set("HOME", tmpHome);
+  try {
+    const servers = await readGlobalAmpMcpServers();
+    assertEquals(servers, { granola: { url: "https://mcp.granola.ai/mcp" } });
+  } finally {
+    if (prevHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", prevHome);
+    await Deno.remove(tmpHome, { recursive: true });
+  }
+});
+
+Deno.test("readGlobalAmpMcpServers: degrades to {} when settings absent or malformed", async () => {
+  const tmpHome = await Deno.makeTempDir({ prefix: "amp-home-" });
+  const prevHome = Deno.env.get("HOME");
+  Deno.env.set("HOME", tmpHome);
+  try {
+    // No settings file at all.
+    assertEquals(await readGlobalAmpMcpServers(), {});
+    // Malformed JSON.
+    await Deno.mkdir(`${tmpHome}/.config/amp`, { recursive: true });
+    await Deno.writeTextFile(`${tmpHome}/.config/amp/settings.json`, "{not json");
+    assertEquals(await readGlobalAmpMcpServers(), {});
+    // Non-object mcpServers.
+    await Deno.writeTextFile(
+      `${tmpHome}/.config/amp/settings.json`,
+      JSON.stringify({ "amp.mcpServers": ["granola"] }),
+    );
+    assertEquals(await readGlobalAmpMcpServers(), {});
+  } finally {
+    if (prevHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", prevHome);
+    await Deno.remove(tmpHome, { recursive: true });
+  }
+});
+
+Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServers", async () => {
+  const tmpHome = await Deno.makeTempDir({ prefix: "amp-home-" });
+  await Deno.mkdir(`${tmpHome}/.config/amp`, { recursive: true });
+  await Deno.writeTextFile(
+    `${tmpHome}/.config/amp/settings.json`,
+    JSON.stringify({
+      "amp.mcpServers": { granola: { url: "https://mcp.granola.ai/mcp" } },
+    }),
+  );
+  const prevHome = Deno.env.get("HOME");
+  Deno.env.set("HOME", tmpHome);
+  try {
+    const { cmd, stdin } = await buildAmpCommand(
+      "amp",
+      "low",
+      "list my meetings",
+      "readonly",
+    );
+    assertEquals(stdin, "list my meetings");
+    const sfIndex = cmd.indexOf("--settings-file");
+    assertEquals(sfIndex >= 0, true);
+    const written = JSON.parse(await Deno.readTextFile(cmd[sfIndex + 1]));
+    assertEquals(written["amp.mcpServers"], {
+      granola: { url: "https://mcp.granola.ai/mcp" },
+    });
+    // Permissions still present (readonly rejects Bash).
+    assertEquals(Array.isArray(written["amp.permissions"]), true);
+    await Deno.remove(cmd[sfIndex + 1]);
+  } finally {
+    if (prevHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", prevHome);
+    await Deno.remove(tmpHome, { recursive: true });
+  }
+});
+
+Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools", async () => {
+  const tmpHome = await Deno.makeTempDir({ prefix: "amp-home-" });
+  const prevHome = Deno.env.get("HOME");
+  Deno.env.set("HOME", tmpHome);
+  try {
+    const { cmd } = await buildAmpCommand(
+      "amp",
+      "low",
+      "list my meetings",
+      "readonly",
+      ["mcp__granola__list_meetings", "mcp__granola__get_meetings"],
+    );
+    const sfIndex = cmd.indexOf("--settings-file");
+    const written = JSON.parse(await Deno.readTextFile(cmd[sfIndex + 1]));
+    const perms = written["amp.permissions"] as Array<
+      { tool: string; action: string }
+    >;
+    // Allowlisted tools are allowed.
+    for (const tool of ["mcp__granola__list_meetings", "mcp__granola__get_meetings"]) {
+      assertEquals(
+        perms.some((r) => r.tool === tool && r.action === "allow"),
+        true,
+      );
+    }
+    // Everything else is rejected by a trailing catch-all.
+    const last = perms[perms.length - 1];
+    assertEquals(last.tool, "*");
+    assertEquals(last.action, "reject");
+    // The profile's Bash reject is preserved and precedes the allows.
+    const bashIdx = perms.findIndex((r) =>
+      r.tool === "Bash" && r.action === "reject"
+    );
+    const firstAllowIdx = perms.findIndex((r) => r.action === "allow");
+    assertEquals(bashIdx >= 0 && bashIdx < firstAllowIdx, true);
+    await Deno.remove(cmd[sfIndex + 1]);
+  } finally {
+    if (prevHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", prevHome);
+    await Deno.remove(tmpHome, { recursive: true });
+  }
 });

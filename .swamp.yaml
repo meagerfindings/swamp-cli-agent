@@ -1,8 +1,8 @@
 swampVersion: 20260727.000815.0
-initializedAt: '2026-05-19T15:15:20.223Z'
+initializedAt: "2026-05-19T15:15:20.223Z"
 repoId: 20e101a5-7b1b-4a3a-a5ba-6a022bde4b0f
 tools:
   - claude
 gitignoreManaged: true
-lastSkillMigrationWarning: '2026-07-26T02:29:39.540Z'
-upgradedAt: '2026-07-27T01:52:33.903Z'
+lastSkillMigrationWarning: "2026-08-11T21:15:57.986Z"
+upgradedAt: "2026-07-27T01:52:33.903Z"

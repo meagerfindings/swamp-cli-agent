@@ -1480,6 +1480,62 @@ const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
 };
 
 /**
+ * Compose the Amp permission rules for one invocation.
+ *
+ * Without a `toolAllowlist`, this is exactly the profile's rules. With one, the
+ * child is fenced to only the named tools: the profile's leading `reject` rules
+ * are preserved (a dangerous Bash the profile blocks stays blocked even if the
+ * caller listed it), each allowlisted tool becomes an `allow`, and a trailing
+ * catch-all `reject` denies every other tool. Rules are first-match-wins.
+ */
+function ampPermissions(
+  toolProfile: ToolProfile,
+  toolAllowlist?: string[],
+): unknown[] {
+  if (!toolAllowlist || toolAllowlist.length === 0) {
+    return AMP_PERMISSIONS[toolProfile];
+  }
+  const profileRejects = AMP_PERMISSIONS[toolProfile].filter(
+    (rule) => (rule as { action?: string }).action === "reject",
+  );
+  return [
+    ...profileRejects,
+    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
+    { tool: "*", action: "reject" },
+  ];
+}
+
+/**
+ * Read the user's globally-configured Amp MCP servers so a `--settings-file`
+ * invocation can preserve them.
+ *
+ * `--settings-file` FULLY REPLACES Amp's default settings — it does not merge.
+ * Amp reads its defaults from `~/.config/amp/settings.json`, where MCP servers
+ * live under the `amp.mcpServers` key. Without carrying that key forward, a
+ * `--settings-file` run loads ZERO MCP servers, so every `mcp__*` tool silently
+ * disappears from the child (e.g. the granola-mcp model's `mcp__granola__*`
+ * tools). This helper runs in the swamp model process (outside any sandbox),
+ * so it can read the global settings directly. Missing/unreadable/malformed
+ * settings degrade to no MCP servers rather than throwing.
+ */
+export async function readGlobalAmpMcpServers(): Promise<
+  Record<string, unknown>
+> {
+  const home = Deno.env.get("HOME");
+  if (!home) return {};
+  const path = `${home}/.config/amp/settings.json`;
+  try {
+    const parsed = JSON.parse(await Deno.readTextFile(path));
+    const servers = parsed?.["amp.mcpServers"];
+    return servers && typeof servers === "object" && !Array.isArray(servers)
+      ? servers as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Build the command array for the Amp CLI.
  *
  * `--stream-json` makes amp emit Claude-Code-compatible stream JSON (one event
@@ -1492,20 +1548,35 @@ const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
  * `--dangerously-allow-all`: instead of a blanket bypass, Bash is scoped to
  * reject `git push`, `curl`, and `rm -rf` (actor profile) or rejected entirely
  * alongside file edits (readonly profile), with everything else allowed.
+ *
+ * Because `--settings-file` fully replaces Amp's defaults, the user's global
+ * `amp.mcpServers` is merged back in — otherwise the child sees no MCP servers
+ * at all (see {@link readGlobalAmpMcpServers}).
+ *
+ * `toolAllowlist`, when provided, restricts the child to ONLY those tools:
+ * the profile's `reject` rules are kept (so a dangerous Bash stays rejected
+ * even if the caller allowlisted it), then each allowlisted tool gets an
+ * `allow` rule, and a trailing catch-all `reject` denies everything else.
+ * Rules are first-match-wins in order (see {@link AMP_PERMISSIONS}).
  */
-async function buildAmpCommand(
+export async function buildAmpCommand(
   cliPath: string,
   _model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  toolAllowlist?: string[],
 ): Promise<{ cmd: string[]; stdin?: string }> {
   const settingsFile = await Deno.makeTempFile({
     prefix: "amp-settings-",
     suffix: ".json",
   });
+  const mcpServers = await readGlobalAmpMcpServers();
   await Deno.writeTextFile(
     settingsFile,
-    JSON.stringify({ "amp.permissions": AMP_PERMISSIONS[toolProfile] }),
+    JSON.stringify({
+      "amp.permissions": ampPermissions(toolProfile, toolAllowlist),
+      "amp.mcpServers": mcpServers,
+    }),
   );
   return {
     cmd: [
@@ -2626,6 +2697,7 @@ type CommandBuilder = (
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  toolAllowlist?: string[],
 ) =>
   | { cmd: string[]; stdin?: string }
   | Promise<{ cmd: string[]; stdin?: string }>;
@@ -2897,6 +2969,7 @@ async function runWithRetries(
     idleTimeoutMs: number;
     maxRetries: number;
     sandbox?: SandboxConfig;
+    toolAllowlist?: string[];
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -2912,6 +2985,7 @@ async function runWithRetries(
       modelName,
       resolved,
       toolProfile,
+      opts.toolAllowlist,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3352,6 +3426,9 @@ export const InvokeArgsSchema = z.object({
   ),
   toolProfile: ToolProfileEnum.optional().describe(
     "Scoped permission profile: 'readonly' (read/search only) or 'actor' (also edit/write/run shell). Defaults to defaultToolProfile.",
+  ),
+  toolAllowlist: z.array(z.string().min(1)).optional().describe(
+    "Restrict the child to ONLY these tool names (e.g. specific MCP tools like 'mcp__granola__list_meetings'). Every other tool is rejected. Layered on top of toolProfile's rules. Currently honored by the amp provider; other providers ignore it.",
   ),
   sandboxMode: SandboxModeEnum.optional().describe(
     "Override the global sandboxMode for this invocation: 'auto' (default; OS-picked backend), 'off', 'seatbelt', or 'bwrap'.",
@@ -4087,7 +4164,7 @@ export async function collectAmpExports(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.07.31.1",
+  version: "2026.08.11.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4208,6 +4285,18 @@ export const model = {
       toVersion: "2026.07.31.1",
       description:
         "Add read-only native daily token usage collection for Claude Code, Amp, and Codex CLI. No global argument schema changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.07.1",
+      description:
+        "Content-identical republish under a newer swamp CLI (automated regression-watch/republish). No source, schema, or behavior change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.11.1",
+      description:
+        "Amp provider: preserve the user's global amp.mcpServers when writing the temp --settings-file (a --settings-file fully replaces Amp's defaults, so MCP servers were being dropped and every mcp__* tool silently disappeared), and add an optional toolAllowlist invocation argument that fences the Amp child to only the named tools via layered permission rules. Additive argument; other providers ignore toolAllowlist. No global argument schema changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -4384,6 +4473,7 @@ export const model = {
               idleTimeoutMs,
               maxRetries,
               sandbox,
+              toolAllowlist: args.toolAllowlist,
             },
             context.logger,
           );
@@ -4565,6 +4655,7 @@ export const model = {
               idleTimeoutMs,
               maxRetries,
               sandbox,
+              toolAllowlist: args.toolAllowlist,
             },
             context.logger,
           );
