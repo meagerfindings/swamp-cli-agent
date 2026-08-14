@@ -3491,6 +3491,31 @@ const DailyUsageCountsSchema = z.object({
 /** Token and activity totals attributed to one native CLI provider. */
 export type DailyUsageCounts = z.infer<typeof DailyUsageCountsSchema>;
 
+const AmpUsageEventSchema = z.object({
+  id: z.string().min(1),
+  version: z.number().int().nonnegative(),
+  timestamp: z.number().int().nonnegative(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative(),
+  cacheWriteTokens: z.number().int().nonnegative(),
+  reasoningTokens: z.number().int().nonnegative(),
+}).refine(
+  (event) =>
+    event.cacheReadTokens + event.cacheWriteTokens <= event.inputTokens,
+  { message: "Amp cache tokens must be included within input tokens" },
+);
+type AmpUsageEvent = z.infer<typeof AmpUsageEventSchema>;
+
+/** Durable normalized latest protocol events from one Amp thread. */
+export const AmpThreadUsageCacheSchema = z.object({
+  schemaVersion: z.literal(2),
+  threadId: z.string().min(1),
+  updatedMarker: z.string().min(1),
+  events: z.array(AmpUsageEventSchema),
+});
+type AmpThreadUsageCache = z.infer<typeof AmpThreadUsageCacheSchema>;
+
 /** Persisted provider and combined usage totals for one local calendar day. */
 export const LocalUsageSchema = z.object({
   date: z.string(),
@@ -3842,72 +3867,116 @@ function visitObjects(
   for (const child of Object.values(object)) visitObjects(child, visitor);
 }
 
+function ampEventTiebreak(event: AmpUsageEvent): string {
+  return JSON.stringify([
+    event.inputTokens,
+    event.outputTokens,
+    event.cacheReadTokens,
+    event.cacheWriteTokens,
+    event.reasoningTokens,
+  ]);
+}
+
+function ampEventWins(candidate: AmpUsageEvent, prior: AmpUsageEvent): boolean {
+  if (candidate.version !== prior.version) {
+    return candidate.version > prior.version;
+  }
+  if (candidate.timestamp !== prior.timestamp) {
+    return candidate.timestamp > prior.timestamp;
+  }
+  return ampEventTiebreak(candidate) > ampEventTiebreak(prior);
+}
+
+/** Normalize and deduplicate the latest protocol events in one Amp export. */
+export function normalizeAmpThreadUsage(
+  threadId: string,
+  exported: unknown,
+): { threadId: string; events: AmpUsageEvent[] } {
+  const events = new Map<string, AmpUsageEvent>();
+  visitObjects(exported, (message) => {
+    const usage = record(message.usage);
+    const id = message.protocolMessageID ?? message.protocolMessageId ??
+      message.messageId ?? message.id;
+    const role = message.role ?? message.type;
+    if (!usage || role !== "assistant" || typeof id !== "string" || !id) return;
+    const counters = usageCounters(
+      usage,
+      "totalInputTokens",
+      "outputTokens",
+      ["cacheReadInputTokens", "cacheReadTokens"],
+      ["cacheCreationInputTokens", "cacheWriteTokens"],
+      ["reasoningTokens"],
+    );
+    if (
+      !counters || counters.cacheRead + counters.cacheWrite > counters.input
+    ) {
+      return;
+    }
+    const rawVersion = message.protocolMessageVersion ?? message.messageVersion;
+    const version = rawVersion === undefined ? 0 : validCount(rawVersion);
+    const timestamp = timestampMillis(usage.timestamp);
+    if (version === undefined || timestamp === undefined) return;
+    const event = AmpUsageEventSchema.parse({
+      id,
+      version,
+      timestamp,
+      inputTokens: counters.input,
+      outputTokens: counters.output,
+      cacheReadTokens: counters.cacheRead,
+      cacheWriteTokens: counters.cacheWrite,
+      reasoningTokens: counters.reasoning,
+    });
+    const prior = events.get(id);
+    if (!prior || ampEventWins(event, prior)) events.set(id, event);
+  });
+  return { threadId, events: [...events.values()] };
+}
+
+/** Globally deduplicate normalized Amp events and aggregate daily totals. */
+export function aggregateAmpThreadUsage(
+  threads: Array<{ threadId: string; events: AmpUsageEvent[] }>,
+  date: string,
+  timeZone: string,
+): DailyUsageCounts {
+  const events = new Map<string, AmpUsageEvent>();
+  const sessions = new Set<string>();
+  for (const thread of threads) {
+    for (const event of thread.events) {
+      if (dateInTimeZone(event.timestamp, timeZone) === date) {
+        sessions.add(thread.threadId);
+      }
+      const prior = events.get(event.id);
+      if (!prior || ampEventWins(event, prior)) events.set(event.id, event);
+    }
+  }
+  const result = emptyDailyUsage("amp");
+  for (const event of events.values()) {
+    if (dateInTimeZone(event.timestamp, timeZone) !== date) continue;
+    result.eventCount++;
+    result.inputTokens += event.inputTokens;
+    result.outputTokens += event.outputTokens;
+    result.cacheReadTokens += event.cacheReadTokens;
+    result.cacheWriteTokens += event.cacheWriteTokens;
+    result.reasoningTokens += event.reasoningTokens;
+    result.totalTokens += event.inputTokens + event.outputTokens;
+  }
+  result.sessionCount = sessions.size;
+  return result;
+}
+
 /** Parse Amp exports and globally deduplicate native protocol messages. */
 export function aggregateAmpUsage(
   threads: Array<{ threadId: string; export: unknown }>,
   date: string,
   timeZone: string,
 ): DailyUsageCounts {
-  const events = new Map<string, {
-    counters: UsageCounters;
-    tiebreak: string;
-    timestamp: number;
-    version: number;
-  }>();
-  const threadIds = new Set<string>();
-  for (const thread of threads) {
-    visitObjects(thread.export, (message) => {
-      const usage = record(message.usage);
-      const id = message.protocolMessageID ?? message.protocolMessageId ??
-        message.messageId ?? message.id;
-      const role = message.role ?? message.type;
-      if (!usage || role !== "assistant" || typeof id !== "string") return;
-      if (dateInTimeZone(usage.timestamp, timeZone) !== date) return;
-      const counters = usageCounters(
-        usage,
-        "totalInputTokens",
-        "outputTokens",
-        ["cacheReadInputTokens", "cacheReadTokens"],
-        ["cacheCreationInputTokens", "cacheWriteTokens"],
-        ["reasoningTokens"],
-      );
-      if (
-        !counters || counters.cacheRead + counters.cacheWrite > counters.input
-      ) return;
-      const rawVersion = message.protocolMessageVersion ??
-        message.messageVersion;
-      const version = rawVersion === undefined ? 0 : validCount(rawVersion);
-      const timestamp = timestampMillis(usage.timestamp);
-      if (version === undefined || timestamp === undefined) return;
-      threadIds.add(thread.threadId);
-      const tiebreak = JSON.stringify([
-        counters.input,
-        counters.output,
-        counters.cacheRead,
-        counters.cacheWrite,
-        counters.reasoning,
-      ]);
-      const prior = events.get(id);
-      if (
-        !prior || version > prior.version ||
-        version === prior.version && timestamp > prior.timestamp ||
-        version === prior.version && timestamp === prior.timestamp &&
-          tiebreak > prior.tiebreak
-      ) events.set(id, { counters, tiebreak, timestamp, version });
-    });
-  }
-  const result = emptyDailyUsage("amp");
-  for (const { counters } of events.values()) {
-    result.eventCount++;
-    result.inputTokens += counters.input;
-    result.outputTokens += counters.output;
-    result.cacheReadTokens += counters.cacheRead;
-    result.cacheWriteTokens += counters.cacheWrite;
-    result.reasoningTokens += counters.reasoning;
-    result.totalTokens += counters.input + counters.output;
-  }
-  result.sessionCount = threadIds.size;
-  return result;
+  return aggregateAmpThreadUsage(
+    threads.map((thread) =>
+      normalizeAmpThreadUsage(thread.threadId, thread.export)
+    ),
+    date,
+    timeZone,
+  );
 }
 
 /** Sum provider counters while preserving each provider's separate totals. */
@@ -4028,6 +4097,10 @@ async function aggregateCodexUsageFiles(
 }
 
 const AMP_USAGE_TIMEOUT_MS = 30_000;
+// Each Amp export starts a separate Node process. Keep this below the level
+// that competes materially with interactive Amp sessions on a developer's
+// machine, while still avoiding the previous fully serial collection.
+const AMP_USAGE_EXPORT_CONCURRENCY = 2;
 async function runAmpUsageCommand(
   ampPath: string,
   args: string[],
@@ -4079,14 +4152,23 @@ function ampListRows(value: unknown): JsonRecord[] {
   );
 }
 
-/** Select unique Amp threads that may contain events from the target local day. */
-export function selectAmpCandidateIds(
+type AmpThreadCandidate = {
+  threadId: string;
+  updatedMarker?: string;
+};
+
+function ampUpdatedMarker(value: unknown): string | undefined {
+  const millis = timestampMillis(value);
+  return millis === undefined ? undefined : new Date(millis).toISOString();
+}
+
+function selectAmpCandidates(
   rows: JsonRecord[],
   date: string,
   timeZone: string,
   seen = new Set<string>(),
-): string[] {
-  const selected: string[] = [];
+): AmpThreadCandidate[] {
+  const selected: AmpThreadCandidate[] = [];
   for (const row of rows) {
     const id = row.id ?? row.threadId ?? row.threadID;
     if (typeof id !== "string") {
@@ -4100,25 +4182,33 @@ export function selectAmpCandidateIds(
     const updatedDate = dateInTimeZone(updated, timeZone);
     if (updatedDate === undefined || updatedDate >= date) {
       seen.add(id);
-      selected.push(id);
+      selected.push({ threadId: id, updatedMarker: ampUpdatedMarker(updated) });
     }
   }
   return selected;
 }
 
-type AmpUsageRunner = (args: string[], operation: string) => Promise<string>;
-
-/** List and export Amp threads that may contain usage for a local day. */
-export async function collectAmpExports(
-  ampPath: string,
+/** Select unique Amp threads that may contain events from the target local day. */
+export function selectAmpCandidateIds(
+  rows: JsonRecord[],
   date: string,
   timeZone: string,
-  injectedRunner?: AmpUsageRunner,
-): Promise<Array<{ threadId: string; export: unknown }>> {
-  const runner = injectedRunner ??
-    ((args, operation) => runAmpUsageCommand(ampPath, args, operation));
+  seen = new Set<string>(),
+): string[] {
+  return selectAmpCandidates(rows, date, timeZone, seen).map((candidate) =>
+    candidate.threadId
+  );
+}
+
+type AmpUsageRunner = (args: string[], operation: string) => Promise<string>;
+
+async function listAmpCandidates(
+  date: string,
+  timeZone: string,
+  runner: AmpUsageRunner,
+): Promise<AmpThreadCandidate[]> {
   const limit = 100;
-  const candidates: string[] = [];
+  const candidates: AmpThreadCandidate[] = [];
   const seen = new Set<string>();
   for (let offset = 0;; offset += limit) {
     const stdout = await runner([
@@ -4142,29 +4232,158 @@ export async function collectAmpExports(
       }
       throw error;
     }
-    candidates.push(...selectAmpCandidateIds(rows, date, timeZone, seen));
+    candidates.push(...selectAmpCandidates(rows, date, timeZone, seen));
     if (rows.length < limit) break;
   }
-  const exports: Array<{ threadId: string; export: unknown }> = [];
-  for (const threadId of candidates) {
-    const stdout = await runner(
-      ["threads", "export", threadId],
-      "thread export",
+  return candidates;
+}
+
+async function exportAmpCandidates(
+  candidates: AmpThreadCandidate[],
+  runner: AmpUsageRunner,
+): Promise<Array<{ threadId: string; export: unknown }>> {
+  const exports = new Array<{ threadId: string; export: unknown }>(
+    candidates.length,
+  );
+  let nextCandidate = 0;
+  const worker = async (): Promise<void> => {
+    while (nextCandidate < candidates.length) {
+      const index = nextCandidate++;
+      const { threadId } = candidates[index];
+      const stdout = await runner(
+        ["threads", "export", threadId],
+        "thread export",
+      );
+      try {
+        exports[index] = { threadId, export: JSON.parse(stdout) };
+      } catch {
+        throw new Error(
+          "Amp thread export returned invalid JSON; update Amp or retry",
+        );
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(AMP_USAGE_EXPORT_CONCURRENCY, candidates.length) },
+      worker,
+    ),
+  );
+  return exports;
+}
+
+/** List and export Amp threads that may contain usage for a local day. */
+export async function collectAmpExports(
+  ampPath: string,
+  date: string,
+  timeZone: string,
+  injectedRunner?: AmpUsageRunner,
+): Promise<Array<{ threadId: string; export: unknown }>> {
+  const runner = injectedRunner ??
+    ((args, operation) => runAmpUsageCommand(ampPath, args, operation));
+  const candidates = await listAmpCandidates(date, timeZone, runner);
+  return await exportAmpCandidates(candidates, runner);
+}
+
+function cacheKey(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(
+    /=+$/,
+    "",
+  );
+}
+
+/** Stable cache identity for one Amp thread across local-day queries. */
+export function ampUsageCacheName(threadId: string): string {
+  return `amp-usage-thread-${cacheKey(threadId)}`;
+}
+
+/**
+ * Reuse unchanged normalized thread events, export changed threads, then apply
+ * protocol-message deduplication globally across both sources.
+ */
+export async function collectAmpUsageWithCache(
+  context: ResourceContext,
+  ampPath: string,
+  date: string,
+  timeZone: string,
+  injectedRunner?: AmpUsageRunner,
+): Promise<{
+  usage: DailyUsageCounts;
+  cacheHandles: Record<string, unknown>[];
+  exportedThreadCount: number;
+  reusedThreadCount: number;
+}> {
+  const runner = injectedRunner ??
+    ((args, operation) => runAmpUsageCommand(ampPath, args, operation));
+  const candidates = await listAmpCandidates(date, timeZone, runner);
+  const contributions = new Array<
+    { threadId: string; events: AmpUsageEvent[] }
+  >(
+    candidates.length,
+  );
+  const changed: Array<{ index: number; candidate: AmpThreadCandidate }> = [];
+  let reusedThreadCount = 0;
+
+  for (const [index, candidate] of candidates.entries()) {
+    if (candidate.updatedMarker !== undefined) {
+      const raw = await context.readResource(
+        ampUsageCacheName(candidate.threadId),
+      );
+      const cached = AmpThreadUsageCacheSchema.safeParse(raw);
+      if (
+        cached.success && cached.data.threadId === candidate.threadId &&
+        cached.data.updatedMarker === candidate.updatedMarker
+      ) {
+        contributions[index] = cached.data;
+        reusedThreadCount++;
+        continue;
+      }
+    }
+    changed.push({ index, candidate });
+  }
+
+  const exported = await exportAmpCandidates(
+    changed.map(({ candidate }) => candidate),
+    runner,
+  );
+  const cacheHandles: Record<string, unknown>[] = [];
+  for (const [changedIndex, { index, candidate }] of changed.entries()) {
+    const contribution = normalizeAmpThreadUsage(
+      candidate.threadId,
+      exported[changedIndex].export,
     );
-    try {
-      exports.push({ threadId, export: JSON.parse(stdout) });
-    } catch {
-      throw new Error(
-        "Amp thread export returned invalid JSON; update Amp or retry",
+    contributions[index] = contribution;
+    if (candidate.updatedMarker !== undefined) {
+      const cached = AmpThreadUsageCacheSchema.parse({
+        schemaVersion: 2,
+        threadId: candidate.threadId,
+        updatedMarker: candidate.updatedMarker,
+        events: contribution.events,
+      });
+      cacheHandles.push(
+        await context.writeResource(
+          "ampThreadUsageCache",
+          ampUsageCacheName(candidate.threadId),
+          cached,
+        ),
       );
     }
   }
-  return exports;
+
+  return {
+    usage: aggregateAmpThreadUsage(contributions, date, timeZone),
+    cacheHandles,
+    exportedThreadCount: changed.length,
+    reusedThreadCount,
+  };
 }
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.11.1",
+  version: "2026.08.14.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4299,6 +4518,18 @@ export const model = {
         "Amp provider: preserve the user's global amp.mcpServers when writing the temp --settings-file (a --settings-file fully replaces Amp's defaults, so MCP servers were being dropped and every mcp__* tool silently disappeared), and add an optional toolAllowlist invocation argument that fences the Amp child to only the named tools via layered permission rules. Additive argument; other providers ignore toolAllowlist. No global argument schema changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.08.14.1",
+      description:
+        "Cache normalized Amp usage events by local day, timezone, and thread update marker, while preserving global protocol-message deduplication across cached and freshly exported threads. Additive resource only; no global argument schema changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.14.2",
+      description:
+        "Move Amp caching to timezone-independent latest-event sets per thread so protocol versions are globally deduplicated before local-day attribution, including versions that cross midnight. Cache schema replacement only; no global argument changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     localUsage: {
@@ -4307,6 +4538,12 @@ export const model = {
       schema: LocalUsageSchema,
       lifetime: "infinite" as const,
       garbageCollection: 400,
+    },
+    ampThreadUsageCache: {
+      description: "Normalized latest Amp protocol usage events for one thread",
+      schema: AmpThreadUsageCacheSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 10,
     },
     invocationLaunchClaim: {
       description:
@@ -4373,14 +4610,15 @@ export const model = {
         // these provider-native stores and summing both would double-count.
         const claudePaths = await jsonlFiles(`${home}/.claude/projects`);
         const codexPaths = await jsonlFiles(`${home}/.codex/sessions`);
-        const ampExports = await collectAmpExports(
+        const amp = await collectAmpUsageWithCache(
+          context,
           context.globalArgs.ampPath,
           date,
           timeZone,
         );
         const providers = [
           await aggregateClaudeUsageFiles(claudePaths, date, timeZone),
-          aggregateAmpUsage(ampExports, date, timeZone),
+          amp.usage,
           await aggregateCodexUsageFiles(codexPaths, date, timeZone),
         ] as const;
         const usage = LocalUsageSchema.parse({
@@ -4396,14 +4634,16 @@ export const model = {
           usage,
         );
         context.logger.info(
-          "Completed native local usage collection for {date} with {sessions} sessions and {events} events",
+          "Completed native local usage collection for {date} with {sessions} sessions and {events} events; reused {reusedAmpThreads} Amp threads and exported {exportedAmpThreads}",
           {
             date,
             sessions: usage.combined.sessionCount,
             events: usage.combined.eventCount,
+            reusedAmpThreads: amp.reusedThreadCount,
+            exportedAmpThreads: amp.exportedThreadCount,
           },
         );
-        return { dataHandles: [handle] };
+        return { dataHandles: [...amp.cacheHandles, handle] };
       },
     },
 

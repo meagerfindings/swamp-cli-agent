@@ -16,18 +16,19 @@ import {
   aggregateAmpUsage,
   aggregateClaudeUsage,
   aggregateCodexUsage,
+  ampUsageCacheName,
   arbitrateSignalOutcome,
   buildAmpCommand,
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
-  readGlobalAmpMcpServers,
   buildPiCommand,
   canonicalCwd,
   classifyFailure,
-  combineDailyUsage,
   collectAmpExports,
+  collectAmpUsageWithCache,
   CollectLocalUsageArgsSchema,
+  combineDailyUsage,
   createOnceOrVerify,
   extractError,
   extractTextFromOutput,
@@ -48,12 +49,13 @@ import {
   parseGrokModelsList,
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
+  readGlobalAmpMcpServers,
   RepositoryExpectationSchema,
   repositoryStateHash,
-  resolveLocalUsageDay,
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
+  resolveLocalUsageDay,
   resolveModel,
   runCli,
   SANDBOX_PROFILE_FILENAME,
@@ -69,15 +71,19 @@ import {
 
 Deno.test("local usage: timezone filtering and date validation", () => {
   assertEquals(
-    aggregateClaudeUsage([{
-      timestamp: "2026-08-01T05:30:00Z",
-      sessionId: "session-a",
-      message: {
-        id: "message-a",
-        role: "assistant",
-        usage: { input_tokens: 2, output_tokens: 3 },
-      },
-    }], "2026-07-31", "America/Denver").eventCount,
+    aggregateClaudeUsage(
+      [{
+        timestamp: "2026-08-01T05:30:00Z",
+        sessionId: "session-a",
+        message: {
+          id: "message-a",
+          role: "assistant",
+          usage: { input_tokens: 2, output_tokens: 3 },
+        },
+      }],
+      "2026-07-31",
+      "America/Denver",
+    ).eventCount,
     1,
   );
   assertThrows(
@@ -90,7 +96,10 @@ Deno.test("local usage: timezone filtering and date validation", () => {
     Error,
     "Invalid timeZone",
   );
-  assertEquals(CollectLocalUsageArgsSchema.safeParse({ date: "07/31/2026" }).success, false);
+  assertEquals(
+    CollectLocalUsageArgsSchema.safeParse({ date: "07/31/2026" }).success,
+    false,
+  );
 });
 
 Deno.test("local usage: Claude globally deduplicates latest message and folds cache into processed input", () => {
@@ -108,17 +117,24 @@ Deno.test("local usage: Claude globally deduplicates latest message and folds ca
       },
     },
   });
-  const usage = aggregateClaudeUsage([
-    message("2026-07-31T12:00:00Z", 2),
-    message("2026-07-31T12:01:00Z", 3),
-    { malformed: true },
-  ], "2026-07-31", "UTC");
+  const usage = aggregateClaudeUsage(
+    [
+      message("2026-07-31T12:00:00Z", 2),
+      message("2026-07-31T12:01:00Z", 3),
+      { malformed: true },
+    ],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(usage.sessionCount, 1);
   assertEquals(usage.eventCount, 1);
   assertEquals(usage.inputTokens, 21);
   assertEquals(usage.totalTokens, 26);
   assertEquals(usage.totalTokens, usage.inputTokens + usage.outputTokens);
-  assertEquals(usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens, true);
+  assertEquals(
+    usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens,
+    true,
+  );
 });
 
 Deno.test("local usage: Claude assigns a request to its latest valid completion", () => {
@@ -138,7 +154,10 @@ Deno.test("local usage: Claude assigns a request to its latest valid completion"
     row(null, 999),
     row("2026-08-01T00:02:00Z", "bad"),
   ];
-  assertEquals(aggregateClaudeUsage(records, "2026-07-31", "UTC").eventCount, 0);
+  assertEquals(
+    aggregateClaudeUsage(records, "2026-07-31", "UTC").eventCount,
+    0,
+  );
   const usage = aggregateClaudeUsage(records, "2026-08-01", "UTC");
   assertEquals(usage.eventCount, 1);
   assertEquals(usage.inputTokens, 5);
@@ -157,23 +176,29 @@ Deno.test("local usage: Codex deltas cumulative snapshots across midnight", () =
     timestamp,
     payload: {
       type: "token_count",
-      info: { total_token_usage: {
-        input_tokens: input,
-        cached_input_tokens: cached,
-        cache_write_input_tokens: cacheWrite,
-        output_tokens: output,
-        reasoning_output_tokens: reasoning,
-        total_tokens: input + output,
-      } },
+      info: {
+        total_token_usage: {
+          input_tokens: input,
+          cached_input_tokens: cached,
+          cache_write_input_tokens: cacheWrite,
+          output_tokens: output,
+          reasoning_output_tokens: reasoning,
+          total_tokens: input + output,
+        },
+      },
     },
   });
-  const usage = aggregateCodexUsage([[
-    snapshot("2026-07-30T23:00:00Z", 100, 30, 20, 5, 4),
-    snapshot("2026-07-31T10:00:00Z", 150, 40, 30, 8, 6),
-    snapshot("2026-07-31T10:30:00Z", 150, 40, 30, 8, 6),
-    snapshot("2026-07-31T11:00:00Z", 210, 70, 50, 15, 11),
-    snapshot("2026-08-01T11:00:00Z", 300, 90, 70, 20, 14),
-  ]], "2026-07-31", "UTC");
+  const usage = aggregateCodexUsage(
+    [[
+      snapshot("2026-07-30T23:00:00Z", 100, 30, 20, 5, 4),
+      snapshot("2026-07-31T10:00:00Z", 150, 40, 30, 8, 6),
+      snapshot("2026-07-31T10:30:00Z", 150, 40, 30, 8, 6),
+      snapshot("2026-07-31T11:00:00Z", 210, 70, 50, 15, 11),
+      snapshot("2026-08-01T11:00:00Z", 300, 90, 70, 20, 14),
+    ]],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(usage.sessionCount, 1);
   assertEquals(usage.eventCount, 2);
   assertEquals(usage.inputTokens, 110);
@@ -186,24 +211,35 @@ Deno.test("local usage: Codex deltas cumulative snapshots across midnight", () =
 });
 
 Deno.test("local usage: Codex handles resets and skips malformed baselines", () => {
-  const snapshot = (timestamp: string, input: unknown, output: number, cached = 0) => ({
+  const snapshot = (
+    timestamp: string,
+    input: unknown,
+    output: number,
+    cached = 0,
+  ) => ({
     timestamp,
     payload: {
       type: "token_count",
-      info: { total_token_usage: {
-        input_tokens: input,
-        cached_input_tokens: cached,
-        output_tokens: output,
-      } },
+      info: {
+        total_token_usage: {
+          input_tokens: input,
+          cached_input_tokens: cached,
+          output_tokens: output,
+        },
+      },
     },
   });
-  const usage = aggregateCodexUsage([[
-    snapshot("2026-07-30T23:00:00Z", 100, 20, 30),
-    snapshot("2026-07-31T01:00:00Z", 120, 25, 35),
-    snapshot("2026-07-31T02:00:00Z", "bad", 999),
-    snapshot("2026-07-31T03:00:00Z", 10, 2, 2),
-    snapshot("2026-07-31T04:00:00Z", 15, 3, 3),
-  ]], "2026-07-31", "UTC");
+  const usage = aggregateCodexUsage(
+    [[
+      snapshot("2026-07-30T23:00:00Z", 100, 20, 30),
+      snapshot("2026-07-31T01:00:00Z", 120, 25, 35),
+      snapshot("2026-07-31T02:00:00Z", "bad", 999),
+      snapshot("2026-07-31T03:00:00Z", 10, 2, 2),
+      snapshot("2026-07-31T04:00:00Z", 15, 3, 3),
+    ]],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(usage.sessionCount, 1);
   assertEquals(usage.eventCount, 3);
   assertEquals(usage.inputTokens, 35);
@@ -211,10 +247,14 @@ Deno.test("local usage: Codex handles resets and skips malformed baselines", () 
   assertEquals(usage.cacheReadTokens, 8);
   assertEquals(usage.totalTokens, 43);
 
-  const zero = aggregateCodexUsage([[
-    snapshot("2026-07-30T23:00:00Z", 100, 20),
-    snapshot("2026-07-31T01:00:00Z", 100, 20),
-  ]], "2026-07-31", "UTC");
+  const zero = aggregateCodexUsage(
+    [[
+      snapshot("2026-07-30T23:00:00Z", 100, 20),
+      snapshot("2026-07-31T01:00:00Z", 100, 20),
+    ]],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(zero.sessionCount, 0);
   assertEquals(zero.eventCount, 0);
 });
@@ -224,37 +264,45 @@ Deno.test("local usage: Codex optional counters cannot fake resets or exceed inp
     timestamp,
     payload: { type: "token_count", info: { total_token_usage: usage } },
   });
-  const optionalDisappears = aggregateCodexUsage([[
-    row("2026-07-30T23:00:00Z", {
-      input_tokens: 100,
-      output_tokens: 20,
-      cached_input_tokens: 20,
-      reasoning_output_tokens: 5,
-    }),
-    row("2026-07-31T01:00:00Z", { input_tokens: 110, output_tokens: 22 }),
-  ]], "2026-07-31", "UTC");
+  const optionalDisappears = aggregateCodexUsage(
+    [[
+      row("2026-07-30T23:00:00Z", {
+        input_tokens: 100,
+        output_tokens: 20,
+        cached_input_tokens: 20,
+        reasoning_output_tokens: 5,
+      }),
+      row("2026-07-31T01:00:00Z", { input_tokens: 110, output_tokens: 22 }),
+    ]],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(optionalDisappears.inputTokens, 10);
   assertEquals(optionalDisappears.outputTokens, 2);
   assertEquals(optionalDisappears.cacheReadTokens, 0);
 
-  const inconsistent = aggregateCodexUsage([[
-    row("2026-07-30T23:00:00Z", {
-      input_tokens: 100,
-      output_tokens: 20,
-      cached_input_tokens: 0,
-    }),
-    row("2026-07-31T01:00:00Z", {
-      input_tokens: 105,
-      output_tokens: 22,
-      cached_input_tokens: 10,
-    }),
-    row(null, { input_tokens: 999, output_tokens: 999 }),
-    row("2026-07-31T02:00:00Z", {
-      input_tokens: 120,
-      output_tokens: 25,
-      cached_input_tokens: 12,
-    }),
-  ]], "2026-07-31", "UTC");
+  const inconsistent = aggregateCodexUsage(
+    [[
+      row("2026-07-30T23:00:00Z", {
+        input_tokens: 100,
+        output_tokens: 20,
+        cached_input_tokens: 0,
+      }),
+      row("2026-07-31T01:00:00Z", {
+        input_tokens: 105,
+        output_tokens: 22,
+        cached_input_tokens: 10,
+      }),
+      row(null, { input_tokens: 999, output_tokens: 999 }),
+      row("2026-07-31T02:00:00Z", {
+        input_tokens: 120,
+        output_tokens: 25,
+        cached_input_tokens: 12,
+      }),
+    ]],
+    "2026-07-31",
+    "UTC",
+  );
   assertEquals(inconsistent.eventCount, 1);
   assertEquals(inconsistent.inputTokens, 20);
   assertEquals(inconsistent.outputTokens, 5);
@@ -282,10 +330,18 @@ Deno.test("local usage: Amp dedup is versioned, deterministic, and counts sessio
     },
   });
   const threads = [
-    { threadId: "thread-a", export: { messages: [assistant("protocol-a", 1, 10)] } },
+    {
+      threadId: "thread-a",
+      export: { messages: [assistant("protocol-a", 1, 10)] },
+    },
     {
       threadId: "thread-b",
-      export: { messages: [assistant("protocol-a", 2, 12), assistant("protocol-b", 1, 20)] },
+      export: {
+        messages: [
+          assistant("protocol-a", 2, 12),
+          assistant("protocol-b", 1, 20),
+        ],
+      },
     },
   ];
   const usage = aggregateAmpUsage(threads, "2026-07-31", "UTC");
@@ -305,41 +361,108 @@ Deno.test("local usage: Amp dedup is versioned, deterministic, and counts sessio
     protocolMessageVersion: "bad",
   };
   assertEquals(
-    aggregateAmpUsage([{
-      threadId: "thread-a",
-      export: { messages: [assistant("protocol-a", 2, 12), malformedHigherVersion] },
-    }], "2026-07-31", "UTC").inputTokens,
+    aggregateAmpUsage(
+      [{
+        threadId: "thread-a",
+        export: {
+          messages: [assistant("protocol-a", 2, 12), malformedHigherVersion],
+        },
+      }],
+      "2026-07-31",
+      "UTC",
+    ).inputTokens,
     12,
   );
   assertEquals(usage.totalTokens, usage.inputTokens + usage.outputTokens);
-  assertEquals(usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens, true);
+  assertEquals(
+    usage.cacheReadTokens + usage.cacheWriteTokens <= usage.inputTokens,
+    true,
+  );
+});
+
+Deno.test("local usage: Amp deduplicates protocol versions before day attribution", () => {
+  const message = (version: number, timestamp: string, input: number) => ({
+    role: "assistant",
+    protocolMessageID: "cross-midnight",
+    protocolMessageVersion: version,
+    usage: {
+      timestamp,
+      totalInputTokens: input,
+      outputTokens: 2,
+    },
+  });
+  const threads = [
+    {
+      threadId: "thread-a",
+      export: { messages: [message(1, "2026-07-31T23:59:00Z", 10)] },
+    },
+    {
+      threadId: "thread-b",
+      export: { messages: [message(2, "2026-08-01T00:01:00Z", 20)] },
+    },
+  ];
+  const priorDay = aggregateAmpUsage(threads, "2026-07-31", "UTC");
+  assertEquals(priorDay.eventCount, 0);
+  assertEquals(priorDay.totalTokens, 0);
+  const winningDay = aggregateAmpUsage(threads, "2026-08-01", "UTC");
+  assertEquals(winningDay.eventCount, 1);
+  assertEquals(winningDay.inputTokens, 20);
+  assertEquals(winningDay.totalTokens, 22);
 });
 
 Deno.test("local usage: JSONL scanning skips malformed and continues", () => {
   const values: unknown[] = [];
-  scanJsonLines('\n{"valid":1}\nnot-json\n{"valid":2}\n', (value) => values.push(value));
+  scanJsonLines(
+    '\n{"valid":1}\nnot-json\n{"valid":2}\n',
+    (value) => values.push(value),
+  );
   assertEquals(values, [{ valid: 1 }, { valid: 2 }]);
 });
 
 Deno.test("local usage: Amp candidates honor real updated field and timezone", () => {
   const seen = new Set<string>();
-  assertEquals(selectAmpCandidateIds([
-    { id: "old", updated: "2026-07-31T05:59:59Z" },
-    { id: "today", updated: "2026-07-31T06:00:00Z" },
-    { id: "later", updated: "2026-08-01T06:00:00Z" },
-    { id: "unknown" },
-  ], "2026-07-31", "America/Denver", seen), ["today", "later", "unknown"]);
-  assertEquals(selectAmpCandidateIds([
-    { id: "today", updated: "2026-07-31T12:00:00Z" },
-  ], "2026-07-31", "America/Denver", seen), []);
-  assertEquals(selectAmpCandidateIds([
-    { id: "moves", updated: "2026-07-31T05:00:00Z" },
-    { id: "moves", updated: "2026-07-31T07:00:00Z" },
-  ], "2026-07-31", "America/Denver"), ["moves"]);
+  assertEquals(
+    selectAmpCandidateIds(
+      [
+        { id: "old", updated: "2026-07-31T05:59:59Z" },
+        { id: "today", updated: "2026-07-31T06:00:00Z" },
+        { id: "later", updated: "2026-08-01T06:00:00Z" },
+        { id: "unknown" },
+      ],
+      "2026-07-31",
+      "America/Denver",
+      seen,
+    ),
+    ["today", "later", "unknown"],
+  );
+  assertEquals(
+    selectAmpCandidateIds(
+      [
+        { id: "today", updated: "2026-07-31T12:00:00Z" },
+      ],
+      "2026-07-31",
+      "America/Denver",
+      seen,
+    ),
+    [],
+  );
+  assertEquals(
+    selectAmpCandidateIds(
+      [
+        { id: "moves", updated: "2026-07-31T05:00:00Z" },
+        { id: "moves", updated: "2026-07-31T07:00:00Z" },
+      ],
+      "2026-07-31",
+      "America/Denver",
+    ),
+    ["moves"],
+  );
 });
 
 Deno.test("local usage: Amp pagination deduplicates exports", async () => {
   const calls: string[][] = [];
+  let activeExports = 0;
+  let maxActiveExports = 0;
   const firstPage = Array.from({ length: 100 }, (_, index) => ({
     id: `thread-${index}`,
     updated: "2026-07-31T12:00:00Z",
@@ -348,14 +471,167 @@ Deno.test("local usage: Amp pagination deduplicates exports", async () => {
     calls.push(args);
     if (args[1] === "list") {
       const offset = args.at(-1);
-      return Promise.resolve(JSON.stringify(offset === "0" ? firstPage : [firstPage[0]]));
+      return Promise.resolve(
+        JSON.stringify(offset === "0" ? firstPage : [firstPage[0]]),
+      );
     }
-    return Promise.resolve(JSON.stringify({ messages: [] }));
+    activeExports += 1;
+    maxActiveExports = Math.max(maxActiveExports, activeExports);
+    return new Promise<string>((resolve) => {
+      setTimeout(() => {
+        activeExports -= 1;
+        resolve(JSON.stringify({ messages: [] }));
+      }, 1);
+    });
   };
   const exports = await collectAmpExports("amp", "2026-07-31", "UTC", runner);
   assertEquals(exports.length, 100);
+  assertEquals(
+    exports.map(({ threadId }) => threadId),
+    firstPage.map(({ id }) => id),
+  );
   assertEquals(calls.filter((args) => args[1] === "list").length, 2);
   assertEquals(calls.filter((args) => args[1] === "export").length, 100);
+  assertEquals(maxActiveExports, 2);
+});
+
+Deno.test("local usage: Amp cache reuses unchanged threads and preserves global dedup", async () => {
+  const stored = new Map<string, Record<string, unknown>>();
+  const context = {
+    readResource: (name: string) => Promise.resolve(stored.get(name) ?? null),
+    writeResource: (
+      specName: string,
+      name: string,
+      data: Record<string, unknown>,
+    ) => {
+      assertEquals(specName, "ampThreadUsageCache");
+      stored.set(name, data);
+      return Promise.resolve({ name });
+    },
+  };
+  let rows = [
+    { id: "thread-a", updated: "2026-07-31T12:00:00Z" },
+    { id: "thread-b", updated: "2026-07-31T12:01:00Z" },
+  ];
+  let exportCalls = 0;
+  const exports: Record<string, unknown> = {
+    "thread-a": {
+      messages: [{
+        role: "assistant",
+        protocolMessageID: "shared",
+        protocolMessageVersion: 1,
+        usage: {
+          timestamp: "2026-07-31T12:00:00Z",
+          totalInputTokens: 10,
+          outputTokens: 2,
+        },
+      }],
+    },
+    "thread-b": {
+      messages: [{
+        role: "assistant",
+        protocolMessageID: "shared",
+        protocolMessageVersion: 2,
+        usage: {
+          timestamp: "2026-07-31T12:01:00Z",
+          totalInputTokens: 20,
+          outputTokens: 3,
+        },
+      }],
+    },
+  };
+  const runner = (args: string[]) => {
+    if (args[1] === "list") return Promise.resolve(JSON.stringify(rows));
+    exportCalls++;
+    return Promise.resolve(JSON.stringify(exports[args[2]]));
+  };
+
+  const cold = await collectAmpUsageWithCache(
+    context,
+    "amp",
+    "2026-07-31",
+    "UTC",
+    runner,
+  );
+  assertEquals(cold.exportedThreadCount, 2);
+  assertEquals(cold.reusedThreadCount, 0);
+  assertEquals(cold.usage.sessionCount, 2);
+  assertEquals(cold.usage.eventCount, 1);
+  assertEquals(cold.usage.inputTokens, 20);
+  assertEquals(cold.usage.totalTokens, 23);
+  assertEquals(stored.size, 2);
+
+  exportCalls = 0;
+  const warm = await collectAmpUsageWithCache(
+    context,
+    "amp",
+    "2026-07-31",
+    "America/Denver",
+    runner,
+  );
+  assertEquals(exportCalls, 0);
+  assertEquals(warm.exportedThreadCount, 0);
+  assertEquals(warm.reusedThreadCount, 2);
+  assertEquals(warm.usage, cold.usage);
+
+  rows = [rows[0], { ...rows[1], updated: "2026-07-31T12:02:00Z" }];
+  exports["thread-b"] = {
+    messages: [{
+      role: "assistant",
+      protocolMessageID: "shared",
+      protocolMessageVersion: 3,
+      usage: {
+        timestamp: "2026-07-31T12:02:00Z",
+        totalInputTokens: 30,
+        outputTokens: 4,
+      },
+    }],
+  };
+  exportCalls = 0;
+  const changed = await collectAmpUsageWithCache(
+    context,
+    "amp",
+    "2026-07-31",
+    "UTC",
+    runner,
+  );
+  assertEquals(exportCalls, 1);
+  assertEquals(changed.exportedThreadCount, 1);
+  assertEquals(changed.reusedThreadCount, 1);
+  assertEquals(changed.usage.eventCount, 1);
+  assertEquals(changed.usage.inputTokens, 30);
+  assertEquals(changed.usage.totalTokens, 34);
+  assertEquals(
+    ampUsageCacheName("thread-a") === ampUsageCacheName("thread-b"),
+    false,
+  );
+});
+
+Deno.test("local usage: Amp threads without update markers are never cached", async () => {
+  let exports = 0;
+  let writes = 0;
+  const context = {
+    readResource: (_name: string) => Promise.resolve(null),
+    writeResource: (
+      _specName: string,
+      _name: string,
+      _data: Record<string, unknown>,
+    ) => {
+      writes++;
+      return Promise.resolve({});
+    },
+  };
+  const runner = (args: string[]) => {
+    if (args[1] === "list") {
+      return Promise.resolve(JSON.stringify([{ id: "unknown-update" }]));
+    }
+    exports++;
+    return Promise.resolve(JSON.stringify({ messages: [] }));
+  };
+  await collectAmpUsageWithCache(context, "amp", "2026-07-31", "UTC", runner);
+  await collectAmpUsageWithCache(context, "amp", "2026-07-31", "UTC", runner);
+  assertEquals(exports, 2);
+  assertEquals(writes, 0);
 });
 
 Deno.test("local usage: combined totals are elementwise provider sums", () => {
@@ -381,7 +657,10 @@ Deno.test("local usage: combined totals are elementwise provider sums", () => {
   assertEquals(combined.inputTokens, 60);
   assertEquals(combined.outputTokens, 6);
   assertEquals(combined.totalTokens, 66);
-  assertEquals(combined.totalTokens, combined.inputTokens + combined.outputTokens);
+  assertEquals(
+    combined.totalTokens,
+    combined.inputTokens + combined.outputTokens,
+  );
 });
 
 Deno.test("InvokeArgsSchema: validates idle and wall timeout overrides independently", () => {
@@ -3941,7 +4220,10 @@ Deno.test("readGlobalAmpMcpServers: degrades to {} when settings absent or malfo
     assertEquals(await readGlobalAmpMcpServers(), {});
     // Malformed JSON.
     await Deno.mkdir(`${tmpHome}/.config/amp`, { recursive: true });
-    await Deno.writeTextFile(`${tmpHome}/.config/amp/settings.json`, "{not json");
+    await Deno.writeTextFile(
+      `${tmpHome}/.config/amp/settings.json`,
+      "{not json",
+    );
     assertEquals(await readGlobalAmpMcpServers(), {});
     // Non-object mcpServers.
     await Deno.writeTextFile(
@@ -4009,7 +4291,12 @@ Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools",
       { tool: string; action: string }
     >;
     // Allowlisted tools are allowed.
-    for (const tool of ["mcp__granola__list_meetings", "mcp__granola__get_meetings"]) {
+    for (
+      const tool of [
+        "mcp__granola__list_meetings",
+        "mcp__granola__get_meetings",
+      ]
+    ) {
       assertEquals(
         perms.some((r) => r.tool === tool && r.action === "allow"),
         true,
