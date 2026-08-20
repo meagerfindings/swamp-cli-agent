@@ -1448,8 +1448,10 @@ export function buildClaudeCommand(
  *
  * OpenCode 1.15.3 exposes its permission contract through named agents and
  * `--dangerously-skip-permissions`, not a generic tool allowlist. Select the
- * built-in `build` agent for actors and inject a primary readonly agent with
- * shell/edit/write disabled (the built-in `plan` agent still exposes shell).
+ * built-in `build` agent for actors and inject a primary readonly agent whose
+ * wildcard deny removes built-in, custom, plugin, and MCP mutation tools while
+ * allowing only read-oriented repository inspection (the built-in `plan`
+ * agent still exposes shell).
  * Actor invocations auto-approve permissions so a noninteractive `run` cannot
  * stop after narrating its intended tool call.
  */
@@ -1480,8 +1482,13 @@ export function buildOpencodeCommand(
           agent: {
             [readonlyAgent]: {
               mode: "primary",
-              tools: { bash: false, edit: false, write: false, task: false },
-              permission: { bash: "deny", edit: "deny", task: "deny" },
+              permission: {
+                "*": "deny",
+                read: "allow",
+                glob: "allow",
+                grep: "allow",
+                lsp: "allow",
+              },
             },
           },
         }),
@@ -4421,7 +4428,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.14.2",
+  version: "2026.08.20.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4566,6 +4573,12 @@ export const model = {
       toVersion: "2026.08.14.2",
       description:
         "Move Amp caching to timezone-independent latest-event sets per thread so protocol versions are globally deduplicated before local-day attribution, including versions that cross midnight. Cache schema replacement only; no global argument changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.20.1",
+      description:
+        "Select OpenCode's build agent and approve noninteractive actor permissions while injecting a write-disabled agent for readonly invocations. No global argument schema changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

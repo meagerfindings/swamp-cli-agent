@@ -1912,8 +1912,13 @@ Deno.test("buildOpencodeCommand: readonly disables write-capable tools without p
     agent: {
       "cli-agent-readonly": {
         mode: "primary",
-        tools: { bash: false, edit: false, write: false, task: false },
-        permission: { bash: "deny", edit: "deny", task: "deny" },
+        permission: {
+          "*": "deny",
+          read: "allow",
+          glob: "allow",
+          grep: "allow",
+          lsp: "allow",
+        },
       },
     },
   });
