@@ -22,6 +22,7 @@ import {
   buildBwrapArgs,
   buildClaudeCommand,
   buildGrokCommand,
+  buildOpencodeCommand,
   buildPiCommand,
   canonicalCwd,
   classifyFailure,
@@ -1864,6 +1865,58 @@ Deno.test("buildClaudeCommand: readonly profile scopes allowedTools, prompt stil
   ]);
   assertEquals(cmd.includes("--allowedTools"), false);
   assertEquals(cmd[cmd.length - 1], "Reply with only: hi");
+});
+
+Deno.test("buildOpencodeCommand: actor selects build and approves noninteractive tool use", () => {
+  const { cmd, stdin } = buildOpencodeCommand(
+    "opencode",
+    "opencode/deepseek-v4-flash-free",
+    "Make the requested repository edit",
+    "actor",
+  );
+  assertEquals(cmd, [
+    "opencode",
+    "run",
+    "--format",
+    "json",
+    "--model",
+    "opencode/deepseek-v4-flash-free",
+    "--agent",
+    "build",
+    "--dangerously-skip-permissions",
+    "Make the requested repository edit",
+  ]);
+  assertEquals(stdin, undefined);
+});
+
+Deno.test("buildOpencodeCommand: readonly disables write-capable tools without permission bypass", () => {
+  const { cmd, env } = buildOpencodeCommand(
+    "opencode",
+    "opencode/deepseek-v4-flash-free",
+    "Inspect the repository",
+    "readonly",
+  );
+  assertEquals(cmd, [
+    "opencode",
+    "run",
+    "--format",
+    "json",
+    "--model",
+    "opencode/deepseek-v4-flash-free",
+    "--agent",
+    "cli-agent-readonly",
+    "Inspect the repository",
+  ]);
+  assertEquals(cmd.includes("--dangerously-skip-permissions"), false);
+  assertEquals(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), {
+    agent: {
+      "cli-agent-readonly": {
+        mode: "primary",
+        tools: { bash: false, edit: false, write: false, task: false },
+        permission: { bash: "deny", edit: "deny", task: "deny" },
+      },
+    },
+  });
 });
 
 Deno.test("buildGrokCommand: actor profile argv contract, no stdin, no --no-auto-update", () => {

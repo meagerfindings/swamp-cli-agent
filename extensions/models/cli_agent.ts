@@ -1443,15 +1443,50 @@ export function buildClaudeCommand(
   return { cmd };
 }
 
-/** Build the command array for the OpenCode CLI. */
-function buildOpencodeCommand(
+/**
+ * Build the command array for the OpenCode CLI.
+ *
+ * OpenCode 1.15.3 exposes its permission contract through named agents and
+ * `--dangerously-skip-permissions`, not a generic tool allowlist. Select the
+ * built-in `build` agent for actors and inject a primary readonly agent with
+ * shell/edit/write disabled (the built-in `plan` agent still exposes shell).
+ * Actor invocations auto-approve permissions so a noninteractive `run` cannot
+ * stop after narrating its intended tool call.
+ */
+export function buildOpencodeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
-  _toolProfile: ToolProfile,
-): { cmd: string[]; stdin?: string } {
+  toolProfile: ToolProfile,
+): { cmd: string[]; stdin?: string; env?: Record<string, string> } {
+  const readonlyAgent = "cli-agent-readonly";
+  const permissionArgs = toolProfile === "actor"
+    ? ["--agent", "build", "--dangerously-skip-permissions"]
+    : ["--agent", readonlyAgent];
   return {
-    cmd: [cliPath, "run", "--format", "json", "--model", model, resolvedPrompt],
+    cmd: [
+      cliPath,
+      "run",
+      "--format",
+      "json",
+      "--model",
+      model,
+      ...permissionArgs,
+      resolvedPrompt,
+    ],
+    env: toolProfile === "readonly"
+      ? {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          agent: {
+            [readonlyAgent]: {
+              mode: "primary",
+              tools: { bash: false, edit: false, write: false, task: false },
+              permission: { bash: "deny", edit: "deny", task: "deny" },
+            },
+          },
+        }),
+      }
+      : undefined,
   };
 }
 
@@ -2699,8 +2734,8 @@ type CommandBuilder = (
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
 ) =>
-  | { cmd: string[]; stdin?: string }
-  | Promise<{ cmd: string[]; stdin?: string }>;
+  | { cmd: string[]; stdin?: string; env?: Record<string, string> }
+  | Promise<{ cmd: string[]; stdin?: string; env?: Record<string, string> }>;
 
 /**
  * Closed per-provider capability record.
@@ -2980,7 +3015,7 @@ async function runWithRetries(
   let retries = 0;
 
   while (retries <= opts.maxRetries) {
-    const { cmd, stdin } = await buildCommand(
+    const { cmd, stdin, env } = await buildCommand(
       cliPath,
       modelName,
       resolved,
@@ -2997,7 +3032,10 @@ async function runWithRetries(
       lastResult = await runCli(cmd, {
         cwd: opts.cwd,
         stdin,
-        env: piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : undefined,
+        env: {
+          ...env,
+          ...(piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : {}),
+        },
         wallTimeoutMs: opts.wallTimeoutMs,
         idleTimeoutMs: opts.idleTimeoutMs,
         sandbox: opts.sandbox,
