@@ -4471,7 +4471,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.20.2",
+  version: "2026.08.21.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4628,6 +4628,12 @@ export const model = {
       toVersion: "2026.08.20.2",
       description:
         "Retry clean provider responses that violate invokeAndParse's JSON object contract within the existing maxRetries budget, adding a focused repair instruction before each retry. Execution-only change; no schema or attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.21.1",
+      description:
+        "Wire JSON contract retries to invokeAndParse rather than invoke. Execution-only correction; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -4814,7 +4820,6 @@ export const model = {
               maxRetries,
               sandbox,
               toolAllowlist: args.toolAllowlist,
-              requireParseableJson: true,
             },
             context.logger,
           );
@@ -4997,6 +5002,7 @@ export const model = {
               maxRetries,
               sandbox,
               toolAllowlist: args.toolAllowlist,
+              requireParseableJson: true,
             },
             context.logger,
           );
