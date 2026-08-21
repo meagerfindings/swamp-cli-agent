@@ -2994,13 +2994,33 @@ export function parseJsonResponse(
   const jsonMatch = extractedText.match(
     /```(?:json)?\s*\n?([\s\S]*?)\n?```/,
   );
-  const jsonStr = jsonMatch
-    ? jsonMatch[1].trim()
-    : extractedText.match(/\{[\s\S]*\}/)?.[0];
-  if (!jsonStr) return null;
+  const source = jsonMatch ? jsonMatch[1].trim() : extractedText;
+  const start = source.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = -1;
+  for (let i = start; i < source.length; i++) {
+    const character = source[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{") depth++;
+    else if (character === "}" && --depth === 0) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end === -1) return null;
 
   try {
-    const parsed = JSON.parse(jsonStr);
+    const parsed = JSON.parse(source.slice(start, end));
     return parsed !== null && typeof parsed === "object" &&
         !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
@@ -4471,7 +4491,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.21.1",
+  version: "2026.08.21.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4634,6 +4654,12 @@ export const model = {
       toVersion: "2026.08.21.1",
       description:
         "Wire JSON contract retries to invokeAndParse rather than invoke. Execution-only correction; no schema or attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.21.2",
+      description:
+        "Extract the first balanced JSON object so a valid response remains parseable when a provider appends malformed closing delimiters. Parsing-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

@@ -4118,7 +4118,9 @@ Deno.test("classifyFailure: contract-violation wins even on a clean process exit
 Deno.test("parseJsonResponse accepts plain and fenced objects but rejects malformed JSON", () => {
   assertEquals(parseJsonResponse('{"ok":true}'), { ok: true });
   assertEquals(parseJsonResponse('```json\n{"ok":true}\n```'), { ok: true });
-  assertEquals(parseJsonResponse('{"ok":true}}'), null);
+  assertEquals(parseJsonResponse('{"ok":true}]}'), { ok: true });
+  assertEquals(parseJsonResponse('{"ok":true'), null);
+  assertEquals(parseJsonResponse('{"value":"}"}'), { value: "}" });
   assertEquals(parseJsonResponse("no object here"), null);
 });
 
@@ -4138,7 +4140,7 @@ count=$((count + 1))
 printf '%s' "$count" > ${JSON.stringify(countFile)}
 printf '%s\\n' "$*" >> ${JSON.stringify(promptFile)}
 if [ "$count" -eq 1 ]; then
-  printf '%s\\n' '{"type":"result","result":"{\\"ok\\":true}}"}'
+  printf '%s\\n' '{"type":"result","result":"{\\"ok\\":tru}"}'
 else
   printf '%s\\n' '{"type":"result","result":"{\\"ok\\":true}"}'
 fi
