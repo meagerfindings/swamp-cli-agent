@@ -57,6 +57,12 @@ as an API key or Claude's official `CLAUDE_CODE_OAUTH_TOKEN` generated with
 existing static Seatbelt policy is unchanged: Claude Code can use its normal
 Keychain-backed login while known file-backed credentials remain masked.
 
+On Linux, standard linked Git worktrees are supported under bwrap. The linked
+worktree remains the only writable repository path; its external common `.git`
+directory is mounted read-only with optional Git locking disabled, allowing
+agents to inspect branches, status, and diffs without exposing or mutating the
+parent checkout.
+
 For pi, pass the model in `provider/id` form (for example,
 `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.
 Pi 0.82.0 or newer is required. Pi extensions are always disabled. Sandboxed
