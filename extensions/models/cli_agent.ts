@@ -651,6 +651,7 @@ export function buildBwrapArgs(
   credentialAccess: "provider" | "isolated",
   nodePath: string | null = null,
   executableDirectoryPath: string | null = null,
+  gitMetadataPath: string | null = null,
 ): string[] {
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
@@ -762,18 +763,69 @@ export function buildBwrapArgs(
   if (cwd.startsWith(home + "/")) {
     args.push("--dir", cwd);
   }
+  if (gitMetadataPath?.startsWith(home + "/")) {
+    args.push("--dir", gitMetadataPath);
+  }
   args.push("--remount-ro", home);
   // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
   // under home (e.g. /home/user/tmp/...), binding it before --tmpfs home
   // would shadow it with the tmpfs. Binding after --remount-ro home creates
   // a writable mount point on top of the read-only home tree.
   args.push("--bind", cwd, cwd);
+  if (gitMetadataPath) {
+    args.push("--ro-bind", gitMetadataPath, gitMetadataPath);
+    args.push("--setenv", "GIT_OPTIONAL_LOCKS", "0");
+  }
   args.push("--setenv", "HOME", home);
 
   return [
     ...args,
     ...(executablePath ? [sandboxExecutable, ...cmd.slice(1)] : cmd),
   ];
+}
+
+/**
+ * Resolve the external common Git directory for a standard linked worktree.
+ *
+ * Linux bwrap exposes only the worktree by default, while its `.git` file
+ * points to metadata in the parent checkout. Mounting that common directory
+ * read-only restores Git inspection without exposing the parent checkout or
+ * allowing an agent to mutate repository metadata. Non-worktrees, malformed
+ * pointers, and non-standard layouts return `null`.
+ */
+export function resolveLinkedWorktreeGitMetadata(
+  cwd: string,
+  readTextFile: (path: string) => string = Deno.readTextFileSync,
+  realPath: (path: string) => string = Deno.realPathSync,
+): string | null {
+  try {
+    const pointer = readTextFile(`${cwd}/.git`).trim();
+    const match = /^gitdir:\s*(.+)$/i.exec(pointer);
+    if (!match) return null;
+
+    const gitDirInput = match[1].startsWith("/")
+      ? match[1]
+      : `${cwd}/${match[1]}`;
+    const gitDir = realPath(gitDirInput);
+    const commonPointer = readTextFile(`${gitDir}/commondir`).trim();
+    if (!commonPointer) return null;
+
+    const commonInput = commonPointer.startsWith("/")
+      ? commonPointer
+      : `${gitDir}/${commonPointer}`;
+    const commonDir = realPath(commonInput);
+
+    // Standard non-bare linked worktrees live below <common>/.git/worktrees.
+    // This constraint prevents a repository-controlled gitfile from causing
+    // an arbitrary host directory to be exposed inside the sandbox.
+    if (!commonDir.endsWith("/.git")) return null;
+    if (!gitDir.startsWith(`${commonDir}/worktrees/`)) return null;
+    if (commonDir === cwd || commonDir.startsWith(`${cwd}/`)) return null;
+
+    return commonDir;
+  } catch {
+    return null;
+  }
 }
 
 function resolveExecutablePath(command: string, cwd: string): string | null {
@@ -936,6 +988,7 @@ export function wrapWithSandbox(
         !executableAlreadyVisible
       ? executablePath.slice(0, executablePath.lastIndexOf("/"))
       : null;
+    const gitMetadataPath = resolveLinkedWorktreeGitMetadata(resolvedCwd);
     return [
       bwrapPath,
       ...buildBwrapArgs(
@@ -948,6 +1001,7 @@ export function wrapWithSandbox(
         sandbox.credentialAccess,
         hiddenNodePath,
         executableDirectoryPath,
+        gitMetadataPath,
       ),
     ];
   }
@@ -4491,7 +4545,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.21.2",
+  version: "2026.08.21.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4660,6 +4714,12 @@ export const model = {
       toVersion: "2026.08.21.2",
       description:
         "Extract the first balanced JSON object so a valid response remains parseable when a provider appends malformed closing delimiters. Parsing-only change; no schema or attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.21.3",
+      description:
+        "Expose standard linked-worktree Git metadata read-only inside Linux bwrap so sandboxed agents can inspect status and diffs without access to the parent checkout. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

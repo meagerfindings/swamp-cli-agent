@@ -57,6 +57,7 @@ import {
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
+  resolveLinkedWorktreeGitMetadata,
   resolveLocalUsageDay,
   resolveModel,
   runCli,
@@ -3444,6 +3445,81 @@ Deno.test("buildBwrapArgs: cwd bind is placed after --remount-ro home (not shado
   // The --bind target is the cwd
   assertEquals(argv[bindIdx + 1], "/home/agent/tmp/work");
   assertEquals(argv[bindIdx + 2], "/home/agent/tmp/work");
+});
+
+Deno.test("buildBwrapArgs: exposes linked-worktree Git metadata read-only after the home remount", () => {
+  const gitMetadata = "/home/agent/repo/.git";
+  const argv = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/home/agent/repo/trees/feature",
+    "/home/agent",
+    () => false,
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    gitMetadata,
+  );
+
+  const remountIdx = argv.indexOf("--remount-ro");
+  const metadataIdx = argv.indexOf(gitMetadata, remountIdx);
+  assertEquals(argv[metadataIdx - 1], "--ro-bind");
+  assertEquals(argv[metadataIdx + 1], gitMetadata);
+  assertEquals(metadataIdx > remountIdx, true);
+
+  const optionalLocksIdx = argv.indexOf("GIT_OPTIONAL_LOCKS");
+  assertEquals(argv.slice(optionalLocksIdx - 1, optionalLocksIdx + 2), [
+    "--setenv",
+    "GIT_OPTIONAL_LOCKS",
+    "0",
+  ]);
+});
+
+Deno.test("resolveLinkedWorktreeGitMetadata: resolves a standard linked worktree common directory", () => {
+  const files = new Map([
+    [
+      "/home/agent/repo/trees/feature/.git",
+      "gitdir: /home/agent/repo/.git/worktrees/feature\n",
+    ],
+    ["/home/agent/repo/.git/worktrees/feature/commondir", "../..\n"],
+  ]);
+  const canonical = new Map([
+    [
+      "/home/agent/repo/.git/worktrees/feature",
+      "/home/agent/repo/.git/worktrees/feature",
+    ],
+    ["/home/agent/repo/.git/worktrees/feature/../..", "/home/agent/repo/.git"],
+  ]);
+
+  assertEquals(
+    resolveLinkedWorktreeGitMetadata(
+      "/home/agent/repo/trees/feature",
+      (path) => {
+        const value = files.get(path);
+        if (value === undefined) throw new Error("missing fixture");
+        return value;
+      },
+      (path) => {
+        const value = canonical.get(path);
+        if (value === undefined) throw new Error("missing fixture");
+        return value;
+      },
+    ),
+    "/home/agent/repo/.git",
+  );
+});
+
+Deno.test("resolveLinkedWorktreeGitMetadata: rejects arbitrary gitfile targets", () => {
+  assertEquals(
+    resolveLinkedWorktreeGitMetadata(
+      "/home/agent/repo",
+      (path) => path.endsWith("/.git") ? "gitdir: /home/agent/.ssh" : "..",
+      (path) =>
+        path === "/home/agent/.ssh" ? "/home/agent/.ssh" : "/home/agent",
+    ),
+    null,
+  );
 });
 
 Deno.test("buildBwrapArgs: binds existing state dirs writable and masks existing credential files with /dev/null", () => {
