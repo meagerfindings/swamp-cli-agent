@@ -2987,19 +2987,44 @@ type RunOutcome = {
   ok: boolean;
 };
 
+/** Parse the object payload accepted by invokeAndParse from agent text. */
+export function parseJsonResponse(
+  extractedText: string,
+): Record<string, unknown> | null {
+  const jsonMatch = extractedText.match(
+    /```(?:json)?\s*\n?([\s\S]*?)\n?```/,
+  );
+  const jsonStr = jsonMatch
+    ? jsonMatch[1].trim()
+    : extractedText.match(/\{[\s\S]*\}/)?.[0];
+  if (!jsonStr) return null;
+
+  try {
+    const parsed = JSON.parse(jsonStr);
+    return parsed !== null && typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Run a provider CLI with retries, then detect provider-reported errors.
  *
- * Retries cover two distinct transient failure modes:
+ * Retries cover three failure modes:
  * - a transient *exit code* (137/143 — killed by signal), and
  * - a *retryable provider error* surfaced in the output stream (rate limit /
  *   quota / overloaded / 429), which the CLI itself does not retry and which
  *   typically exits non-transiently (e.g. 1) with zero assistant text.
+ * - a clean response that violates invokeAndParse's JSON contract, when
+ *   `requireParseableJson` is enabled.
  *
  * The second is the case that previously slipped through as a silent success:
  * the subprocess "succeeded" enough to exit, but the model never answered.
  */
-async function runWithRetries(
+export async function runWithRetries(
   provider: Provider,
   cliPath: string,
   modelName: string,
@@ -3012,6 +3037,8 @@ async function runWithRetries(
     maxRetries: number;
     sandbox?: SandboxConfig;
     toolAllowlist?: string[];
+    requireParseableJson?: boolean;
+    retryDelayMs?: number;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -3020,12 +3047,13 @@ async function runWithRetries(
   let lastResult: CmdResult | undefined;
   let providerError: ProviderError | null = null;
   let retries = 0;
+  let attemptPrompt = resolved;
 
   while (retries <= opts.maxRetries) {
     const { cmd, stdin, env } = await buildCommand(
       cliPath,
       modelName,
-      resolved,
+      attemptPrompt,
       toolProfile,
       opts.toolAllowlist,
     );
@@ -3065,22 +3093,37 @@ async function runWithRetries(
     const transientExit = !lastResult.success &&
       TRANSIENT_EXIT_CODES.has(lastResult.code);
     const retryableProviderError = providerError?.retryable === true;
+    const attemptTextSource = caps.combineStreams
+      ? [lastResult.stdout, lastResult.stderr].filter(Boolean).join("\n")
+      : lastResult.stdout;
+    const attemptText = caps.extractText(attemptTextSource);
+    const contractViolation = opts.requireParseableJson === true &&
+      lastResult.success && providerError === null &&
+      parseJsonResponse(attemptText) === null;
 
-    if (!transientExit && !retryableProviderError) break;
+    if (!transientExit && !retryableProviderError && !contractViolation) break;
 
     retries++;
     if (retries <= opts.maxRetries) {
       logger?.warning(
-        "Transient failure ({reason}), retrying ({retries}/{max})",
+        "Retryable failure ({reason}), retrying ({retries}/{max})",
         {
-          reason: retryableProviderError
+          reason: contractViolation
+            ? "contract:unparseable-json"
+            : retryableProviderError
             ? `provider:${providerError?.code ?? "rate_limit"}`
             : `exit ${lastResult.code}`,
           retries,
           max: opts.maxRetries,
         },
       );
-      await new Promise((r) => setTimeout(r, 5000 * retries));
+      if (contractViolation) {
+        attemptPrompt =
+          `${resolved}\n\nYour previous response could not be parsed as a JSON object. Return the complete response again as exactly one valid JSON object with no markdown or trailing text.`;
+      }
+      await new Promise((r) =>
+        setTimeout(r, (opts.retryDelayMs ?? 5000) * retries)
+      );
     }
   }
 
@@ -4428,7 +4471,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.20.1",
+  version: "2026.08.20.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4579,6 +4622,12 @@ export const model = {
       toVersion: "2026.08.20.1",
       description:
         "Select OpenCode's build agent and approve noninteractive actor permissions while injecting a write-disabled agent for readonly invocations. No global argument schema changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.20.2",
+      description:
+        "Retry clean provider responses that violate invokeAndParse's JSON object contract within the existing maxRetries budget, adding a focused repair instruction before each retry. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -4765,6 +4814,7 @@ export const model = {
               maxRetries,
               sandbox,
               toolAllowlist: args.toolAllowlist,
+              requireParseableJson: true,
             },
             context.logger,
           );
@@ -4983,19 +5033,7 @@ export const model = {
         }
         const { result, extractedText, providerError } = outcome;
 
-        // Parse JSON from extracted text
-        let parsedJson: Record<string, unknown> | null = null;
-        const jsonMatch = extractedText.match(
-          /```(?:json)?\s*\n?([\s\S]*?)\n?```/,
-        );
-        const jsonStr = jsonMatch
-          ? jsonMatch[1].trim()
-          : extractedText.match(/\{[\s\S]*\}/)?.[0];
-        if (jsonStr) {
-          try {
-            parsedJson = JSON.parse(jsonStr);
-          } catch { /* not valid JSON */ }
-        }
+        const parsedJson = parseJsonResponse(extractedText);
 
         // invokeAndParse additionally requires a parseable JSON payload. A run
         // that otherwise succeeded but produced no valid JSON is a

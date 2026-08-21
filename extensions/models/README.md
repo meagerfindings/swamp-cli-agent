@@ -116,7 +116,10 @@ Arguments:
 
 Run a CLI agent and parse JSON from the output. Looks for JSON in fenced code
 blocks or raw `{...}` in the response. Throws if the CLI fails or no valid
-JSON is found, but still persists the invocation record for debugging.
+JSON is found after the configured retry budget, but still persists the final
+invocation record for debugging. A clean response with malformed or missing
+JSON is retried with a focused JSON repair instruction before terminal evidence
+is written.
 
 ```sh
 swamp model method run my-agent invokeAndParse \

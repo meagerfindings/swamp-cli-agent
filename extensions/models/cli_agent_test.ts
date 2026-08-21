@@ -48,6 +48,7 @@ import {
   ModelIdSchema,
   normalizeTags,
   parseGrokModelsList,
+  parseJsonResponse,
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
   readGlobalAmpMcpServers,
@@ -59,6 +60,7 @@ import {
   resolveLocalUsageDay,
   resolveModel,
   runCli,
+  runWithRetries,
   SANDBOX_PROFILE_FILENAME,
   SANDBOX_STRICT_PROFILE_FILENAME,
   sandboxConfigFrom,
@@ -4111,6 +4113,125 @@ Deno.test("classifyFailure: contract-violation wins even on a clean process exit
     }),
     "contract-violation",
   );
+});
+
+Deno.test("parseJsonResponse accepts plain and fenced objects but rejects malformed JSON", () => {
+  assertEquals(parseJsonResponse('{"ok":true}'), { ok: true });
+  assertEquals(parseJsonResponse('```json\n{"ok":true}\n```'), { ok: true });
+  assertEquals(parseJsonResponse('{"ok":true}}'), null);
+  assertEquals(parseJsonResponse("no object here"), null);
+});
+
+Deno.test("runWithRetries repairs an invokeAndParse contract violation", async () => {
+  const dir = await Deno.makeTempDir();
+  const script = `${dir}/claude-fixture`;
+  const countFile = `${dir}/count`;
+  const promptFile = `${dir}/prompts`;
+  await Deno.writeTextFile(
+    script,
+    `#!/bin/sh
+count=0
+if [ -f ${JSON.stringify(countFile)} ]; then count=$(cat ${
+      JSON.stringify(countFile)
+    }); fi
+count=$((count + 1))
+printf '%s' "$count" > ${JSON.stringify(countFile)}
+printf '%s\\n' "$*" >> ${JSON.stringify(promptFile)}
+if [ "$count" -eq 1 ]; then
+  printf '%s\\n' '{"type":"result","result":"{\\"ok\\":true}}"}'
+else
+  printf '%s\\n' '{"type":"result","result":"{\\"ok\\":true}"}'
+fi
+`,
+  );
+  await Deno.chmod(script, 0o700);
+
+  try {
+    const outcome = await runWithRetries(
+      "claude",
+      script,
+      "test-model",
+      "Return JSON",
+      "readonly",
+      {
+        cwd: dir,
+        wallTimeoutMs: 5_000,
+        idleTimeoutMs: 5_000,
+        maxRetries: 2,
+        retryDelayMs: 1,
+        requireParseableJson: true,
+        sandbox: {
+          mode: "off",
+          provider: "claude",
+          credentialAccess: "provider",
+          network: "allow",
+          profilePath: "",
+          required: false,
+        },
+      },
+    );
+
+    assertEquals(outcome.ok, true);
+    assertEquals(outcome.retries, 1);
+    assertEquals(parseJsonResponse(outcome.extractedText), { ok: true });
+    assertStringIncludes(
+      await Deno.readTextFile(promptFile),
+      "previous response could not be parsed as a JSON object",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("runWithRetries exhausts the shared budget for JSON contract violations", async () => {
+  const dir = await Deno.makeTempDir();
+  const script = `${dir}/claude-fixture`;
+  const countFile = `${dir}/count`;
+  await Deno.writeTextFile(
+    script,
+    `#!/bin/sh
+count=0
+if [ -f ${JSON.stringify(countFile)} ]; then count=$(cat ${
+      JSON.stringify(countFile)
+    }); fi
+count=$((count + 1))
+printf '%s' "$count" > ${JSON.stringify(countFile)}
+printf '%s\\n' '{"type":"result","result":"not json"}'
+`,
+  );
+  await Deno.chmod(script, 0o700);
+
+  try {
+    const outcome = await runWithRetries(
+      "claude",
+      script,
+      "test-model",
+      "Return JSON",
+      "readonly",
+      {
+        cwd: dir,
+        wallTimeoutMs: 5_000,
+        idleTimeoutMs: 5_000,
+        maxRetries: 2,
+        retryDelayMs: 1,
+        requireParseableJson: true,
+        sandbox: {
+          mode: "off",
+          provider: "claude",
+          credentialAccess: "provider",
+          network: "allow",
+          profilePath: "",
+          required: false,
+        },
+      },
+    );
+
+    assertEquals(await Deno.readTextFile(countFile), "3");
+    assertEquals(outcome.retries, 3);
+    assertEquals(parseJsonResponse(outcome.extractedText), null);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 });
 
 Deno.test("classifyFailure: a provider error that isn't throttling classifies as unknown, not infrastructure", () => {
