@@ -2044,6 +2044,58 @@ Deno.test("resolveModel: explicit, configured global, and unconfigured-opus→pr
   );
 });
 
+Deno.test("resolveModel: opencode rejects effective Anthropic models and aliases", () => {
+  for (
+    const modelId of [
+      "anthropic/claude-sonnet-4",
+      "OpenRouter/Anthropic/Claude-Opus-4.1",
+      "gateway/team/ANTHROPIC/model",
+      "openrouter/vendor/my-claude-compatible-model",
+      "haiku",
+      "vendor/SONNET/latest",
+      "openrouter/vendor/OpUs",
+    ]
+  ) {
+    assertThrows(
+      () => resolveModel("opencode", modelId, "openai/gpt-5"),
+      Error,
+      "opencode cannot use Anthropic/Claude model",
+    );
+  }
+
+  // The same guard applies when the effective model is inherited globally.
+  for (
+    const globalDefault of [
+      "ANTHROPIC/model",
+      "vendor/claude-4",
+      "Haiku",
+      "Sonnet",
+      "opus",
+    ]
+  ) {
+    assertThrows(
+      () => resolveModel("opencode", undefined, globalDefault),
+      Error,
+      "opencode cannot use Anthropic/Claude model",
+    );
+  }
+});
+
+Deno.test("resolveModel: native Claude and non-Anthropic opencode routes remain valid", () => {
+  assertEquals(resolveModel("claude", "OpUs", "sonnet"), "OpUs");
+  for (
+    const modelId of [
+      "openai/gpt-5",
+      "openrouter/moonshotai/kimi-k3",
+      "vendor/anthropic-compatible",
+      "vendor/sonnet-derivative",
+    ]
+  ) {
+    assertEquals(resolveModel("opencode", modelId, "opus"), modelId);
+    assertEquals(resolveModel("opencode", undefined, modelId), modelId);
+  }
+});
+
 Deno.test("PROVIDERS registry: capabilities closed; extractors and listModels on adapters", () => {
   const keys = Object.keys(PROVIDERS).sort();
   assertEquals(keys, [
