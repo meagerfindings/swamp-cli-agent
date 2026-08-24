@@ -16,6 +16,7 @@ import {
   aggregateAmpUsage,
   aggregateClaudeUsage,
   aggregateCodexUsage,
+  ampReportedSuccess,
   ampUsageCacheName,
   arbitrateSignalOutcome,
   buildAmpCommand,
@@ -1733,6 +1734,20 @@ Deno.test("extractError: claude/amp detect is_error result events", () => {
   // A successful result must NOT be flagged as an error.
   assertEquals(extractError("claude", CLAUDE_OUTPUT), null);
   assertEquals(extractError("amp", AMP_OUTPUT), null);
+});
+
+Deno.test("ampReportedSuccess requires a terminal successful result event", () => {
+  assertEquals(ampReportedSuccess(AMP_OUTPUT), true);
+  assertEquals(
+    ampReportedSuccess(JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      result: "failed",
+    })),
+    false,
+  );
+  assertEquals(ampReportedSuccess("not json"), false);
 });
 
 Deno.test("extractError: gemini detects a top-level error field", () => {
@@ -3476,6 +3491,57 @@ Deno.test("buildBwrapArgs: exposes linked-worktree Git metadata read-only after 
   ]);
 });
 
+Deno.test("buildBwrapArgs: exposes generated provider settings read-only inside the private tmpfs", () => {
+  const settingsFile = "/tmp/amp-settings-123.json";
+  const argv = buildBwrapArgs(
+    ["amp", "--settings-file", settingsFile, "-x", "--stream-json"],
+    "/home/agent/repo",
+    "/home/agent",
+    (path) => path === settingsFile,
+    null,
+    "amp",
+    "provider",
+    null,
+    null,
+    null,
+    [settingsFile],
+  );
+
+  const settingsIdx = argv.indexOf(settingsFile);
+  assertEquals(argv[settingsIdx - 1], "--ro-bind");
+  assertEquals(argv[settingsIdx + 1], settingsFile);
+  assertEquals(
+    settingsIdx > argv.indexOf("/tmp"),
+    true,
+    "settings bind must layer on top of the private /tmp mount",
+  );
+});
+
+Deno.test("buildBwrapArgs: preserves Amp's compiled executable path after the home remount", () => {
+  const executable = "/home/agent/.amp/bin/amp";
+  const argv = buildBwrapArgs(
+    ["amp", "-x", "--stream-json"],
+    "/home/agent/repo",
+    "/home/agent",
+    (path) => path === executable,
+    executable,
+    "amp",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    true,
+  );
+
+  const remountIdx = argv.indexOf("--remount-ro");
+  const executableIdx = argv.indexOf(executable, remountIdx);
+  assertEquals(argv[executableIdx - 1], "--ro-bind");
+  assertEquals(argv[executableIdx + 1], executable);
+  assertEquals(argv.slice(-3), [executable, "-x", "--stream-json"]);
+  assertEquals(argv.includes("/run/cli-agent/provider"), false);
+});
+
 Deno.test("resolveLinkedWorktreeGitMetadata: resolves a standard linked worktree common directory", () => {
   const files = new Map([
     [
@@ -3660,6 +3726,35 @@ Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's cr
     assertEquals(argv[index - 2], "--ro-bind");
     assertEquals(argv[index - 1], "/dev/null");
   }
+});
+
+Deno.test("buildBwrapArgs: Amp receives only its required login files, not its state tree", () => {
+  const home = "/home/agent";
+  const ampFiles = [
+    `${home}/.local/share/amp/device-id.json`,
+    `${home}/.local/share/amp/secrets.json`,
+    `${home}/.local/share/amp/session.json`,
+  ];
+  const argv = buildBwrapArgs(
+    ["amp", "-x"],
+    "/work",
+    home,
+    (path) => ampFiles.includes(path),
+    null,
+    "amp",
+    "provider",
+  );
+
+  for (const file of ampFiles) {
+    const index = argv.indexOf(file);
+    assertEquals(argv[index - 1], "--bind");
+    assertEquals(argv[index + 1], file);
+  }
+  const stateDir = `${home}/.local/share/amp`;
+  const stateDirIdx = argv.indexOf(stateDir);
+  assertEquals(argv[stateDirIdx - 1], "--tmpfs");
+  assertEquals(argv.includes(`${home}/.local/share/amp/history.jsonl`), false);
+  assertEquals(argv.includes(`${home}/.local/share/amp/runner`), false);
 });
 
 Deno.test("buildBwrapArgs: never exposes the host ~/.pi tree", () => {
@@ -4514,6 +4609,7 @@ Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServ
       "readonly",
     );
     assertEquals(stdin, "list my meetings");
+    assertEquals(cmd.includes("--no-ide"), true);
     const sfIndex = cmd.indexOf("--settings-file");
     assertEquals(sfIndex >= 0, true);
     const written = JSON.parse(await Deno.readTextFile(cmd[sfIndex + 1]));

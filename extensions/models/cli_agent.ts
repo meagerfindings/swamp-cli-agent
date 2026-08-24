@@ -496,7 +496,10 @@ export const BWRAP_PATH = "/usr/bin/bwrap";
  * known credential-file literal on the researched machine (the macOS
  * profile denies read of the whole subpath instead) — deliberately NOT
  * bound at all on Linux (see STATE_DIRS below), so it is absent rather
- * than masked.
+ * than masked. Amp's current login is stored separately under
+ * `~/.local/share/amp`; only its three required identity/session files are
+ * exposed to Amp in provider credential mode, never the surrounding history
+ * and runner state.
  *
  * Codex's files (`~/.codex/...`) are included even though `~/.codex` does
  * not exist on the roccinante Linux box this backend was proven on — the
@@ -527,6 +530,11 @@ const PROVIDER_CREDENTIAL_FILES: Partial<Record<Provider, readonly string[]>> =
     claude: [".claude.json", ".claude/.credentials.json"],
     codex: [".codex/auth.json", ".codex/config.toml"],
     opencode: [".local/share/opencode/auth.json"],
+    amp: [
+      ".local/share/amp/device-id.json",
+      ".local/share/amp/secrets.json",
+      ".local/share/amp/session.json",
+    ],
   };
 
 const CREDENTIAL_FILES: readonly string[] = [
@@ -559,6 +567,12 @@ const STATE_DIRS: string[] = [
 
 const PROVIDER_STATE_DIRS: Partial<Record<Provider, readonly string[]>> = {
   gemini: [".gemini"],
+};
+
+const PROVIDER_EPHEMERAL_STATE_DIRS: Partial<
+  Record<Provider, readonly string[]>
+> = {
+  amp: [".local/share/amp"],
 };
 
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
@@ -640,7 +654,9 @@ type BwrapArg = string;
  * value the same way `wrapWithSandbox` already resolves `HOME` for Seatbelt.
  * `executablePath` is the resolved host file to mount at the stable sandbox
  * path, or null when the command is already reachable through an existing
- * bind.
+ * bind. `extraReadOnlyFiles` layers generated provider configuration files on
+ * top of the private tmpfs so the child can read them without exposing host
+ * `/tmp` or allowing the child to modify its own policy.
  */
 export function buildBwrapArgs(
   cmd: string[],
@@ -653,9 +669,13 @@ export function buildBwrapArgs(
   nodePath: string | null = null,
   executableDirectoryPath: string | null = null,
   gitMetadataPath: string | null = null,
+  extraReadOnlyFiles: readonly string[] = [],
+  preserveExecutablePath = false,
 ): string[] {
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
-  const sandboxExecutable = executableDirectoryPath
+  const sandboxExecutable = preserveExecutablePath && executablePath
+    ? executablePath
+    : executableDirectoryPath
     ? `/run/cli-agent/provider-package/${executableName}`
     : "/run/cli-agent/provider";
   const sandboxNode = "/run/cli-agent/node";
@@ -703,7 +723,25 @@ export function buildBwrapArgs(
     home,
   ];
 
-  if (executablePath && executableDirectoryPath) {
+  for (const path of extraReadOnlyFiles) {
+    if (pathExists(path)) {
+      args.push("--ro-bind", path, path);
+    }
+  }
+
+  if (executablePath && preserveExecutablePath) {
+    if (executablePath.startsWith(home + "/")) {
+      args.push(
+        "--dir",
+        executablePath.slice(0, executablePath.lastIndexOf("/")),
+        "--ro-bind",
+        "/dev/null",
+        executablePath,
+      );
+    } else {
+      args.push("--ro-bind", executablePath, executablePath);
+    }
+  } else if (executablePath && executableDirectoryPath) {
     args.push(
       "--dir",
       "/run/cli-agent",
@@ -743,12 +781,29 @@ export function buildBwrapArgs(
     }
   }
 
+  const providerEphemeralStateDirs = credentialAccess === "provider"
+    ? PROVIDER_EPHEMERAL_STATE_DIRS[provider] ?? []
+    : [];
+  for (const rel of providerEphemeralStateDirs) {
+    args.push("--tmpfs", `${home}/${rel}`);
+  }
+
   const permittedCredentialFiles = credentialAccess === "provider"
     ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
     : new Set<string>();
+  const createdCredentialDirs = new Set(
+    providerEphemeralStateDirs.map((rel) => `${home}/${rel}`),
+  );
   for (const rel of CREDENTIAL_FILES) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
+      if (permittedCredentialFiles.has(rel)) {
+        const parent = abs.slice(0, abs.lastIndexOf("/"));
+        if (!createdCredentialDirs.has(parent)) {
+          args.push("--dir", parent);
+          createdCredentialDirs.add(parent);
+        }
+      }
       args.push(
         permittedCredentialFiles.has(rel) ? "--bind" : "--ro-bind",
         permittedCredentialFiles.has(rel) ? abs : "/dev/null",
@@ -768,6 +823,9 @@ export function buildBwrapArgs(
     args.push("--dir", gitMetadataPath);
   }
   args.push("--remount-ro", home);
+  if (preserveExecutablePath && executablePath?.startsWith(home + "/")) {
+    args.push("--ro-bind", executablePath, executablePath);
+  }
   // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
   // under home (e.g. /home/user/tmp/...), binding it before --tmpfs home
   // would shadow it with the tmpfs. Binding after --remount-ro home creates
@@ -990,6 +1048,15 @@ export function wrapWithSandbox(
       ? executablePath.slice(0, executablePath.lastIndexOf("/"))
       : null;
     const gitMetadataPath = resolveLinkedWorktreeGitMetadata(resolvedCwd);
+    // Amp's generated permission settings live in host /tmp. The private
+    // bwrap /tmp intentionally hides that host directory, so bind only this
+    // exact policy file read-only rather than exposing all temporary files.
+    const settingsFlagIndex = sandbox.provider === "amp"
+      ? cmd.indexOf("--settings-file")
+      : -1;
+    const ampSettingsFile = settingsFlagIndex >= 0
+      ? cmd[settingsFlagIndex + 1]
+      : undefined;
     return [
       bwrapPath,
       ...buildBwrapArgs(
@@ -1003,6 +1070,8 @@ export function wrapWithSandbox(
         hiddenNodePath,
         executableDirectoryPath,
         gitMetadataPath,
+        ampSettingsFile ? [ampSettingsFile] : [],
+        sandbox.provider === "amp",
       ),
     ];
   }
@@ -1678,6 +1747,7 @@ export async function buildAmpCommand(
   return {
     cmd: [
       cliPath,
+      "--no-ide",
       "--settings-file",
       settingsFile,
       "-x",
@@ -2066,6 +2136,22 @@ function extractTextImpl(provider: Provider, rawOutput: string): string {
     default:
       return assertNever(provider);
   }
+}
+
+/**
+ * Amp's terminal success event is authoritative even if an auxiliary service
+ * fails during CLI shutdown. This matters on hosts where an IDE/config file
+ * watcher can exhaust inotify after the agent has already completed its turn.
+ */
+export function ampReportedSuccess(rawOutput: string): boolean {
+  for (const line of rawOutput.split("\n").reverse()) {
+    try {
+      const event = JSON.parse(line);
+      if (event.type !== "result") continue;
+      return event.subtype === "success" && event.is_error !== true;
+    } catch { /* not JSON */ }
+  }
+  return false;
 }
 
 /** Public extractor — dispatches through the closed PROVIDERS adapter. */
@@ -3165,7 +3251,9 @@ export async function runWithRetries(
       : lastResult.stdout;
     providerError = caps.extractError(errorSource);
 
-    const transientExit = !lastResult.success &&
+    const commandSucceeded = lastResult.success ||
+      (provider === "amp" && ampReportedSuccess(lastResult.stdout));
+    const transientExit = !commandSucceeded &&
       TRANSIENT_EXIT_CODES.has(lastResult.code);
     const retryableProviderError = providerError?.retryable === true;
     const attemptTextSource = caps.combineStreams
@@ -3173,7 +3261,7 @@ export async function runWithRetries(
       : lastResult.stdout;
     const attemptText = caps.extractText(attemptTextSource);
     const contractViolation = opts.requireParseableJson === true &&
-      lastResult.success && providerError === null &&
+      commandSucceeded && providerError === null &&
       parseJsonResponse(attemptText) === null;
 
     if (!transientExit && !retryableProviderError && !contractViolation) break;
@@ -3213,7 +3301,9 @@ export async function runWithRetries(
     extractedText = providerError.message;
   }
   const usage = caps.extractUsage(result.stdout);
-  const ok = result.success && providerError === null;
+  const commandSucceeded = result.success ||
+    (provider === "amp" && ampReportedSuccess(result.stdout));
+  const ok = commandSucceeded && providerError === null;
 
   return { result, retries, providerError, extractedText, usage, ok };
 }
@@ -3258,7 +3348,7 @@ function buildInvocationBase(
       ? `provider_error:${providerError.code ?? "unknown"}`
       : result.timedOut
       ? result.timeoutReason
-      : !result.success
+      : !outcome.ok
       ? `exit_${result.code}`
       : undefined,
     // Deterministic typed failure class (absent on success). invokeAndParse
@@ -4546,7 +4636,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.24.1",
+  version: "2026.08.24.2",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4733,6 +4823,12 @@ export const model = {
       toVersion: "2026.08.24.1",
       description:
         "Package orb transport only through the base model to avoid duplicate extension registration warnings. No schema or behavior change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.24.2",
+      description:
+        "Make Amp usable in mandatory Linux bwrap sandboxes by exposing only its generated settings, required login files, original executable path, and ephemeral writable state; disable IDE integration and honor Amp's terminal success protocol event during shutdown watcher failures. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
