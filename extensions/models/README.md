@@ -198,6 +198,26 @@ Arguments:
 | ---------- | ---- | -------- | ---------------------------------------------------- |
 | `provider` | enum | no       | Provider to enumerate (defaults to `defaultProvider`) |
 
+### Optional Software Factory orb transport
+
+The extension also adds an opt-in, serialized transport for handing one
+existing Swamp Software Factory work item to an Amp orb. It is configuration
+driven: callers supply the Amp project, repository, factory model identity,
+implementation workflow, terminal stage, and required completion evidence.
+Nothing dispatches an orb unless `dispatchFactoryOrb` is called explicitly.
+
+The transport persists a claim before spawning Amp, binds the emitted thread
+and orb checkout identities, refuses recursive dispatch from `AMP_ORB=1`, and
+allows one active dispatch per model instance. `refreshFactoryOrbStatus` reads
+authoritative factory state without advancing it. `continueFactoryOrb` resumes
+only the stored thread. `archiveFactoryOrb` requires the configured terminal
+stage and evidence, no pending approvals, and a clean registered checkout.
+
+Use a dedicated `@mgreten/cli-agent` model instance for orb dispatch so its
+per-model serialization does not contend with ordinary local invocations. The
+calling repository should own the workflow and factory-specific values. The
+transport always uses standard Amp medium mode and never enables Fast mode.
+
 ### `collectLocalUsage`
 
 Aggregate one local calendar day of native token usage from Claude Code

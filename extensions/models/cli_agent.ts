@@ -12,6 +12,7 @@
  */
 
 import { z } from "npm:zod@4";
+import { orbMethods, orbResources } from "./cli_agent_orb.ts";
 
 // Schemas below are written without explicit z.Zod* type annotations: zod 4's
 // inferred types are the source of truth, and pinning them by hand (e.g.
@@ -4545,7 +4546,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.21.3",
+  version: "2026.08.24.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4722,8 +4723,21 @@ export const model = {
         "Expose standard linked-worktree Git metadata read-only inside Linux bwrap so sandboxed agents can inspect status and diffs without access to the parent checkout. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.08.23.1",
+      description:
+        "Add an optional serialized Amp orb transport extension for externally configured software factories. Additive methods and resources only; no model attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.24.1",
+      description:
+        "Package orb transport only through the base model to avoid duplicate extension registration warnings. No schema or behavior change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
+    ...orbResources,
     localUsage: {
       description:
         "Daily native-client token usage aggregated from local Claude Code, Amp, and Codex sessions",
@@ -4773,6 +4787,7 @@ export const model = {
     },
   },
   methods: {
+    ...orbMethods,
     collectLocalUsage: {
       description:
         "Aggregate one local calendar day of native Claude Code, Amp, and Codex CLI token usage without reading cli-agent invocation resources",
