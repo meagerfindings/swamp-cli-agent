@@ -791,13 +791,3 @@ export const orbMethods = {
     },
   },
 };
-
-// Retain the extension shape for focused tests and repositories that imported
-// this module directly before the orb transport became part of the base model.
-export const extension = {
-  type: "@mgreten/cli-agent",
-  description:
-    "Optional serialized whole-work-item Amp orb transport for a configured software factory",
-  resources: orbResources,
-  methods: [orbMethods],
-};

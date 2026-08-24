@@ -1,9 +1,9 @@
 // deno-lint-ignore-file no-import-prefix
 import {
   continuationArguments,
-  extension,
   factoryOrbPrompt,
   launchArguments,
+  orbMethods,
   parseThreadId,
 } from "./cli_agent_orb.ts";
 import {
@@ -229,7 +229,7 @@ Deno.test("stream init parsing requires one unique valid thread identity", () =>
 
 Deno.test("dispatch persists claim before session and exact replay never respawns", async () => {
   const f = fixture();
-  const method = extension.methods[0].dispatchFactoryOrb;
+  const method = orbMethods.dispatchFactoryOrb;
   const first = await method.execute(dispatchArgs(), f.context);
   assertEquals(first.dataHandles.length, 2);
   assertEquals(f.writes.map((write) => write[2].transportStatus), [
@@ -253,7 +253,7 @@ Deno.test("dispatch persists claim before session and exact replay never respawn
 
 Deno.test("dedicated serialized dispatch refuses another active work item before spawn", async () => {
   const f = fixture();
-  const method = extension.methods[0].dispatchFactoryOrb;
+  const method = orbMethods.dispatchFactoryOrb;
   await method.execute(dispatchArgs("ORB-1"), f.context);
   await assertRejects(
     () => method.execute(dispatchArgs("ORB-2"), f.context),
@@ -267,7 +267,7 @@ Deno.test("missing session identity parks durable transport without a blind retr
   const f = fixture({ ampOutput: "not-json" });
   await assertRejects(
     () =>
-      extension.methods[0].dispatchFactoryOrb.execute(
+      orbMethods.dispatchFactoryOrb.execute(
         dispatchArgs(),
         f.context,
       ),
@@ -282,7 +282,7 @@ Deno.test("missing session identity parks durable transport without a blind retr
 });
 
 Deno.test("lowest dispatch boundary rejects recursive orb spawn", () => {
-  const source = extension.methods[0].dispatchFactoryOrb.execute.toString();
+  const source = orbMethods.dispatchFactoryOrb.execute.toString();
   assert(source.includes('Deno.env.get("AMP_ORB") === "1"'));
   assert(
     source.indexOf("recursive factory orb dispatch is forbidden") <
@@ -291,7 +291,7 @@ Deno.test("lowest dispatch boundary rejects recursive orb spawn", () => {
 });
 
 Deno.test("archive uses the documented Amp thread command without Fast mode", () => {
-  const source = extension.methods[0].archiveFactoryOrb.execute.toString();
+  const source = orbMethods.archiveFactoryOrb.execute.toString();
   assert(/"threads",\s*"archive"/.test(source));
   assert(source.includes('transportStatus: result.success ? "archived"'));
   assertFalse(source.includes("--fast"));

@@ -4546,7 +4546,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.23.1",
+  version: "2026.08.24.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4727,6 +4727,12 @@ export const model = {
       toVersion: "2026.08.23.1",
       description:
         "Add an optional serialized Amp orb transport extension for externally configured software factories. Additive methods and resources only; no model attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.24.1",
+      description:
+        "Package orb transport only through the base model to avoid duplicate extension registration warnings. No schema or behavior change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
