@@ -18,6 +18,7 @@ import {
   aggregateCodexUsage,
   ampUsageCacheName,
   arbitrateSignalOutcome,
+  attestAmpPermissions,
   buildAmpCommand,
   buildBwrapArgs,
   buildClaudeCommand,
@@ -979,6 +980,75 @@ function terminal(
 Deno.test("launch claim remains backward compatible when repository expectation is omitted", async () => {
   const c = await claim("invoke", { repositoryExpectation: undefined });
   assertEquals(c.repositoryExpectation, undefined);
+});
+
+Deno.test("Amp permissions attestation normalizes reordered equivalent allowlists", async () => {
+  const first = await attestAmpPermissions("actor", [
+    "tool_b",
+    "tool_a",
+    "tool_a",
+  ]);
+  const second = await attestAmpPermissions("actor", ["tool_a", "tool_b"]);
+  assertEquals(first, second);
+});
+
+Deno.test("Amp permissions attestation changes with effective permissions", async () => {
+  const first = await attestAmpPermissions("actor", ["tool_a"]);
+  const second = await attestAmpPermissions("actor", ["tool_b"]);
+  assertEquals(first.canonicalSha256 === second.canonicalSha256, false);
+  assertEquals(
+    JSON.stringify(first.rules) === JSON.stringify(second.rules),
+    false,
+  );
+});
+
+Deno.test("Amp deny-all rules are attested exactly", async () => {
+  const attestation = await attestAmpPermissions("actor", []);
+  assertEquals(attestation.rules, [
+    {
+      tool: "Bash",
+      action: "reject",
+      matches: { cmd: ["git push*", "curl*", "rm -rf*"] },
+    },
+    { tool: "*", action: "reject" },
+  ]);
+  assertEquals(attestation.schemaVersion, 1);
+  assertEquals(attestation.canonicalSha256.length, 64);
+});
+
+Deno.test("Amp claim permission absence and mismatch fail closed", async () => {
+  const legacy = await claim("invoke", { provider: "amp", cliPath: "amp" });
+  assertEquals(legacy.ampPermissions, undefined);
+  const attested = await claim("invoke", {
+    provider: "amp",
+    cliPath: "amp",
+    ampPermissions: await attestAmpPermissions("actor", []),
+  });
+  const stored: Stored = new Map([["launch-claim-owned-1", legacy]]);
+  await assertRejects(
+    () =>
+      launchCallerInvocation(
+        resourceContext(stored).context,
+        attested,
+        () => Promise.resolve("unsafe"),
+      ),
+    Error,
+    "Conflicting durable resource",
+  );
+
+  const mismatched = structuredClone(attested);
+  mismatched.ampPermissions!.canonicalSha256 = "f".repeat(64);
+  stored.set("launch-claim-owned-1", attested);
+  await assertRejects(
+    () =>
+      launchCallerInvocation(
+        resourceContext(stored).context,
+        mismatched,
+        () => Promise.resolve("unsafe"),
+      ),
+    Error,
+    "Invalid Amp permissions attestation hash",
+  );
 });
 
 Deno.test("exact constrained replay skips the launch callback", async () => {

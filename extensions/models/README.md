@@ -139,6 +139,16 @@ with different execution inputs fails; consistent terminal records replay withou
 launching again, while partial or inconsistent records fail closed. Omitting it
 preserves generated-UUID behavior.
 
+For Amp, new claims also contain `ampPermissions.schemaVersion`, the normalized
+effective `ampPermissions.rules`, and `ampPermissions.canonicalSha256`. The hash
+is lowercase SHA-256 over the UTF-8 bytes of the recursively key-sorted,
+whitespace-free canonical value `{schemaVersion:1,rules:[...]}`. Tool allowlists
+are deduplicated and lexicographically sorted before rules are generated, so
+reordering does not change identity. An explicitly empty allowlist is deny-all.
+Consumers requiring Amp permission proof must reject a missing field, an unknown
+schema version, a hash mismatch, or rules other than their required policy;
+absence is accepted by this extension only to keep legacy claims readable.
+
 `repositoryExpectation` is optional and strict/all-or-none. It may only be
 supplied with a caller-owned `invocationId`; generated invocation IDs are rejected
 by both `invoke` and `invokeAndParse`. When supplied, the method canonicalizes `cwd` and, under Swamp's per-model method serialization,

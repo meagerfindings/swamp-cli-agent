@@ -258,6 +258,19 @@ export const InvocationLaunchClaimSchema = z.object({
   wallTimeoutMs: TimeoutMsSchema,
   maxRetries: z.number(),
   toolProfile: ToolProfileEnum,
+  ampPermissions: z.object({
+    schemaVersion: z.literal(1),
+    rules: z.array(
+      z.object({
+        tool: z.string().min(1),
+        action: z.enum(["allow", "reject"]),
+        matches: z.object({ cmd: z.array(z.string()) }).strict().optional(),
+      }).strict(),
+    ),
+    canonicalSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  }).strict().optional().describe(
+    "Normalized effective Amp permission rules and SHA-256 attestation. Absent on non-Amp and legacy claims; consumers requiring permission proof must fail closed when absent.",
+  ),
   sandbox: z.object({
     mode: SandboxModeEnum,
     provider: ProviderEnum,
@@ -1585,21 +1598,41 @@ const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
  * caller listed it), each allowlisted tool becomes an `allow`, and a trailing
  * catch-all `reject` denies every other tool. Rules are first-match-wins.
  */
-function ampPermissions(
+export function ampPermissions(
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
 ): unknown[] {
-  if (!toolAllowlist || toolAllowlist.length === 0) {
+  if (toolAllowlist === undefined) {
     return AMP_PERMISSIONS[toolProfile];
   }
+  const normalizedAllowlist = [...new Set(toolAllowlist)].sort((a, b) =>
+    a.localeCompare(b)
+  );
   const profileRejects = AMP_PERMISSIONS[toolProfile].filter(
     (rule) => (rule as { action?: string }).action === "reject",
   );
   return [
     ...profileRejects,
-    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
+    ...normalizedAllowlist.map((tool) => ({ tool, action: "allow" })),
     { tool: "*", action: "reject" },
   ];
+}
+
+/** Build the versioned, deterministic attestation persisted in launch claims. */
+export async function attestAmpPermissions(
+  toolProfile: ToolProfile,
+  toolAllowlist?: string[],
+) {
+  const rules = ampPermissions(toolProfile, toolAllowlist) as Array<{
+    tool: string;
+    action: "allow" | "reject";
+    matches?: { cmd: string[] };
+  }>;
+  return {
+    schemaVersion: 1 as const,
+    rules,
+    canonicalSha256: await hashPrompt(stableValue({ schemaVersion: 1, rules })),
+  };
 }
 
 /**
@@ -3384,6 +3417,16 @@ export async function launchCallerInvocation<T>(
   launch: () => Promise<T>,
 ): Promise<{ replayed: false; value: T } | { replayed: true }> {
   const parsedClaim = InvocationLaunchClaimSchema.parse(claim);
+  if (parsedClaim.ampPermissions) {
+    const { schemaVersion, rules, canonicalSha256 } =
+      parsedClaim.ampPermissions;
+    const expectedHash = await hashPrompt(
+      stableValue({ schemaVersion, rules }),
+    );
+    if (canonicalSha256 !== expectedHash) {
+      throw new Error("Invalid Amp permissions attestation hash");
+    }
+  }
   const claimName = `launch-claim-${claim.invocationId}`;
   const { created } = await createOnceOrVerify(
     context,
@@ -4546,7 +4589,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.24.1",
+  version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4735,6 +4778,12 @@ export const model = {
         "Package orb transport only through the base model to avoid duplicate extension registration warnings. No schema or behavior change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.08.25.1",
+      description:
+        "Attest normalized effective Amp permission rules in caller-owned launch claims so permission changes conflict with replay identity. Additive optional claim field preserves legacy claim readability; consumers requiring proof must reject absence.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     ...orbResources,
@@ -4903,6 +4952,9 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const ampPermissions = provider === "amp"
+          ? await attestAmpPermissions(toolProfile, args.toolAllowlist)
+          : undefined;
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -4948,6 +5000,7 @@ export const model = {
             wallTimeoutMs,
             maxRetries,
             toolProfile,
+            ampPermissions,
             sandbox,
           }, launch);
           // Deterministic terminal resources already exist on a successful
@@ -5085,6 +5138,9 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const ampPermissions = provider === "amp"
+          ? await attestAmpPermissions(toolProfile, args.toolAllowlist)
+          : undefined;
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -5131,6 +5187,7 @@ export const model = {
             wallTimeoutMs,
             maxRetries,
             toolProfile,
+            ampPermissions,
             sandbox,
           }, launch);
           if (claimed.replayed) return { dataHandles: [] };
