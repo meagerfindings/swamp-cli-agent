@@ -558,6 +558,7 @@ const STATE_DIRS: string[] = [
 ];
 
 const PROVIDER_STATE_DIRS: Partial<Record<Provider, readonly string[]>> = {
+  amp: [".local/share/amp"],
   gemini: [".gemini"],
 };
 
@@ -595,7 +596,9 @@ type BwrapArg = string;
  *    /run/systemd/resolve — that directory is bound read-only so the symlink
  *    resolves and DNS works inside the sandbox.
  * 3. `--proc /proc`, `--dev /dev`, `--tmpfs /tmp` (ephemeral scratch, not the
- *    real /tmp).
+ *    real /tmp). Builder-declared read-only input files are then mounted one
+ *    at a time at their exact paths; this lets a provider consume an ephemeral
+ *    invocation file without exposing the rest of host `/tmp`.
  * 4. **Workspace**: `--bind cwd cwd` — placed AFTER `--remount-ro home` so it
  *    is not shadowed when cwd is under home (e.g. /home/user/tmp/work). This
  *    is the only unconditionally-writable path outside home-relative state dirs.
@@ -615,8 +618,8 @@ type BwrapArg = string;
  *    `.npmrc`, ...) is therefore simply absent — allowlist by omission,
  *    avoiding the mask-precedence trap a broad `--bind home home` would
  *    require carefully layering masks on top of (see task brief). Provider-
- *    specific state such as `.gemini` is added only for that provider in
- *    provider credential mode.
+ *    specific state such as `.gemini` or `.local/share/amp` is added only for
+ *    that provider in provider credential mode.
  * 6. **Credential files**: for each existing path in CREDENTIAL_FILES,
  *    the selected provider's files are bound writable when credentialAccess
  *    is `"provider"`, allowing the genuine CLI to refresh its own OAuth state.
@@ -653,6 +656,7 @@ export function buildBwrapArgs(
   nodePath: string | null = null,
   executableDirectoryPath: string | null = null,
   gitMetadataPath: string | null = null,
+  readOnlyInputFiles: readonly string[] = [],
 ): string[] {
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
@@ -699,6 +703,7 @@ export function buildBwrapArgs(
     "/dev",
     "--tmpfs",
     "/tmp",
+    ...readOnlyInputFiles.flatMap((path) => ["--ro-bind", path, path]),
     "--tmpfs",
     home,
   ];
@@ -897,6 +902,7 @@ export function wrapWithSandbox(
   logger?: MethodContext["logger"],
   sandboxExecPath = "/usr/bin/sandbox-exec",
   bwrapPath = BWRAP_PATH,
+  readOnlyInputFiles: readonly string[] = [],
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
@@ -1003,6 +1009,7 @@ export function wrapWithSandbox(
         hiddenNodePath,
         executableDirectoryPath,
         gitMetadataPath,
+        readOnlyInputFiles,
       ),
     ];
   }
@@ -1171,11 +1178,20 @@ export async function runCli(
     wallTimeoutMs: number;
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
+    sandboxReadOnlyInputFiles?: readonly string[];
     logger?: MethodContext["logger"];
   },
 ): Promise<CmdResult> {
   const effectiveCmd = opts.sandbox
-    ? wrapWithSandbox(cmd, opts.cwd, opts.sandbox, opts.logger)
+    ? wrapWithSandbox(
+      cmd,
+      opts.cwd,
+      opts.sandbox,
+      opts.logger,
+      undefined,
+      undefined,
+      opts.sandboxReadOnlyInputFiles,
+    )
     : cmd;
   const start = performance.now();
   const childEnv = {
@@ -1662,19 +1678,24 @@ export async function buildAmpCommand(
   resolvedPrompt: string,
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
-): Promise<{ cmd: string[]; stdin?: string }> {
+): Promise<CommandInvocation> {
   const settingsFile = await Deno.makeTempFile({
     prefix: "amp-settings-",
     suffix: ".json",
   });
-  const mcpServers = await readGlobalAmpMcpServers();
-  await Deno.writeTextFile(
-    settingsFile,
-    JSON.stringify({
-      "amp.permissions": ampPermissions(toolProfile, toolAllowlist),
-      "amp.mcpServers": mcpServers,
-    }),
-  );
+  try {
+    const mcpServers = await readGlobalAmpMcpServers();
+    await Deno.writeTextFile(
+      settingsFile,
+      JSON.stringify({
+        "amp.permissions": ampPermissions(toolProfile, toolAllowlist),
+        "amp.mcpServers": mcpServers,
+      }),
+    );
+  } catch (error) {
+    await Deno.remove(settingsFile).catch(() => {});
+    throw error;
+  }
   return {
     cmd: [
       cliPath,
@@ -1684,6 +1705,8 @@ export async function buildAmpCommand(
       "--stream-json",
     ],
     stdin: resolvedPrompt,
+    sandboxReadOnlyInputFiles: [settingsFile],
+    cleanupFiles: [settingsFile],
   };
 }
 
@@ -2788,6 +2811,16 @@ export function extractUsage(provider: string, rawOutput: string): UsageData {
 /** A scoped permission profile applied to a provider's CLI invocation. */
 type ToolProfile = "readonly" | "actor";
 
+type CommandInvocation = {
+  cmd: string[];
+  stdin?: string;
+  env?: Record<string, string>;
+  /** Exact host files that must remain readable inside an otherwise-hidden sandbox. */
+  sandboxReadOnlyInputFiles?: readonly string[];
+  /** Builder-owned temporary files removed after this attempt. */
+  cleanupFiles?: readonly string[];
+};
+
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
   cliPath: string,
@@ -2796,8 +2829,8 @@ type CommandBuilder = (
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
 ) =>
-  | { cmd: string[]; stdin?: string; env?: Record<string, string> }
-  | Promise<{ cmd: string[]; stdin?: string; env?: Record<string, string> }>;
+  | CommandInvocation
+  | Promise<CommandInvocation>;
 
 /**
  * Closed per-provider capability record.
@@ -3125,7 +3158,13 @@ export async function runWithRetries(
   let attemptPrompt = resolved;
 
   while (retries <= opts.maxRetries) {
-    const { cmd, stdin, env } = await buildCommand(
+    const {
+      cmd,
+      stdin,
+      env,
+      sandboxReadOnlyInputFiles,
+      cleanupFiles = [],
+    } = await buildCommand(
       cliPath,
       modelName,
       attemptPrompt,
@@ -3149,11 +3188,17 @@ export async function runWithRetries(
         wallTimeoutMs: opts.wallTimeoutMs,
         idleTimeoutMs: opts.idleTimeoutMs,
         sandbox: opts.sandbox,
+        sandboxReadOnlyInputFiles,
         logger,
       });
     } finally {
       if (piConfigDir) {
         await Deno.remove(piConfigDir, { recursive: true }).catch((error) => {
+          if (!(error instanceof Deno.errors.NotFound)) throw error;
+        });
+      }
+      for (const path of cleanupFiles) {
+        await Deno.remove(path).catch((error) => {
           if (!(error instanceof Deno.errors.NotFound)) throw error;
         });
       }
@@ -4546,7 +4591,7 @@ export async function collectAmpUsageWithCache(
 
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.24.1",
+  version: "2026.08.26.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4733,6 +4778,12 @@ export const model = {
       toVersion: "2026.08.24.1",
       description:
         "Package orb transport only through the base model to avoid duplicate extension registration warnings. No schema or behavior change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.26.1",
+      description:
+        "Expose Amp's provider-owned state and exact generated settings file inside Linux bwrap, then remove the settings file after every attempt, so mandatory sandboxed invocations can load their login and policy without exposing host temporary files or unrelated home data. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
