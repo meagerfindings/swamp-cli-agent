@@ -3617,6 +3617,27 @@ Deno.test("buildBwrapArgs: exposes Gemini state only to Gemini in provider crede
   );
 });
 
+Deno.test("buildBwrapArgs: exposes Amp state only to Amp in provider credential mode", () => {
+  const ampState = "/home/agent/.local/share/amp";
+  const build = (
+    provider: "amp" | "claude",
+    access: "provider" | "isolated",
+  ) =>
+    buildBwrapArgs(
+      [provider, "prompt"],
+      "/work",
+      "/home/agent",
+      (path) => path === ampState,
+      null,
+      provider,
+      access,
+    );
+
+  assertEquals(build("amp", "provider").includes(ampState), true);
+  assertEquals(build("amp", "isolated").includes(ampState), false);
+  assertEquals(build("claude", "provider").includes(ampState), false);
+});
+
 Deno.test("buildBwrapArgs: provider mode exposes only the selected provider's credential files", () => {
   const existing = new Set([
     "/home/agent/.claude",
@@ -3982,6 +4003,81 @@ Deno.test("buildBwrapArgs: home is bound via tmpfs+remount-ro bracket (order loa
   if (lastStateBindIdx !== -1) {
     assertEquals(remountIdx > lastStateBindIdx, true);
   }
+});
+
+Deno.test("buildBwrapArgs: mounts only exact read-only inputs after hiding host /tmp", () => {
+  const settingsFile = "/tmp/amp-settings-exact.json";
+  const argv = buildBwrapArgs(
+    ["/usr/bin/cat", settingsFile],
+    "/work",
+    "/home/agent",
+    () => false,
+    null,
+    "amp",
+    "isolated",
+    null,
+    null,
+    null,
+    [settingsFile],
+  );
+
+  const tmpfsIndex = argv.indexOf("/tmp");
+  assertEquals(argv.slice(tmpfsIndex - 1, tmpfsIndex + 5), [
+    "--tmpfs",
+    "/tmp",
+    "--ro-bind",
+    settingsFile,
+    settingsFile,
+    "--tmpfs",
+  ]);
+  assertEquals(
+    argv.filter((value) => value === settingsFile).length,
+    3,
+  );
+});
+
+Deno.test({
+  name:
+    "runCli: bwrap exposes an exact input while unrelated host /tmp stays hidden",
+  ignore: Deno.build.os !== "linux",
+  fn: async () => {
+    const cwd = await Deno.makeTempDir({ prefix: "bwrap-cwd-" });
+    const input = await Deno.makeTempFile({ prefix: "amp-settings-" });
+    const sentinel = await Deno.makeTempFile({ prefix: "bwrap-sentinel-" });
+    await Deno.writeTextFile(input, "mounted-settings");
+    await Deno.writeTextFile(sentinel, "must-stay-hidden");
+    try {
+      const result = await runCli(
+        [
+          "/usr/bin/sh",
+          "-c",
+          `cat "$1"; test ! -e "$2"`,
+          "sh",
+          input,
+          sentinel,
+        ],
+        {
+          cwd,
+          wallTimeoutMs: 5_000,
+          sandboxReadOnlyInputFiles: [input],
+          sandbox: {
+            mode: "bwrap",
+            provider: "amp",
+            credentialAccess: "isolated",
+            network: "allow",
+            profilePath: "",
+            required: true,
+          },
+        },
+      );
+      assertEquals(result.success, true, result.stderr);
+      assertEquals(result.stdout, "mounted-settings");
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+      await Deno.remove(input).catch(() => {});
+      await Deno.remove(sentinel).catch(() => {});
+    }
+  },
 });
 
 // --- wrapWithSandbox: Linux bwrap dispatch -----------------------------------
@@ -4507,15 +4603,18 @@ Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServ
   const prevHome = Deno.env.get("HOME");
   Deno.env.set("HOME", tmpHome);
   try {
-    const { cmd, stdin } = await buildAmpCommand(
-      "amp",
-      "low",
-      "list my meetings",
-      "readonly",
-    );
+    const { cmd, stdin, sandboxReadOnlyInputFiles, cleanupFiles } =
+      await buildAmpCommand(
+        "amp",
+        "low",
+        "list my meetings",
+        "readonly",
+      );
     assertEquals(stdin, "list my meetings");
     const sfIndex = cmd.indexOf("--settings-file");
     assertEquals(sfIndex >= 0, true);
+    assertEquals(sandboxReadOnlyInputFiles, [cmd[sfIndex + 1]]);
+    assertEquals(cleanupFiles, [cmd[sfIndex + 1]]);
     const written = JSON.parse(await Deno.readTextFile(cmd[sfIndex + 1]));
     assertEquals(written["amp.mcpServers"], {
       granola: { url: "https://mcp.granola.ai/mcp" },
@@ -4527,6 +4626,105 @@ Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServ
     if (prevHome === undefined) Deno.env.delete("HOME");
     else Deno.env.set("HOME", prevHome);
     await Deno.remove(tmpHome, { recursive: true });
+  }
+});
+
+Deno.test("buildAmpCommand: removes its settings file when initialization fails", async () => {
+  const settingsFile = await Deno.makeTempFile({
+    prefix: "amp-settings-failed-write-",
+    suffix: ".json",
+  });
+  const originalMakeTempFile = Deno.makeTempFile;
+  const originalWriteTextFile = Deno.writeTextFile;
+  Deno.makeTempFile = (() => Promise.resolve(settingsFile)) as typeof Deno.makeTempFile;
+  Deno.writeTextFile = ((path, ...args) =>
+    String(path) === settingsFile
+      ? Promise.reject(new Error("simulated settings write failure"))
+      : originalWriteTextFile(path, ...args)) as typeof Deno.writeTextFile;
+
+  try {
+    await assertRejects(
+      () => buildAmpCommand("amp", "low", "prompt", "readonly"),
+      Error,
+      "simulated settings write failure",
+    );
+    await assertRejects(() => Deno.stat(settingsFile), Deno.errors.NotFound);
+  } finally {
+    Deno.makeTempFile = originalMakeTempFile;
+    Deno.writeTextFile = originalWriteTextFile;
+    await Deno.remove(settingsFile).catch(() => {});
+  }
+});
+
+Deno.test("runWithRetries: Amp removes every generated settings file after success, failure, timeout, and retry", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "amp-cleanup-" });
+  const script = `${dir}/fake-amp`;
+  const log = `${dir}/settings-paths`;
+  await Deno.writeTextFile(
+    script,
+    `#!/bin/sh
+settings=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--settings-file" ]; then settings="$2"; shift 2; else shift; fi
+done
+printf '%s\\n' "$settings" >> ${JSON.stringify(log)}
+test -r "$settings" || exit 99
+cat >/dev/null
+case "$0" in
+  *failure*) exit 1 ;;
+  *retry*) exit 143 ;;
+  *timeout*) sleep 5 ;;
+esac
+printf '%s\\n' '{"type":"result","result":"ok"}'
+`,
+  );
+  await Deno.chmod(script, 0o700);
+
+  const run = async (cliPath: string, wallTimeoutMs = 2_000, maxRetries = 0) =>
+    await runWithRetries("amp", cliPath, "test", "prompt", "readonly", {
+      cwd: dir,
+      wallTimeoutMs,
+      idleTimeoutMs: wallTimeoutMs,
+      maxRetries,
+      retryDelayMs: 1,
+      sandbox: {
+        mode: "off",
+        provider: "amp",
+        credentialAccess: "isolated",
+        network: "allow",
+        profilePath: "",
+        required: false,
+      },
+    });
+
+  try {
+    await run(script);
+
+    const failure = `${dir}/fake-amp-failure`;
+    await Deno.copyFile(script, failure);
+    await Deno.chmod(failure, 0o700);
+    // A transient exit exercises cleanup between attempts as well as after the
+    // final attempt.
+    const retry = `${dir}/fake-amp-retry`;
+    await Deno.copyFile(script, retry);
+    await Deno.chmod(retry, 0o700);
+    await run(failure);
+    await run(retry, 2_000, 1);
+
+    const timeout = `${dir}/fake-amp-timeout`;
+    await Deno.copyFile(script, timeout);
+    await Deno.chmod(timeout, 0o700);
+    await run(timeout, 100);
+
+    const paths = (await Deno.readTextFile(log)).trim().split("\n");
+    assertEquals(paths.length, 5);
+    for (const path of paths) {
+      await assertRejects(() => Deno.stat(path), Deno.errors.NotFound);
+    }
+    // Cleanup is limited to builder-owned files, not the caller's executable.
+    assertEquals((await Deno.stat(script)).isFile, true);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
