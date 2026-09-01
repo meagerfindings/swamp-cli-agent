@@ -1597,51 +1597,80 @@ export function buildOpencodeCommand(
 /**
  * Amp permission rules per profile, passed via `--settings-file` as JSON
  * pointing at `amp.permissions` rules (amp has no CLI flag for inline rules).
- * Rules are evaluated in order; the trailing catch-all makes the remaining
- * tools allowed-by-default while `reject` rules for dangerous Bash patterns
- * take precedence over it.
+ * Amp applies the last matching rule. Legacy profiles therefore place their
+ * broad default first and their specific rejects afterward.
  */
 const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
   readonly: [
+    { tool: "*", action: "allow" },
     { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
     { tool: "edit_file", action: "reject" },
     { tool: "create_file", action: "reject" },
-    { tool: "*", action: "allow" },
   ],
   actor: [
+    { tool: "*", action: "allow" },
     {
       tool: "Bash",
       action: "reject",
       matches: { cmd: ["git push*", "curl*", "rm -rf*"] },
     },
-    { tool: "*", action: "allow" },
   ],
 };
 
 /** Fail-closed Amp rules used only by approved software-factory invocations. */
 export const AMP_FACTORY_ACTOR_PERMISSIONS: unknown[] = [
-  {
-    tool: "Bash",
-    action: "allow",
-    matches: { cmd: ["git diff --check"] },
-  },
-  { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
+  { tool: "*", action: "reject" },
   { tool: "Read", action: "allow" },
   { tool: "Grep", action: "allow" },
   { tool: "Glob", action: "allow" },
   { tool: "edit_file", action: "allow" },
   { tool: "create_file", action: "allow" },
-  { tool: "*", action: "reject" },
+  { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
+  {
+    tool: "Bash",
+    action: "allow",
+    matches: { cmd: ["git diff --check"] },
+  },
 ];
+
+function globMatches(value: string, pattern: string): boolean {
+  const expression = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replaceAll("*", ".*");
+  return new RegExp(`^${expression}$`).test(value);
+}
+
+/** Evaluate the generated Amp table with Amp's last-match-wins semantics. */
+export function ampPermissionAllowed(
+  rules: unknown[],
+  tool: string,
+  command?: string,
+): boolean {
+  let decision: "allow" | "reject" | null = null;
+  for (const unknownRule of rules) {
+    const rule = unknownRule as {
+      tool?: string;
+      action?: "allow" | "reject";
+      matches?: { cmd?: string[] };
+    };
+    if (
+      !rule.action || (rule.tool !== "*" && rule.tool !== tool) ||
+      (rule.matches?.cmd &&
+        (command === undefined ||
+          !rule.matches.cmd.some((pattern) => globMatches(command, pattern))))
+    ) continue;
+    decision = rule.action;
+  }
+  return decision === "allow";
+}
 
 /**
  * Compose the Amp permission rules for one invocation.
  *
  * Without a `toolAllowlist`, this is exactly the profile's rules. With one, the
- * child is fenced to only the named tools: the profile's leading `reject` rules
+ * child is fenced to only the named tools: the profile's `reject` rules
  * are preserved (a dangerous Bash the profile blocks stays blocked even if the
- * caller listed it), each allowlisted tool becomes an `allow`, and a trailing
- * catch-all `reject` denies every other tool. Rules are first-match-wins.
+ * caller listed it), a leading catch-all denies every tool by default, and
+ * each allowlisted tool becomes an `allow`. Amp uses the last matching rule.
  */
 export function ampPermissions(
   toolProfile: ToolProfile,
@@ -1664,15 +1693,19 @@ export function ampPermissions(
     (rule) => (rule as { action?: string }).action === "reject",
   );
   return [
-    ...profileRejects,
-    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
     { tool: "*", action: "reject" },
+    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
+    ...profileRejects,
   ];
 }
 
 /** Deterministic shell policy shared by factory Amp and OpenCode actors. */
 export function factoryActorCommandAllowed(command: string): boolean {
-  return command === "git diff --check";
+  return ampPermissionAllowed(
+    AMP_FACTORY_ACTOR_PERMISSIONS,
+    "Bash",
+    command,
+  );
 }
 
 /**
@@ -1726,8 +1759,8 @@ export async function readGlobalAmpMcpServers(): Promise<
  * `toolAllowlist`, when provided, restricts the child to ONLY those tools:
  * the profile's `reject` rules are kept (so a dangerous Bash stays rejected
  * even if the caller allowlisted it), then each allowlisted tool gets an
- * `allow` rule, and a trailing catch-all `reject` denies everything else.
- * Rules are first-match-wins in order (see {@link AMP_PERMISSIONS}).
+ * `allow` rule, with the broad default first and profile rejects last so Amp's
+ * last-match-wins evaluation preserves the requested restriction.
  */
 export async function buildAmpCommand(
   cliPath: string,
@@ -4732,7 +4765,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.01.1";
+export const CLI_AGENT_VERSION = "2026.09.01.2";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -4932,9 +4965,15 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: CLI_AGENT_VERSION,
+      toVersion: "2026.09.01.1",
       description:
         "Add an opt-in fail-closed software-factory actor boundary for Amp and OpenCode plus a typed bwrap viability method. Existing invocations retain their prior behavior unless factoryBoundary=true.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Order factory Amp permissions for last-match-wins evaluation and derive viability decisions from the generated table. Execution-only change; no model attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -5194,7 +5233,13 @@ export const model = {
           "python -c 'import urllib.request'",
         ].map((command) => ({
           command,
-          allowed: factoryActorCommandAllowed(command),
+          allowed: args.provider === "amp"
+            ? ampPermissionAllowed(
+              AMP_FACTORY_ACTOR_PERMISSIONS,
+              "Bash",
+              command,
+            )
+            : factoryActorCommandAllowed(command),
         }));
         if (
           !checks[0].allowed || checks.slice(1).some((check) => check.allowed)
