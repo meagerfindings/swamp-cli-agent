@@ -16,6 +16,7 @@ import {
   aggregateAmpUsage,
   aggregateClaudeUsage,
   aggregateCodexUsage,
+  ampPermissions,
   ampUsageCacheName,
   arbitrateSignalOutcome,
   buildAmpCommand,
@@ -34,6 +35,7 @@ import {
   extractError,
   extractTextFromOutput,
   extractUsage,
+  factoryActorCommandAllowed,
   filterProviderChildEnv,
   GlobalArgsSchema,
   hashPrompt,
@@ -1925,6 +1927,26 @@ Deno.test("buildOpencodeCommand: readonly disables write-capable tools without p
       },
     },
   });
+});
+
+Deno.test("buildOpencodeCommand: factory actor is fail closed and permits only deterministic shell proof", () => {
+  const built = buildOpencodeCommand(
+    "opencode",
+    "ollama/qwen",
+    "implement",
+    "actor",
+    undefined,
+    true,
+  );
+  assertEquals(built.cmd.includes("--dangerously-skip-permissions"), false);
+  assertEquals(built.cmd.includes("cli-agent-factory-actor"), true);
+  const config = JSON.parse(built.env!.OPENCODE_CONFIG_CONTENT);
+  const permissions = config.agent["cli-agent-factory-actor"].permission;
+  assertEquals(permissions["*"], "deny");
+  assertEquals(permissions.edit, "allow");
+  assertEquals(permissions.write, "allow");
+  assertEquals(permissions.bash["git diff --check"], "allow");
+  assertEquals(permissions.bash["*"], "deny");
 });
 
 Deno.test("buildGrokCommand: actor profile argv contract, no stdin, no --no-auto-update", () => {
@@ -4629,6 +4651,107 @@ Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServ
   }
 });
 
+Deno.test("Amp factory actor permission table is fail closed", () => {
+  const permissions = ampPermissions("actor", undefined, true) as Array<{
+    tool: string;
+    action: string;
+    matches?: { cmd?: string[] };
+  }>;
+  assertEquals(permissions.at(-1), { tool: "*", action: "reject" });
+  assertEquals(
+    permissions.some((rule) =>
+      rule.tool === "Bash" && rule.action === "allow" &&
+      rule.matches?.cmd?.includes("git diff --check")
+    ),
+    true,
+  );
+  assertEquals(factoryActorCommandAllowed("git diff --check"), true);
+  for (
+    const command of [
+      "git diff --check; git push",
+      "git push origin HEAD",
+      "gh pr merge 1",
+      "railway up",
+      "npm publish",
+      "rm -rf .",
+      "curl https://example.com",
+      "wget https://example.com",
+      "python -c 'import urllib.request'",
+    ]
+  ) {
+    assertEquals(factoryActorCommandAllowed(command), false, command);
+  }
+  assertThrows(
+    () => ampPermissions("readonly", undefined, true),
+    Error,
+    "requires toolProfile=actor",
+  );
+});
+
+Deno.test("buildAmpCommand: factory boundary does not inherit MCP servers", async () => {
+  const tmpHome = await Deno.makeTempDir({ prefix: "amp-factory-home-" });
+  await Deno.mkdir(`${tmpHome}/.config/amp`, { recursive: true });
+  await Deno.writeTextFile(
+    `${tmpHome}/.config/amp/settings.json`,
+    JSON.stringify({
+      "amp.mcpServers": { external: { url: "https://example.com/mcp" } },
+    }),
+  );
+  const previousHome = Deno.env.get("HOME");
+  Deno.env.set("HOME", tmpHome);
+  try {
+    const built = await buildAmpCommand(
+      "amp",
+      "medium",
+      "implement",
+      "actor",
+      undefined,
+      true,
+    );
+    const path = built.cleanupFiles![0];
+    const settings = JSON.parse(await Deno.readTextFile(path));
+    assertEquals(settings["amp.mcpServers"], {});
+    await Deno.remove(path);
+  } finally {
+    if (previousHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", previousHome);
+    await Deno.remove(tmpHome, { recursive: true });
+  }
+});
+
+Deno.test("factoryBoundary argument requires exact provider, repository, actor, and mandatory sandbox", () => {
+  const valid = {
+    prompt: "implement",
+    invocationId: "factory-c1",
+    provider: "amp",
+    model: "medium",
+    cwd: "/worktree",
+    repositoryExpectation: {
+      attachedBranch: "factory/test",
+      headSha: "a".repeat(40),
+      stateHash: "b".repeat(64),
+    },
+    toolProfile: "actor",
+    factoryBoundary: true,
+    sandboxMode: "bwrap",
+    sandboxRequired: true,
+  };
+  assertEquals(InvokeArgsSchema.safeParse(valid).success, true);
+  assertEquals(
+    InvokeArgsSchema.safeParse({ ...valid, provider: "claude" }).success,
+    false,
+  );
+  assertEquals(
+    InvokeArgsSchema.safeParse({ ...valid, sandboxRequired: false }).success,
+    false,
+  );
+  assertEquals(
+    InvokeArgsSchema.safeParse({ ...valid, repositoryExpectation: undefined })
+      .success,
+    false,
+  );
+});
+
 Deno.test("buildAmpCommand: removes its settings file when initialization fails", async () => {
   const settingsFile = await Deno.makeTempFile({
     prefix: "amp-settings-failed-write-",
@@ -4636,11 +4759,13 @@ Deno.test("buildAmpCommand: removes its settings file when initialization fails"
   });
   const originalMakeTempFile = Deno.makeTempFile;
   const originalWriteTextFile = Deno.writeTextFile;
-  Deno.makeTempFile = (() => Promise.resolve(settingsFile)) as typeof Deno.makeTempFile;
-  Deno.writeTextFile = ((path, ...args) =>
-    String(path) === settingsFile
-      ? Promise.reject(new Error("simulated settings write failure"))
-      : originalWriteTextFile(path, ...args)) as typeof Deno.writeTextFile;
+  Deno.makeTempFile =
+    (() => Promise.resolve(settingsFile)) as typeof Deno.makeTempFile;
+  Deno.writeTextFile =
+    ((path, ...args) =>
+      String(path) === settingsFile
+        ? Promise.reject(new Error("simulated settings write failure"))
+        : originalWriteTextFile(path, ...args)) as typeof Deno.writeTextFile;
 
   try {
     await assertRejects(
