@@ -16,6 +16,7 @@ import {
   aggregateAmpUsage,
   aggregateClaudeUsage,
   aggregateCodexUsage,
+  ampPermissionAllowed,
   ampPermissions,
   ampUsageCacheName,
   arbitrateSignalOutcome,
@@ -4657,14 +4658,15 @@ Deno.test("Amp factory actor permission table is fail closed", () => {
     action: string;
     matches?: { cmd?: string[] };
   }>;
-  assertEquals(permissions.at(-1), { tool: "*", action: "reject" });
+  assertEquals(permissions[0], { tool: "*", action: "reject" });
   assertEquals(
-    permissions.some((rule) =>
-      rule.tool === "Bash" && rule.action === "allow" &&
-      rule.matches?.cmd?.includes("git diff --check")
-    ),
+    ampPermissionAllowed(permissions, "Bash", "git diff --check"),
     true,
   );
+  for (const tool of ["Read", "Grep", "Glob", "edit_file", "create_file"]) {
+    assertEquals(ampPermissionAllowed(permissions, tool), true, tool);
+  }
+  assertEquals(ampPermissionAllowed(permissions, "unknown"), false);
   assertEquals(factoryActorCommandAllowed("git diff --check"), true);
   for (
     const command of [
@@ -4680,6 +4682,11 @@ Deno.test("Amp factory actor permission table is fail closed", () => {
     ]
   ) {
     assertEquals(factoryActorCommandAllowed(command), false, command);
+    assertEquals(
+      ampPermissionAllowed(permissions, "Bash", command),
+      false,
+      command,
+    );
   }
   assertThrows(
     () => ampPermissions("readonly", undefined, true),
@@ -4711,6 +4718,16 @@ Deno.test("buildAmpCommand: factory boundary does not inherit MCP servers", asyn
     const path = built.cleanupFiles![0];
     const settings = JSON.parse(await Deno.readTextFile(path));
     assertEquals(settings["amp.mcpServers"], {});
+    const permissions = settings["amp.permissions"];
+    assertEquals(
+      ampPermissionAllowed(permissions, "Bash", "git diff --check"),
+      true,
+    );
+    assertEquals(ampPermissionAllowed(permissions, "Read"), true);
+    assertEquals(
+      ampPermissionAllowed(permissions, "Bash", "git push origin HEAD"),
+      false,
+    );
     await Deno.remove(path);
   } finally {
     if (previousHome === undefined) Deno.env.delete("HOME");
@@ -4882,16 +4899,20 @@ Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools",
         true,
       );
     }
-    // Everything else is rejected by a trailing catch-all.
-    const last = perms[perms.length - 1];
-    assertEquals(last.tool, "*");
-    assertEquals(last.action, "reject");
-    // The profile's Bash reject is preserved and precedes the allows.
+    // Everything else is rejected by a leading default.
+    assertEquals(perms[0], { tool: "*", action: "reject" });
+    assertEquals(ampPermissionAllowed(perms, "unknown"), false);
+    assertEquals(
+      ampPermissionAllowed(perms, "mcp__granola__list_meetings"),
+      true,
+    );
+    // The profile's Bash reject follows the allows and therefore still wins.
     const bashIdx = perms.findIndex((r) =>
       r.tool === "Bash" && r.action === "reject"
     );
     const firstAllowIdx = perms.findIndex((r) => r.action === "allow");
-    assertEquals(bashIdx >= 0 && bashIdx < firstAllowIdx, true);
+    assertEquals(bashIdx > firstAllowIdx, true);
+    assertEquals(ampPermissionAllowed(perms, "Bash", "echo hi"), false);
     await Deno.remove(cmd[sfIndex + 1]);
   } finally {
     if (prevHome === undefined) Deno.env.delete("HOME");
