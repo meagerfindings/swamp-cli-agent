@@ -63,6 +63,16 @@ directory is mounted read-only with optional Git locking disabled, allowing
 agents to inspect branches, status, and diffs without exposing or mutating the
 parent checkout.
 
+Software-factory callers can opt into `factoryBoundary: true` for Amp or
+OpenCode actor invocations. This requires a caller-owned `invocationId`, an
+exact `repositoryExpectation`, `toolProfile: actor`, and a mandatory sandbox.
+The factory actor can read and edit only the linked worktree and can run only
+the deterministic `git diff --check` shell command; merge, push, deploy,
+publish, destructive, download, exfiltration, secret, and arbitrary shell
+paths fail closed. Call `checkFactoryViability` before dispatch to verify the
+provider, bwrap confinement, exact Git identity, temporary write/removal,
+state restoration, and policy deny table without launching an agent.
+
 For pi, pass the model in `provider/id` form (for example,
 `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.
 Pi 0.82.0 or newer is required. Pi extensions are always disabled. Sandboxed

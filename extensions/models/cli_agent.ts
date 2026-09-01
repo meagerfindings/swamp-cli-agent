@@ -258,6 +258,9 @@ export const InvocationLaunchClaimSchema = z.object({
   wallTimeoutMs: TimeoutMsSchema,
   maxRetries: z.number(),
   toolProfile: ToolProfileEnum,
+  factoryBoundary: z.boolean().optional().describe(
+    "True when the invocation used the fail-closed software-factory actor policy. Absent on claims created before that policy existed.",
+  ),
   sandbox: z.object({
     mode: SandboxModeEnum,
     provider: ProviderEnum,
@@ -1531,11 +1534,45 @@ export function buildOpencodeCommand(
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  _toolAllowlist?: string[],
+  factoryBoundary = false,
 ): { cmd: string[]; stdin?: string; env?: Record<string, string> } {
   const readonlyAgent = "cli-agent-readonly";
-  const permissionArgs = toolProfile === "actor"
+  const factoryAgent = "cli-agent-factory-actor";
+  const permissionArgs = toolProfile === "actor" && !factoryBoundary
     ? ["--agent", "build", "--dangerously-skip-permissions"]
-    : ["--agent", readonlyAgent];
+    : ["--agent", toolProfile === "actor" ? factoryAgent : readonlyAgent];
+  const agent = toolProfile === "actor"
+    ? {
+      [factoryAgent]: {
+        mode: "primary",
+        permission: {
+          "*": "deny",
+          read: "allow",
+          glob: "allow",
+          grep: "allow",
+          lsp: "allow",
+          edit: "allow",
+          write: "allow",
+          bash: {
+            "git diff --check": "allow",
+            "*": "deny",
+          },
+        },
+      },
+    }
+    : {
+      [readonlyAgent]: {
+        mode: "primary",
+        permission: {
+          "*": "deny",
+          read: "allow",
+          glob: "allow",
+          grep: "allow",
+          lsp: "allow",
+        },
+      },
+    };
   return {
     cmd: [
       cliPath,
@@ -1547,21 +1584,10 @@ export function buildOpencodeCommand(
       ...permissionArgs,
       resolvedPrompt,
     ],
-    env: toolProfile === "readonly"
+    env: toolProfile === "readonly" || factoryBoundary
       ? {
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
-          agent: {
-            [readonlyAgent]: {
-              mode: "primary",
-              permission: {
-                "*": "deny",
-                read: "allow",
-                glob: "allow",
-                grep: "allow",
-                lsp: "allow",
-              },
-            },
-          },
+          agent,
         }),
       }
       : undefined,
@@ -1592,6 +1618,22 @@ const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
   ],
 };
 
+/** Fail-closed Amp rules used only by approved software-factory invocations. */
+export const AMP_FACTORY_ACTOR_PERMISSIONS: unknown[] = [
+  {
+    tool: "Bash",
+    action: "allow",
+    matches: { cmd: ["git diff --check"] },
+  },
+  { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
+  { tool: "Read", action: "allow" },
+  { tool: "Grep", action: "allow" },
+  { tool: "Glob", action: "allow" },
+  { tool: "edit_file", action: "allow" },
+  { tool: "create_file", action: "allow" },
+  { tool: "*", action: "reject" },
+];
+
 /**
  * Compose the Amp permission rules for one invocation.
  *
@@ -1601,10 +1643,20 @@ const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
  * caller listed it), each allowlisted tool becomes an `allow`, and a trailing
  * catch-all `reject` denies every other tool. Rules are first-match-wins.
  */
-function ampPermissions(
+export function ampPermissions(
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
+  factoryBoundary = false,
 ): unknown[] {
+  if (factoryBoundary) {
+    if (toolProfile !== "actor") {
+      throw new Error("factoryBoundary requires toolProfile=actor");
+    }
+    if (toolAllowlist?.length) {
+      throw new Error("factoryBoundary does not accept a caller toolAllowlist");
+    }
+    return AMP_FACTORY_ACTOR_PERMISSIONS;
+  }
   if (!toolAllowlist || toolAllowlist.length === 0) {
     return AMP_PERMISSIONS[toolProfile];
   }
@@ -1616,6 +1668,11 @@ function ampPermissions(
     ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
     { tool: "*", action: "reject" },
   ];
+}
+
+/** Deterministic shell policy shared by factory Amp and OpenCode actors. */
+export function factoryActorCommandAllowed(command: string): boolean {
+  return command === "git diff --check";
 }
 
 /**
@@ -1678,17 +1735,22 @@ export async function buildAmpCommand(
   resolvedPrompt: string,
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
+  factoryBoundary = false,
 ): Promise<CommandInvocation> {
   const settingsFile = await Deno.makeTempFile({
     prefix: "amp-settings-",
     suffix: ".json",
   });
   try {
-    const mcpServers = await readGlobalAmpMcpServers();
+    const mcpServers = factoryBoundary ? {} : await readGlobalAmpMcpServers();
     await Deno.writeTextFile(
       settingsFile,
       JSON.stringify({
-        "amp.permissions": ampPermissions(toolProfile, toolAllowlist),
+        "amp.permissions": ampPermissions(
+          toolProfile,
+          toolAllowlist,
+          factoryBoundary,
+        ),
         "amp.mcpServers": mcpServers,
       }),
     );
@@ -2828,6 +2890,7 @@ type CommandBuilder = (
   resolvedPrompt: string,
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
+  factoryBoundary?: boolean,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3145,6 +3208,7 @@ export async function runWithRetries(
     maxRetries: number;
     sandbox?: SandboxConfig;
     toolAllowlist?: string[];
+    factoryBoundary?: boolean;
     requireParseableJson?: boolean;
     retryDelayMs?: number;
   },
@@ -3170,6 +3234,7 @@ export async function runWithRetries(
       attemptPrompt,
       toolProfile,
       opts.toolAllowlist,
+      opts.factoryBoundary,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3638,6 +3703,9 @@ export const InvokeArgsSchema = z.object({
   toolAllowlist: z.array(z.string().min(1)).optional().describe(
     "Restrict the child to ONLY these tool names (e.g. specific MCP tools like 'mcp__granola__list_meetings'). Every other tool is rejected. Layered on top of toolProfile's rules. Currently honored by the amp provider; other providers ignore it.",
   ),
+  factoryBoundary: z.boolean().default(false).describe(
+    "Apply the fail-closed software-factory actor policy. Requires toolProfile=actor, a caller-owned invocationId, repositoryExpectation, sandboxRequired=true, and sandboxMode other than off. Supported only for amp and opencode.",
+  ),
   sandboxMode: SandboxModeEnum.optional().describe(
     "Override the global sandboxMode for this invocation: 'auto' (default; OS-picked backend), 'off', 'seatbelt', or 'bwrap'.",
   ),
@@ -3661,6 +3729,44 @@ export const InvokeArgsSchema = z.object({
         "invocationId is required when repositoryExpectation is supplied",
     });
   }
+  if (args.factoryBoundary) {
+    if (args.invocationId === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["invocationId"],
+        message: "invocationId is required when factoryBoundary is true",
+      });
+    }
+    if (args.repositoryExpectation === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["repositoryExpectation"],
+        message:
+          "repositoryExpectation is required when factoryBoundary is true",
+      });
+    }
+    if (args.toolProfile !== "actor") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["toolProfile"],
+        message: "toolProfile must be actor when factoryBoundary is true",
+      });
+    }
+    if (args.sandboxRequired !== true || args.sandboxMode === "off") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sandboxRequired"],
+        message: "factoryBoundary requires a mandatory sandbox",
+      });
+    }
+    if (args.provider !== "amp" && args.provider !== "opencode") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["provider"],
+        message: "factoryBoundary supports only amp and opencode",
+      });
+    }
+  }
 });
 type InvokeArgs = z.infer<typeof InvokeArgsSchema>;
 
@@ -3683,6 +3789,43 @@ type ListModelsArgs = z.infer<typeof ListModelsArgsSchema>;
 
 const ListProvidersArgsSchema = z.object({});
 type ListProvidersArgs = z.infer<typeof ListProvidersArgsSchema>;
+
+export const FactoryViabilityArgsSchema = z.object({
+  viabilityId: InvocationIdSchema,
+  routeFingerprint: z.string().min(1),
+  provider: z.enum(["amp", "opencode"]),
+  model: ModelIdSchema,
+  cwd: z.string().min(1),
+  repositoryExpectation: RepositoryExpectationSchema,
+});
+type FactoryViabilityArgs = z.infer<typeof FactoryViabilityArgsSchema>;
+
+export const FactoryViabilitySchema = z.object({
+  schemaVersion: z.literal(1),
+  viabilityId: InvocationIdSchema,
+  routeFingerprint: z.string().min(1),
+  provider: z.enum(["amp", "opencode"]),
+  model: ModelIdSchema,
+  cwd: z.string().min(1),
+  attachedBranch: z.string().min(1),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/),
+  stateHashBefore: z.string().regex(/^[0-9a-f]{64}$/),
+  stateHashAfter: z.string().regex(/^[0-9a-f]{64}$/),
+  sandboxBackend: z.literal("bwrap"),
+  toolProfile: z.literal("actor"),
+  factoryBoundary: z.literal(true),
+  policyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  versionProbeSucceeded: z.boolean(),
+  authProbeSucceeded: z.boolean(),
+  workspaceProbeSucceeded: z.boolean(),
+  commandPolicyChecks: z.array(
+    z.object({
+      command: z.string(),
+      allowed: z.boolean(),
+    }).strict(),
+  ).min(1),
+  checkedAt: z.string().datetime(),
+}).strict();
 
 const DailyProviderEnum = z.enum(["claude", "amp", "codex"]);
 const DailyUsageCountsSchema = z.object({
@@ -4589,9 +4732,11 @@ export async function collectAmpUsageWithCache(
   };
 }
 
+export const CLI_AGENT_VERSION = "2026.09.01.1";
+
 export const model = {
   type: "@mgreten/cli-agent",
-  version: "2026.08.26.1",
+  version: CLI_AGENT_VERSION,
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -4786,6 +4931,12 @@ export const model = {
         "Expose Amp's provider-owned state and exact generated settings file inside Linux bwrap, then remove the settings file after every attempt, so mandatory sandboxed invocations can load their login and policy without exposing host temporary files or unrelated home data. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Add an opt-in fail-closed software-factory actor boundary for Amp and OpenCode plus a typed bwrap viability method. Existing invocations retain their prior behavior unless factoryBoundary=true.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   resources: {
     ...orbResources,
@@ -4806,6 +4957,13 @@ export const model = {
       description:
         "Durable pre-spawn identity claim for a caller-owned invocationId",
       schema: InvocationLaunchClaimSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 100,
+    },
+    factoryViability: {
+      description:
+        "Redacted pre-charge proof that the factory actor boundary, provider auth, and exact linked worktree are viable under mandatory bwrap",
+      schema: FactoryViabilitySchema,
       lifetime: "30d" as const,
       garbageCollection: 100,
     },
@@ -4905,6 +5063,180 @@ export const model = {
       },
     },
 
+    checkFactoryViability: {
+      description:
+        "Prove the fail-closed factory actor boundary and exact linked-worktree read/write/test access under mandatory bwrap without launching an agent",
+      arguments: FactoryViabilityArgsSchema,
+      execute: async (
+        args: FactoryViabilityArgs,
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const cwd = await canonicalCwd(args.cwd);
+        await verifyRepositoryExpectation(cwd, args.repositoryExpectation);
+        const sandbox = sandboxConfigFrom(
+          context.globalArgs,
+          (fn) => context.extensionFile(fn),
+          {
+            provider: args.provider,
+            sandboxMode: "bwrap",
+            sandboxRequired: true,
+            sandboxNetwork: "allow",
+            sandboxCredentialAccess: "provider",
+          },
+        );
+        const cliPath = cliPathFor(args.provider, context.globalArgs);
+        let settingsFile: string | undefined;
+        let versionResult: CmdResult;
+        let authResult: CmdResult;
+        try {
+          if (args.provider === "amp") {
+            const built = await buildAmpCommand(
+              cliPath,
+              args.model,
+              "viability-only",
+              "actor",
+              undefined,
+              true,
+            );
+            settingsFile = built.cleanupFiles?.[0];
+            if (!settingsFile) {
+              throw new Error("Amp settings file was not created");
+            }
+            versionResult = await runCli(
+              [cliPath, "--settings-file", settingsFile, "--version"],
+              {
+                cwd,
+                wallTimeoutMs: 30_000,
+                idleTimeoutMs: 30_000,
+                sandbox,
+                sandboxReadOnlyInputFiles: [settingsFile],
+                logger: context.logger,
+              },
+            );
+            authResult = await runCli(
+              [
+                cliPath,
+                "--settings-file",
+                settingsFile,
+                "threads",
+                "list",
+                "--limit",
+                "1",
+                "--json",
+              ],
+              {
+                cwd,
+                wallTimeoutMs: 30_000,
+                idleTimeoutMs: 30_000,
+                sandbox,
+                sandboxReadOnlyInputFiles: [settingsFile],
+                logger: context.logger,
+              },
+            );
+          } else {
+            versionResult = await runCli([cliPath, "--version"], {
+              cwd,
+              wallTimeoutMs: 30_000,
+              idleTimeoutMs: 30_000,
+              sandbox,
+              logger: context.logger,
+            });
+            authResult = versionResult;
+          }
+        } finally {
+          if (settingsFile) await Deno.remove(settingsFile).catch(() => {});
+        }
+        if (!versionResult.success || !authResult.success) {
+          throw new Error(
+            `factory provider viability failed before launch: version=${versionResult.success}, auth=${authResult.success}`,
+          );
+        }
+
+        const sentinel = `.cli-agent-viability-${args.viabilityId}`;
+        const probe = await runCli(
+          [
+            "/bin/sh",
+            "-ceu",
+            'test "$(git rev-parse --show-toplevel)" = "$1"; test "$(git branch --show-current)" = "$2"; test "$(git rev-parse HEAD)" = "$3"; printf viability > "$4"; test "$(cat "$4")" = viability; rm "$4"; git diff --check',
+            "cli-agent-viability",
+            cwd,
+            args.repositoryExpectation.attachedBranch,
+            args.repositoryExpectation.headSha,
+            `${cwd}/${sentinel}`,
+          ],
+          {
+            cwd,
+            wallTimeoutMs: 30_000,
+            idleTimeoutMs: 30_000,
+            sandbox,
+            logger: context.logger,
+          },
+        );
+        await Deno.remove(`${cwd}/${sentinel}`).catch(() => {});
+        const stateHashAfter = await repositoryStateHash(cwd);
+        if (
+          !probe.success ||
+          stateHashAfter !== args.repositoryExpectation.stateHash
+        ) {
+          throw new Error(
+            "factory workspace viability failed or did not restore the repository state hash",
+          );
+        }
+
+        const checks = [
+          "git diff --check",
+          "git push origin HEAD",
+          "gh pr merge 1",
+          "railway up",
+          "npm publish",
+          "rm -rf .",
+          "curl https://example.com",
+          "python -c 'import urllib.request'",
+        ].map((command) => ({
+          command,
+          allowed: factoryActorCommandAllowed(command),
+        }));
+        if (
+          !checks[0].allowed || checks.slice(1).some((check) => check.allowed)
+        ) {
+          throw new Error("factory command policy viability failed");
+        }
+        const policyDigest = await hashPrompt(JSON.stringify({
+          amp: AMP_FACTORY_ACTOR_PERMISSIONS,
+          opencodeAllowedShell: ["git diff --check"],
+          packageVersion: CLI_AGENT_VERSION,
+        }));
+        const record = FactoryViabilitySchema.parse({
+          schemaVersion: 1,
+          viabilityId: args.viabilityId,
+          routeFingerprint: args.routeFingerprint,
+          provider: args.provider,
+          model: args.model,
+          cwd,
+          attachedBranch: args.repositoryExpectation.attachedBranch,
+          headSha: args.repositoryExpectation.headSha,
+          stateHashBefore: args.repositoryExpectation.stateHash,
+          stateHashAfter,
+          sandboxBackend: "bwrap",
+          toolProfile: "actor",
+          factoryBoundary: true,
+          policyDigest,
+          versionProbeSucceeded: versionResult.success,
+          authProbeSucceeded: authResult.success,
+          workspaceProbeSucceeded: probe.success,
+          commandPolicyChecks: checks,
+          checkedAt: new Date().toISOString(),
+        });
+        const write = await createOnceOrVerify(
+          context,
+          "factoryViability",
+          `factory-viability-${args.viabilityId}`,
+          record,
+        );
+        return { dataHandles: write.handle ? [write.handle] : [] };
+      },
+    },
+
     invoke: {
       description:
         "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok, pi) with a prompt and record structured results",
@@ -4972,6 +5304,7 @@ export const model = {
               maxRetries,
               sandbox,
               toolAllowlist: args.toolAllowlist,
+              factoryBoundary: args.factoryBoundary,
             },
             context.logger,
           );
@@ -4999,6 +5332,7 @@ export const model = {
             wallTimeoutMs,
             maxRetries,
             toolProfile,
+            factoryBoundary: args.factoryBoundary,
             sandbox,
           }, launch);
           // Deterministic terminal resources already exist on a successful
@@ -5154,6 +5488,7 @@ export const model = {
               maxRetries,
               sandbox,
               toolAllowlist: args.toolAllowlist,
+              factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
             },
             context.logger,
@@ -5182,6 +5517,7 @@ export const model = {
             wallTimeoutMs,
             maxRetries,
             toolProfile,
+            factoryBoundary: args.factoryBoundary,
             sandbox,
           }, launch);
           if (claimed.replayed) return { dataHandles: [] };
