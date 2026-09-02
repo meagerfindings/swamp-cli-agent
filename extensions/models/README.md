@@ -71,7 +71,8 @@ the deterministic `git diff --check` shell command; merge, push, deploy,
 publish, destructive, download, exfiltration, secret, and arbitrary shell
 paths fail closed. Call `checkFactoryViability` before dispatch to verify the
 provider, bwrap confinement, exact Git identity, temporary write/removal,
-state restoration, and policy deny table without launching an agent.
+state restoration, and Amp's real cwd-bound read/write/test permission decisions
+without launching an agent.
 
 For pi, pass the model in `provider/id` form (for example,
 `openrouter/moonshotai/kimi-k3`) via `defaultModel` or the `model` argument.

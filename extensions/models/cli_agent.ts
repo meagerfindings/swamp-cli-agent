@@ -1597,41 +1597,114 @@ export function buildOpencodeCommand(
 /**
  * Amp permission rules per profile, passed via `--settings-file` as JSON
  * pointing at `amp.permissions` rules (amp has no CLI flag for inline rules).
- * Amp applies the last matching rule. Legacy profiles therefore place their
- * broad default first and their specific rejects afterward.
+ * Amp applies the first matching rule. Legacy profiles therefore place their
+ * specific rejects before the broad allow.
  */
 const AMP_PERMISSIONS: Record<ToolProfile, unknown[]> = {
   readonly: [
-    { tool: "*", action: "allow" },
     { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
     { tool: "edit_file", action: "reject" },
     { tool: "create_file", action: "reject" },
+    { tool: "*", action: "allow" },
   ],
   actor: [
-    { tool: "*", action: "allow" },
     {
       tool: "Bash",
       action: "reject",
       matches: { cmd: ["git push*", "curl*", "rm -rf*"] },
     },
+    { tool: "*", action: "allow" },
   ],
 };
 
-/** Fail-closed Amp rules used only by approved software-factory invocations. */
-export const AMP_FACTORY_ACTOR_PERMISSIONS: unknown[] = [
-  { tool: "*", action: "reject" },
-  { tool: "Read", action: "allow" },
-  { tool: "Grep", action: "allow" },
-  { tool: "Glob", action: "allow" },
-  { tool: "edit_file", action: "allow" },
-  { tool: "create_file", action: "allow" },
-  { tool: "Bash", action: "reject", matches: { cmd: ["*"] } },
-  {
-    tool: "Bash",
-    action: "allow",
-    matches: { cmd: ["git diff --check"] },
-  },
-];
+/**
+ * Generate the fail-closed permission helper used by approved factory actors.
+ *
+ * Current Amp exposes `shell_command` and `apply_patch`, not the legacy
+ * `Bash`/`Read`/`edit_file` names. Shell reads need argument-level validation:
+ * allowing a wildcard such as `cat *` would also allow `cat file; curl ...`.
+ * The helper therefore parses one simple command, rejects shell operators, and
+ * permits only read-oriented binaries plus the exact deterministic diff check.
+ * bwrap independently limits all filesystem access and writes to the linked
+ * worktree mounted as the invocation cwd.
+ */
+export function ampFactoryPermissionHelperSource(cwd: string): string {
+  const root = JSON.stringify(cwd);
+  return `#!/usr/bin/python3
+import json
+import os
+import shlex
+import sys
+
+ROOT = ${root}
+
+def reject():
+    print("Factory policy rejected this tool call. Use apply_patch for edits; shell_command permits one cwd-bound cat/grep/head/tail/wc/ls/pwd or approved read-only git command, plus exact git diff --check.", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    arguments = json.load(sys.stdin)
+except Exception:
+    reject()
+
+tool = os.environ.get("AGENT_TOOL_NAME", "")
+if tool in {"apply_patch", "skill"}:
+    sys.exit(0)
+if tool != "shell_command":
+    reject()
+
+command = arguments.get("command")
+workdir = arguments.get("workdir", ROOT)
+if not isinstance(command, str) or not command.strip():
+    reject()
+if not isinstance(workdir, str) or os.path.realpath(workdir) != os.path.realpath(ROOT):
+    reject()
+if any(marker in command for marker in (";", "&", "|", ">", "<", "$", "\\n", "\\r", "\\x00", chr(96))):
+    reject()
+
+try:
+    words = shlex.split(command, posix=True)
+except ValueError:
+    reject()
+if not words:
+    reject()
+
+def safe_argument(word):
+    return not (
+        word.startswith("/") or
+        word.startswith("~") or
+        ".." in word or
+        "=/" in word or
+        "=~" in word
+    )
+
+if not all(safe_argument(word) for word in words[1:]):
+    reject()
+
+if words == ["git", "diff", "--check"]:
+    sys.exit(0)
+if words[0] in {"cat", "grep", "head", "tail", "wc", "ls"}:
+    sys.exit(0)
+if words == ["pwd"]:
+    sys.exit(0)
+if len(words) >= 2 and words[0] == "git":
+    subcommand = words[1]
+    if subcommand in {"status", "rev-parse", "ls-files"}:
+        sys.exit(0)
+    if subcommand == "branch" and words == ["git", "branch", "--show-current"]:
+        sys.exit(0)
+    if subcommand == "grep" and not any("pager" in word or "textconv" in word for word in words):
+        sys.exit(0)
+    if subcommand in {"diff", "show", "log"} and "--no-ext-diff" in words and not any(word.startswith("--output") or word == "--textconv" for word in words):
+        sys.exit(0)
+reject()
+`;
+}
+
+/** Factory Amp delegates every tool decision to the generated helper. */
+export function ampFactoryActorPermissions(helperPath: string): unknown[] {
+  return [{ tool: "*", action: "delegate", to: helperPath }];
+}
 
 function globMatches(value: string, pattern: string): boolean {
   const expression = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
@@ -1639,13 +1712,12 @@ function globMatches(value: string, pattern: string): boolean {
   return new RegExp(`^${expression}$`).test(value);
 }
 
-/** Evaluate the generated Amp table with Amp's last-match-wins semantics. */
+/** Evaluate non-delegated Amp tables with Amp's first-match-wins semantics. */
 export function ampPermissionAllowed(
   rules: unknown[],
   tool: string,
   command?: string,
 ): boolean {
-  let decision: "allow" | "reject" | null = null;
   for (const unknownRule of rules) {
     const rule = unknownRule as {
       tool?: string;
@@ -1658,9 +1730,9 @@ export function ampPermissionAllowed(
         (command === undefined ||
           !rule.matches.cmd.some((pattern) => globMatches(command, pattern))))
     ) continue;
-    decision = rule.action;
+    return rule.action === "allow";
   }
-  return decision === "allow";
+  return false;
 }
 
 /**
@@ -1669,8 +1741,8 @@ export function ampPermissionAllowed(
  * Without a `toolAllowlist`, this is exactly the profile's rules. With one, the
  * child is fenced to only the named tools: the profile's `reject` rules
  * are preserved (a dangerous Bash the profile blocks stays blocked even if the
- * caller listed it), a leading catch-all denies every tool by default, and
- * each allowlisted tool becomes an `allow`. Amp uses the last matching rule.
+ * caller listed it), each allowlisted tool becomes an `allow`, and a trailing
+ * catch-all denies every other tool. Amp uses the first matching rule.
  */
 export function ampPermissions(
   toolProfile: ToolProfile,
@@ -1684,7 +1756,7 @@ export function ampPermissions(
     if (toolAllowlist?.length) {
       throw new Error("factoryBoundary does not accept a caller toolAllowlist");
     }
-    return AMP_FACTORY_ACTOR_PERMISSIONS;
+    throw new Error("factoryBoundary requires a generated permission helper");
   }
   if (!toolAllowlist || toolAllowlist.length === 0) {
     return AMP_PERMISSIONS[toolProfile];
@@ -1693,19 +1765,15 @@ export function ampPermissions(
     (rule) => (rule as { action?: string }).action === "reject",
   );
   return [
-    { tool: "*", action: "reject" },
-    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
     ...profileRejects,
+    ...toolAllowlist.map((tool) => ({ tool, action: "allow" })),
+    { tool: "*", action: "reject" },
   ];
 }
 
 /** Deterministic shell policy shared by factory Amp and OpenCode actors. */
 export function factoryActorCommandAllowed(command: string): boolean {
-  return ampPermissionAllowed(
-    AMP_FACTORY_ACTOR_PERMISSIONS,
-    "Bash",
-    command,
-  );
+  return command === "git diff --check";
 }
 
 /**
@@ -1759,8 +1827,8 @@ export async function readGlobalAmpMcpServers(): Promise<
  * `toolAllowlist`, when provided, restricts the child to ONLY those tools:
  * the profile's `reject` rules are kept (so a dangerous Bash stays rejected
  * even if the caller allowlisted it), then each allowlisted tool gets an
- * `allow` rule, with the broad default first and profile rejects last so Amp's
- * last-match-wins evaluation preserves the requested restriction.
+ * `allow` rule, followed by a catch-all reject. Amp's first-match-wins
+ * evaluation preserves both the profile rejects and requested restriction.
  */
 export async function buildAmpCommand(
   cliPath: string,
@@ -1769,28 +1837,48 @@ export async function buildAmpCommand(
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
   factoryBoundary = false,
+  factoryCwd?: string,
 ): Promise<CommandInvocation> {
   const settingsFile = await Deno.makeTempFile({
     prefix: "amp-settings-",
     suffix: ".json",
   });
+  let permissionHelper: string | undefined;
   try {
     const mcpServers = factoryBoundary ? {} : await readGlobalAmpMcpServers();
+    if (factoryBoundary) {
+      if (!factoryCwd) {
+        throw new Error("factoryBoundary requires the exact invocation cwd");
+      }
+      permissionHelper = await Deno.makeTempFile({
+        prefix: "amp-factory-permission-",
+        suffix: ".py",
+      });
+      await Deno.writeTextFile(
+        permissionHelper,
+        ampFactoryPermissionHelperSource(factoryCwd),
+      );
+      await Deno.chmod(permissionHelper, 0o700);
+    }
     await Deno.writeTextFile(
       settingsFile,
       JSON.stringify({
-        "amp.permissions": ampPermissions(
-          toolProfile,
-          toolAllowlist,
-          factoryBoundary,
-        ),
+        "amp.permissions": factoryBoundary
+          ? ampFactoryActorPermissions(permissionHelper!)
+          : ampPermissions(toolProfile, toolAllowlist),
         "amp.mcpServers": mcpServers,
       }),
     );
   } catch (error) {
     await Deno.remove(settingsFile).catch(() => {});
+    if (permissionHelper) {
+      await Deno.remove(permissionHelper).catch(() => {});
+    }
     throw error;
   }
+  const inputFiles = [settingsFile, permissionHelper].filter(
+    (path): path is string => path !== undefined,
+  );
   return {
     cmd: [
       cliPath,
@@ -1800,8 +1888,9 @@ export async function buildAmpCommand(
       "--stream-json",
     ],
     stdin: resolvedPrompt,
-    sandboxReadOnlyInputFiles: [settingsFile],
-    cleanupFiles: [settingsFile],
+    env: factoryBoundary ? { GIT_PAGER: "cat", PAGER: "cat" } : undefined,
+    sandboxReadOnlyInputFiles: inputFiles,
+    cleanupFiles: inputFiles,
   };
 }
 
@@ -2924,6 +3013,7 @@ type CommandBuilder = (
   toolProfile: ToolProfile,
   toolAllowlist?: string[],
   factoryBoundary?: boolean,
+  factoryCwd?: string,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3268,6 +3358,7 @@ export async function runWithRetries(
       toolProfile,
       opts.toolAllowlist,
       opts.factoryBoundary,
+      opts.factoryBoundary ? opts.cwd : undefined,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -4765,7 +4856,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.01.2";
+export const CLI_AGENT_VERSION = "2026.09.02.1";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -4971,9 +5062,15 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: CLI_AGENT_VERSION,
+      toVersion: "2026.09.01.2",
       description:
         "Order factory Amp permissions for last-match-wins evaluation and derive viability decisions from the generated table. Execution-only change; no model attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Delegate factory Amp tool decisions to a cwd-bound helper using current shell_command/apply_patch names, restore first-match permission ordering, and prove the real Amp permission engine under bwrap before launch. Execution-only change; no model attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -5124,9 +5221,10 @@ export const model = {
           },
         );
         const cliPath = cliPathFor(args.provider, context.globalArgs);
-        let settingsFile: string | undefined;
         let versionResult: CmdResult;
         let authResult: CmdResult;
+        let commandPolicyChecks: { command: string; allowed: boolean }[];
+        let ampCleanupFiles: readonly string[] = [];
         try {
           if (args.provider === "amp") {
             const built = await buildAmpCommand(
@@ -5136,11 +5234,14 @@ export const model = {
               "actor",
               undefined,
               true,
+              cwd,
             );
-            settingsFile = built.cleanupFiles?.[0];
+            ampCleanupFiles = built.cleanupFiles ?? [];
+            const settingsFile = built.cleanupFiles?.[0];
             if (!settingsFile) {
               throw new Error("Amp settings file was not created");
             }
+            const sandboxReadOnlyInputFiles = built.sandboxReadOnlyInputFiles;
             versionResult = await runCli(
               [cliPath, "--settings-file", settingsFile, "--version"],
               {
@@ -5148,7 +5249,7 @@ export const model = {
                 wallTimeoutMs: 30_000,
                 idleTimeoutMs: 30_000,
                 sandbox,
-                sandboxReadOnlyInputFiles: [settingsFile],
+                sandboxReadOnlyInputFiles,
                 logger: context.logger,
               },
             );
@@ -5168,10 +5269,80 @@ export const model = {
                 wallTimeoutMs: 30_000,
                 idleTimeoutMs: 30_000,
                 sandbox,
-                sandboxReadOnlyInputFiles: [settingsFile],
+                sandboxReadOnlyInputFiles,
                 logger: context.logger,
               },
             );
+
+            const testPermission = async (
+              tool: string,
+              toolArguments: string[],
+            ): Promise<boolean> => {
+              const result = await runCli(
+                [
+                  cliPath,
+                  "--settings-file",
+                  settingsFile,
+                  "permissions",
+                  "test",
+                  tool,
+                  ...toolArguments,
+                  "--json",
+                ],
+                {
+                  cwd,
+                  wallTimeoutMs: 30_000,
+                  idleTimeoutMs: 30_000,
+                  sandbox,
+                  sandboxReadOnlyInputFiles,
+                  logger: context.logger,
+                },
+              );
+              if (!result.success) return false;
+              try {
+                return JSON.parse(result.stdout).action === "allow";
+              } catch {
+                return false;
+              }
+            };
+            if (
+              !await testPermission("shell_command", [
+                "--command",
+                "cat README.md",
+                "--workdir",
+                cwd,
+              ]) ||
+              !await testPermission("apply_patch", [
+                "--patchText",
+                "*** Begin Patch\n*** End Patch",
+              ])
+            ) {
+              throw new Error(
+                "factory Amp permission viability did not allow repository read/write tools",
+              );
+            }
+            const commands = [
+              "git diff --check",
+              "git push origin HEAD",
+              "gh pr merge 1",
+              "railway up",
+              "npm publish",
+              "rm -rf .",
+              "curl https://example.com",
+              "python -c 'import urllib.request'",
+            ];
+            commandPolicyChecks = [];
+            for (const command of commands) {
+              commandPolicyChecks.push({
+                command,
+                allowed: await testPermission("shell_command", [
+                  "--command",
+                  command,
+                  "--workdir",
+                  cwd,
+                ]),
+              });
+            }
           } else {
             versionResult = await runCli([cliPath, "--version"], {
               cwd,
@@ -5181,9 +5352,24 @@ export const model = {
               logger: context.logger,
             });
             authResult = versionResult;
+            commandPolicyChecks = [
+              "git diff --check",
+              "git push origin HEAD",
+              "gh pr merge 1",
+              "railway up",
+              "npm publish",
+              "rm -rf .",
+              "curl https://example.com",
+              "python -c 'import urllib.request'",
+            ].map((command) => ({
+              command,
+              allowed: factoryActorCommandAllowed(command),
+            }));
           }
         } finally {
-          if (settingsFile) await Deno.remove(settingsFile).catch(() => {});
+          for (const path of ampCleanupFiles) {
+            await Deno.remove(path).catch(() => {});
+          }
         }
         if (!versionResult.success || !authResult.success) {
           throw new Error(
@@ -5222,32 +5408,14 @@ export const model = {
           );
         }
 
-        const checks = [
-          "git diff --check",
-          "git push origin HEAD",
-          "gh pr merge 1",
-          "railway up",
-          "npm publish",
-          "rm -rf .",
-          "curl https://example.com",
-          "python -c 'import urllib.request'",
-        ].map((command) => ({
-          command,
-          allowed: args.provider === "amp"
-            ? ampPermissionAllowed(
-              AMP_FACTORY_ACTOR_PERMISSIONS,
-              "Bash",
-              command,
-            )
-            : factoryActorCommandAllowed(command),
-        }));
         if (
-          !checks[0].allowed || checks.slice(1).some((check) => check.allowed)
+          !commandPolicyChecks[0].allowed ||
+          commandPolicyChecks.slice(1).some((check) => check.allowed)
         ) {
           throw new Error("factory command policy viability failed");
         }
         const policyDigest = await hashPrompt(JSON.stringify({
-          amp: AMP_FACTORY_ACTOR_PERMISSIONS,
+          ampHelper: ampFactoryPermissionHelperSource(cwd),
           opencodeAllowedShell: ["git diff --check"],
           packageVersion: CLI_AGENT_VERSION,
         }));
@@ -5269,7 +5437,7 @@ export const model = {
           versionProbeSucceeded: versionResult.success,
           authProbeSucceeded: authResult.success,
           workspaceProbeSucceeded: probe.success,
-          commandPolicyChecks: checks,
+          commandPolicyChecks,
           checkedAt: new Date().toISOString(),
         });
         const write = await createOnceOrVerify(
