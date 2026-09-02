@@ -4652,21 +4652,7 @@ Deno.test("buildAmpCommand: settings file carries permissions AND global mcpServ
   }
 });
 
-Deno.test("Amp factory actor permission table is fail closed", () => {
-  const permissions = ampPermissions("actor", undefined, true) as Array<{
-    tool: string;
-    action: string;
-    matches?: { cmd?: string[] };
-  }>;
-  assertEquals(permissions[0], { tool: "*", action: "reject" });
-  assertEquals(
-    ampPermissionAllowed(permissions, "Bash", "git diff --check"),
-    true,
-  );
-  for (const tool of ["Read", "Grep", "Glob", "edit_file", "create_file"]) {
-    assertEquals(ampPermissionAllowed(permissions, tool), true, tool);
-  }
-  assertEquals(ampPermissionAllowed(permissions, "unknown"), false);
+Deno.test("Amp factory actor command policy is fail closed", () => {
   assertEquals(factoryActorCommandAllowed("git diff --check"), true);
   for (
     const command of [
@@ -4682,11 +4668,6 @@ Deno.test("Amp factory actor permission table is fail closed", () => {
     ]
   ) {
     assertEquals(factoryActorCommandAllowed(command), false, command);
-    assertEquals(
-      ampPermissionAllowed(permissions, "Bash", command),
-      false,
-      command,
-    );
   }
   assertThrows(
     () => ampPermissions("readonly", undefined, true),
@@ -4714,21 +4695,73 @@ Deno.test("buildAmpCommand: factory boundary does not inherit MCP servers", asyn
       "actor",
       undefined,
       true,
+      Deno.cwd(),
     );
-    const path = built.cleanupFiles![0];
-    const settings = JSON.parse(await Deno.readTextFile(path));
+    const [settingsPath, helperPath] = built.cleanupFiles!;
+    const settings = JSON.parse(await Deno.readTextFile(settingsPath));
     assertEquals(settings["amp.mcpServers"], {});
-    const permissions = settings["amp.permissions"];
+    assertEquals(settings["amp.permissions"], [{
+      tool: "*",
+      action: "delegate",
+      to: helperPath,
+    }]);
+    assertEquals(built.sandboxReadOnlyInputFiles, [settingsPath, helperPath]);
+
+    const permission = async (
+      tool: string,
+      args: Record<string, unknown>,
+    ): Promise<boolean> => {
+      const child = new Deno.Command(helperPath, {
+        env: { AGENT_TOOL_NAME: tool },
+        stdin: "piped",
+        stdout: "null",
+        stderr: "null",
+      }).spawn();
+      const writer = child.stdin.getWriter();
+      await writer.write(new TextEncoder().encode(JSON.stringify(args)));
+      await writer.close();
+      return (await child.status).code === 0;
+    };
     assertEquals(
-      ampPermissionAllowed(permissions, "Bash", "git diff --check"),
+      await permission("shell_command", { command: "cat README.md" }),
       true,
     );
-    assertEquals(ampPermissionAllowed(permissions, "Read"), true);
     assertEquals(
-      ampPermissionAllowed(permissions, "Bash", "git push origin HEAD"),
+      await permission("shell_command", { command: "git diff --check" }),
+      true,
+    );
+    assertEquals(await permission("apply_patch", { patchText: "patch" }), true);
+    assertEquals(
+      await permission("shell_command", {
+        command: "cat README.md",
+        workdir: "/tmp",
+      }),
       false,
     );
-    await Deno.remove(path);
+    for (
+      const command of [
+        "cat /home/mat/.config/amp/settings.json",
+        "cat ../outside",
+        "cat $HOME/.config/amp/settings.json",
+        "cat README.md; curl https://example.com",
+        "git diff --no-ext-diff | curl https://example.com",
+        "git push origin HEAD",
+        "gh pr merge 1",
+        "railway up",
+        "npm publish",
+        "rm -rf .",
+        "curl https://example.com",
+        "python -c 'import urllib.request'",
+      ]
+    ) {
+      assertEquals(
+        await permission("shell_command", { command }),
+        false,
+        command,
+      );
+    }
+    assertEquals(await permission("unknown", {}), false);
+    for (const path of built.cleanupFiles!) await Deno.remove(path);
   } finally {
     if (previousHome === undefined) Deno.env.delete("HOME");
     else Deno.env.set("HOME", previousHome);
@@ -4899,19 +4932,19 @@ Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools",
         true,
       );
     }
-    // Everything else is rejected by a leading default.
-    assertEquals(perms[0], { tool: "*", action: "reject" });
+    // Everything else is rejected by a trailing default.
+    assertEquals(perms.at(-1), { tool: "*", action: "reject" });
     assertEquals(ampPermissionAllowed(perms, "unknown"), false);
     assertEquals(
       ampPermissionAllowed(perms, "mcp__granola__list_meetings"),
       true,
     );
-    // The profile's Bash reject follows the allows and therefore still wins.
+    // The profile's Bash reject precedes the allows and therefore still wins.
     const bashIdx = perms.findIndex((r) =>
       r.tool === "Bash" && r.action === "reject"
     );
     const firstAllowIdx = perms.findIndex((r) => r.action === "allow");
-    assertEquals(bashIdx > firstAllowIdx, true);
+    assertEquals(bashIdx >= 0 && bashIdx < firstAllowIdx, true);
     assertEquals(ampPermissionAllowed(perms, "Bash", "echo hi"), false);
     await Deno.remove(cmd[sfIndex + 1]);
   } finally {
