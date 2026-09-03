@@ -122,6 +122,7 @@ Arguments:
 | `invocationId`  | string   | no       | Stable caller-owned identity for at-most-once launch/replay |
 | `provider`      | enum     | no       | Override the default provider                 |
 | `model`         | string   | no       | Override the default model                    |
+| `opencodeAgent` | string   | no       | Delegate to a machine-global OpenCode agent, which owns its model, variant, prompt, permissions, and tools |
 | `cwd`           | string   | no       | Working directory for the CLI                 |
 | `repositoryExpectation` | object | no | All-or-none preflight identity: attached branch, 40-char HEAD SHA, and 64-char repository state hash |
 | `tags`          | object   | no       | Key-value tags for grouping/filtering         |
@@ -255,10 +256,10 @@ already present in these native-client stores. Do **not** add cli-agent
 
 ## How It Works
 
-1. **Slash command resolution** — prompts starting with `/` are resolved
-   against markdown files in the configured `commandsDir`. The resolver
-   checks `{commandsDir}/{name}.md` and `{commandsDir}/{name-with-slashes}.md`,
-   strips YAML frontmatter, and substitutes `$ARGUMENTS`.
+1. **Slash command resolution** — for OpenCode, prompts starting with `/` are
+   passed to `opencode run --command`, preserving the command's machine-global
+   agent routing. Other providers resolve slash commands against markdown files
+   in `commandsDir`, strip YAML frontmatter, and substitute `$ARGUMENTS`.
 
 2. **Provider dispatch** — each provider has a dedicated command builder that
    maps the prompt and model to the correct CLI flags. Amp receives prompts
@@ -270,6 +271,11 @@ already present in these native-client stores. Do **not** add cli-agent
    `--permission-mode bypassPermissions` for Grok) since headless invocations
    cannot answer interactive approval prompts — only point this extension at
    working directories you trust it to modify.
+
+   OpenCode invocations with `opencodeAgent` instead select that machine-global
+   agent without forcing a model, variant, or permission profile. The agent must
+   exist in the OpenCode configuration visible from `cwd`. `opencodeAgent`
+   cannot be combined with a slash command or factory boundary.
 
 3. **Retry logic** — transient failures (exit codes 137, 143 — typically
    OOM-killed or SIGTERM) and retryable provider errors (rate limits) trigger
@@ -296,10 +302,13 @@ Each invocation is persisted with these fields:
 | ----------------- | ------- | ---------------------------------------- |
 | `invocationId`    | string  | Unique UUID for this invocation          |
 | `provider`        | enum    | Which CLI agent was used                 |
-| `model`           | string  | Model name passed to the CLI             |
+| `model`           | string  | Model passed to the CLI or resolved from the selected OpenCode agent |
 | `prompt`          | string  | First 500 chars of the original prompt   |
 | `promptTruncated` | boolean | Whether `prompt` was capped at 500 chars |
 | `promptHash`      | string  | SHA-256 of the fully resolved prompt      |
+| `agent`           | string  | Selected machine-global OpenCode agent, when applicable |
+| `variant`         | string  | Variant resolved from that agent, when configured |
+| `routingSource`   | enum    | `opencode-agent` or `native-command`, when applicable |
 | `exitCode`        | number  | Process exit code                        |
 | `success`         | boolean | Whether the invocation succeeded         |
 | `durationMs`      | number  | Wall-clock duration in milliseconds      |

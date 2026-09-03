@@ -58,6 +58,8 @@ import {
   readGlobalAmpMcpServers,
   RepositoryExpectationSchema,
   repositoryStateHash,
+  resolveAgentModelVariant,
+  resolveCommandAgent,
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
@@ -72,6 +74,7 @@ import {
   scanJsonLines,
   selectAmpCandidateIds,
   SIGNATURE_TABLE,
+  splitNativeSlashCommand,
   timeoutAttribution,
   verifyRepositoryExpectation,
   wrapWithSandbox,
@@ -962,6 +965,9 @@ function terminal(
     invocationId: launchClaim.invocationId,
     provider: launchClaim.provider,
     model: launchClaim.model,
+    agent: launchClaim.agent,
+    variant: launchClaim.variant,
+    routingSource: launchClaim.routingSource,
     prompt: "prompt",
     promptTruncated: false,
     promptHash: launchClaim.promptHash,
@@ -1162,6 +1168,9 @@ Deno.test("claim conflicts fail closed for fields and operation", async () => {
   for (
     const differing of [
       await claim("invoke", { provider: "amp" }),
+      await claim("invoke", { agent: "reviewer" }),
+      await claim("invoke", { variant: "high" }),
+      await claim("invoke", { routingSource: "opencode-agent" }),
       await claim("invoke", {
         repositoryExpectation: {
           attachedBranch: "main",
@@ -1949,6 +1958,209 @@ Deno.test("buildOpencodeCommand: factory actor is fail closed and permits only d
   assertEquals(permissions.write, "allow");
   assertEquals(permissions.bash["git diff --check"], "allow");
   assertEquals(permissions.bash["*"], "deny");
+});
+
+Deno.test("buildOpencodeCommand: opencodeAgent routing owns model/variant/permissions and drops --model and permission overrides", () => {
+  const built = buildOpencodeCommand(
+    "opencode",
+    "ignored/legacy-model",
+    "Make the requested repository edit",
+    "actor",
+    undefined,
+    false,
+    undefined,
+    { source: "opencode-agent", agent: "herdr", model: "openai/gpt-5.6-sol" },
+  );
+  assertEquals(built.cmd, [
+    "opencode",
+    "run",
+    "--format",
+    "json",
+    "--agent",
+    "herdr",
+    "Make the requested repository edit",
+  ]);
+  assertEquals(built.cmd.includes("--model"), false);
+  assertEquals(built.cmd.includes("--dangerously-skip-permissions"), false);
+  assertEquals(built.env, undefined);
+  assertEquals(built.stdin, undefined);
+});
+
+Deno.test("buildOpencodeCommand: native slash command routes through --command with args as message", () => {
+  const built = buildOpencodeCommand(
+    "opencode",
+    "ignored/legacy-model",
+    "fix the bug",
+    "actor",
+    undefined,
+    false,
+    undefined,
+    {
+      source: "native-command",
+      agent: "reviewer",
+      command: "review",
+      model: "openai/gpt-5.6-sol",
+      variant: "medium",
+    },
+  );
+  assertEquals(built.cmd, [
+    "opencode",
+    "run",
+    "--format",
+    "json",
+    "--command",
+    "review",
+    "fix the bug",
+  ]);
+  assertEquals(built.cmd.includes("--model"), false);
+  assertEquals(built.cmd.includes("--agent"), false);
+  assertEquals(built.env, undefined);
+});
+
+Deno.test("buildOpencodeCommand: native slash command with no args omits the message positional", () => {
+  const built = buildOpencodeCommand(
+    "opencode",
+    "ignored/legacy-model",
+    "",
+    "actor",
+    undefined,
+    false,
+    undefined,
+    {
+      source: "native-command",
+      agent: "digest",
+      command: "brief",
+      model: "openai/gpt-5.6-sol",
+    },
+  );
+  assertEquals(built.cmd, [
+    "opencode",
+    "run",
+    "--format",
+    "json",
+    "--command",
+    "brief",
+  ]);
+});
+
+Deno.test("splitNativeSlashCommand: parses name and message args", () => {
+  assertEquals(splitNativeSlashCommand("/review fix the bug"), {
+    name: "review",
+    args: "fix the bug",
+  });
+  assertEquals(splitNativeSlashCommand("/brief"), { name: "brief", args: "" });
+  assertEquals(splitNativeSlashCommand("/x y z"), { name: "x", args: "y z" });
+});
+
+Deno.test("resolveCommandAgent: prefers command.agent then global default_agent", () => {
+  assertEquals(
+    resolveCommandAgent({
+      default_agent: "build",
+      command: { review: { agent: "reviewer" } },
+    }, "review"),
+    "reviewer",
+  );
+  assertEquals(
+    resolveCommandAgent({
+      default_agent: "build",
+      command: { brief: { template: "..." } },
+    }, "brief"),
+    "build",
+  );
+  assertEquals(resolveCommandAgent({ command: {} }, "missing"), null);
+  assertEquals(resolveCommandAgent("not-an-object", "x"), null);
+});
+
+Deno.test("resolveAgentModelVariant: resolves model and variant from debug agent output", () => {
+  assertEquals(
+    resolveAgentModelVariant({
+      model: { providerID: "openai", modelID: "gpt-5.6-sol" },
+      variant: "medium",
+    }),
+    { model: "openai/gpt-5.6-sol", variant: "medium" },
+  );
+  assertEquals(
+    resolveAgentModelVariant({
+      model: { providerID: "ollama", modelID: "qwen" },
+    }),
+    { model: "ollama/qwen" },
+  );
+  assertEquals(resolveAgentModelVariant({}), null);
+  assertEquals(
+    resolveAgentModelVariant({ model: { providerID: "openai" } }),
+    null,
+  );
+  assertEquals(resolveAgentModelVariant(null), null);
+});
+
+Deno.test("opencodeAgent argument validation", () => {
+  // Valid: explicit opencode provider.
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "hi",
+      provider: "opencode",
+      opencodeAgent: "build",
+    }).success,
+    true,
+  );
+  // Valid: provider omitted (runtime resolves defaultProvider).
+  assertEquals(
+    InvokeArgsSchema.safeParse({ prompt: "hi", opencodeAgent: "build" })
+      .success,
+    true,
+  );
+  // Invalid: non-opencode provider.
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "hi",
+      provider: "claude",
+      opencodeAgent: "build",
+    }).success,
+    false,
+  );
+  // Invalid: slash command is ambiguous routing.
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "/review x",
+      provider: "opencode",
+      opencodeAgent: "build",
+    }).success,
+    false,
+  );
+  // Invalid: factoryBoundary would be silently bypassed by a machine-global agent.
+  const factoryConflict = InvokeArgsSchema.safeParse({
+    prompt: "implement",
+    invocationId: "factory-c2",
+    provider: "opencode",
+    opencodeAgent: "build",
+    repositoryExpectation: {
+      attachedBranch: "factory/test",
+      headSha: "a".repeat(40),
+      stateHash: "b".repeat(64),
+    },
+    toolProfile: "actor",
+    factoryBoundary: true,
+    sandboxMode: "bwrap",
+    sandboxRequired: true,
+  });
+  assertEquals(factoryConflict.success, false);
+  assertEquals(
+    factoryConflict.success
+      ? []
+      : factoryConflict.error.issues.some((issue) =>
+        issue.path[0] === "opencodeAgent"
+      ),
+    true,
+  );
+  // Invalid: blank agent name.
+  assertEquals(
+    InvokeArgsSchema.safeParse({
+      prompt: "hi",
+      provider: "opencode",
+      opencodeAgent: "   ",
+    }).success,
+    false,
+  );
 });
 
 Deno.test("buildGrokCommand: actor profile argv contract, no stdin, no --no-auto-update", () => {
