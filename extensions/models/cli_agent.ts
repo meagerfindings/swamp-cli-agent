@@ -186,6 +186,16 @@ export const InvocationSchema = z.object({
   ),
   promptHash: z.string(),
   slashCommand: z.string().optional(),
+  agent: z.string().optional().describe(
+    "Machine-global OpenCode agent that owned the execution. Absent when routing was not delegated to a machine-global agent.",
+  ),
+  variant: z.string().optional().describe(
+    "Resolved OpenCode model variant (provider-specific reasoning effort) from `opencode debug agent <name>`. Absent when not routed through a machine-global agent.",
+  ),
+  routingSource: z.enum(["opencode-agent", "native-command"]).optional()
+    .describe(
+      "How the OpenCode agent was selected: an explicit opencodeAgent argument, or a native slash command's configured command.agent/default_agent. Absent for legacy --model routing.",
+    ),
   cwd: z.string(),
   exitCode: z.number(),
   success: z.boolean(),
@@ -242,6 +252,9 @@ export const InvocationLaunchClaimSchema = z.object({
   invocationId: InvocationIdSchema,
   provider: ProviderEnum,
   model: ModelIdSchema,
+  agent: z.string().optional(),
+  variant: z.string().optional(),
+  routingSource: z.enum(["opencode-agent", "native-command"]).optional(),
   cwd: z.string().min(1),
   repositoryExpectation: RepositoryExpectationSchema.optional(),
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -1518,6 +1531,214 @@ export function buildClaudeCommand(
 }
 
 /**
+ * Machine-global OpenCode agent routing for one invocation: a named agent
+ * fully owns model, variant, prompt, permissions, and tools, so the CLI runs
+ * with `--agent <name>` (or `--command <name>` for native slash commands) and
+ * no synthetic `--model` / permission overrides.
+ */
+export type OpencodeRoute = {
+  /** How the agent was selected. */
+  source: "opencode-agent" | "native-command";
+  /** The selected machine-global agent name. */
+  agent: string;
+  /** Native slash-command name (native-command source only). */
+  command?: string;
+  /** Actual model resolved from `opencode debug agent <name>` (providerID/modelID). */
+  model: ModelId;
+  /** Resolved variant (provider-specific reasoning effort), when present. */
+  variant?: string;
+};
+
+/** Split a native slash prompt "/name args" into its command name and message. */
+export function splitNativeSlashCommand(
+  prompt: string,
+): { name: string; args: string } {
+  const space = prompt.indexOf(" ");
+  if (space === -1) return { name: prompt.slice(1), args: "" };
+  return { name: prompt.slice(1, space), args: prompt.slice(space + 1) };
+}
+
+/**
+ * Resolve the agent name that owns a native command from merged
+ * `opencode debug config` output: the command's own `command.<name>.agent`,
+ * falling back to the global `default_agent`. Returns null when neither
+ * resolves (callers fail clearly).
+ */
+export function resolveCommandAgent(
+  debugConfig: unknown,
+  commandName: string,
+): string | null {
+  if (typeof debugConfig !== "object" || debugConfig === null) return null;
+  const config = debugConfig as Record<string, unknown>;
+  const command = config.command;
+  if (typeof command === "object" && command !== null) {
+    const entry = (command as Record<string, unknown>)[commandName];
+    if (typeof entry === "object" && entry !== null) {
+      const agent = (entry as Record<string, unknown>).agent;
+      if (typeof agent === "string" && agent.trim().length > 0) return agent;
+    }
+  }
+  const fallback = config.default_agent;
+  return typeof fallback === "string" && fallback.trim().length > 0
+    ? fallback
+    : null;
+}
+
+/**
+ * Resolve the actual model (rendered as `providerID/modelID`) and variant from
+ * `opencode debug agent <name>` output. Returns null when the model is absent,
+ * so callers fail clearly rather than fabricating a model id.
+ */
+export function resolveAgentModelVariant(
+  debugAgent: unknown,
+): { model: ModelId; variant?: string } | null {
+  if (typeof debugAgent !== "object" || debugAgent === null) return null;
+  const agent = debugAgent as Record<string, unknown>;
+  const model = agent.model;
+  if (typeof model !== "object" || model === null) return null;
+  const { providerID, modelID } = model as Record<string, unknown>;
+  if (typeof providerID !== "string" || typeof modelID !== "string") {
+    return null;
+  }
+  if (providerID.trim().length === 0 || modelID.trim().length === 0) {
+    return null;
+  }
+  const variant = agent.variant;
+  const resolved = { model: `${providerID}/${modelID}` };
+  return typeof variant === "string" && variant.trim().length > 0
+    ? { ...resolved, variant }
+    : resolved;
+}
+
+/** Run a read-only `opencode debug ...` introspection command (no sandbox). */
+async function runOpencodeDebug(
+  cliPath: string,
+  args: string[],
+  cwd: string,
+  logger?: MethodContext["logger"],
+): Promise<string> {
+  const result = await runCli([cliPath, ...args], {
+    cwd,
+    wallTimeoutMs: 60_000,
+    logger,
+  });
+  if (!result.success) {
+    throw new Error(
+      `opencode ${args.join(" ")} failed (exit ${result.code}): ${
+        result.stderr.slice(0, 200)
+      }`,
+    );
+  }
+  return result.stdout;
+}
+
+/**
+ * Resolve a machine-global OpenCode agent's actual model/variant from
+ * `opencode debug agent <name>` so invocation/claim records stay truthful
+ * even though the CLI is launched without `--model`.
+ */
+async function resolveAgentRoute(
+  cliPath: string,
+  agentName: string,
+  source: "opencode-agent" | "native-command",
+  cwd: string,
+  logger?: MethodContext["logger"],
+): Promise<OpencodeRoute> {
+  const raw = await runOpencodeDebug(
+    cliPath,
+    ["debug", "agent", agentName],
+    cwd,
+    logger,
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `opencode debug agent ${agentName} produced non-JSON output`,
+    );
+  }
+  const resolved = resolveAgentModelVariant(parsed);
+  if (resolved === null) {
+    throw new Error(
+      `opencode agent '${agentName}' did not resolve a model (debug agent output missing model.providerID/modelID)`,
+    );
+  }
+  return {
+    source,
+    agent: agentName,
+    model: resolved.model,
+    variant: resolved.variant,
+  };
+}
+
+/** Message input + optional OpenCode route for one invocation. */
+type ResolvedPromptAndRoute = {
+  resolved: string;
+  slashCommand?: string;
+  opencodeRoute?: OpencodeRoute;
+};
+
+/**
+ * Resolve the message input and (for OpenCode) machine-global routing for an
+ * invocation. Native `/name args` prompts route through `opencode run
+ * --command name` with args as the message; an explicit `opencodeAgent` owns
+ * model/variant/permissions/tools entirely. Every other prompt — including all
+ * non-opencode providers — falls through to the legacy `.claude/commands`
+ * expansion unchanged.
+ */
+async function resolvePromptAndRoute(
+  args: { prompt: string; opencodeAgent?: string },
+  provider: Provider,
+  cliPath: string,
+  commandsDir: string,
+  commandSubdirs: string[],
+  cwd: string,
+  logger?: MethodContext["logger"],
+): Promise<ResolvedPromptAndRoute> {
+  if (provider !== "opencode") {
+    return resolveSlashCommand(args.prompt, commandsDir, commandSubdirs, cwd);
+  }
+  if (args.opencodeAgent !== undefined) {
+    return {
+      resolved: args.prompt,
+      opencodeRoute: await resolveAgentRoute(
+        cliPath,
+        args.opencodeAgent,
+        "opencode-agent",
+        cwd,
+        logger,
+      ),
+    };
+  }
+  if (args.prompt.startsWith("/")) {
+    const { name, args: message } = splitNativeSlashCommand(args.prompt);
+    const config = JSON.parse(
+      await runOpencodeDebug(cliPath, ["debug", "config"], cwd, logger),
+    );
+    const agent = resolveCommandAgent(config, name);
+    if (agent === null) {
+      throw new Error(
+        `OpenCode native command '/${name}' has no resolvable agent (missing command.${name}.agent and default_agent in debug config)`,
+      );
+    }
+    const route = await resolveAgentRoute(
+      cliPath,
+      agent,
+      "native-command",
+      cwd,
+      logger,
+    );
+    return {
+      resolved: message,
+      slashCommand: name,
+      opencodeRoute: { ...route, command: name },
+    };
+  }
+  return resolveSlashCommand(args.prompt, commandsDir, commandSubdirs, cwd);
+}
+
+/**
  * Build the command array for the OpenCode CLI.
  *
  * OpenCode 1.15.3 exposes its permission contract through named agents and
@@ -1536,7 +1757,25 @@ export function buildOpencodeCommand(
   toolProfile: ToolProfile,
   _toolAllowlist?: string[],
   factoryBoundary = false,
+  _factoryCwd?: string,
+  routing?: OpencodeRoute,
 ): { cmd: string[]; stdin?: string; env?: Record<string, string> } {
+  if (routing) {
+    // Machine-global agent fully owns model, variant, prompt, permissions, and
+    // tools: no --model, no synthetic OPENCODE_CONFIG_CONTENT, and no
+    // permission-bypass flag. Native slash commands delegate to `--command`;
+    // an explicit opencodeAgent delegates to `--agent`.
+    const command = routing.source === "native-command"
+      ? [
+        "--command",
+        routing.command!,
+        ...(resolvedPrompt ? [resolvedPrompt] : []),
+      ]
+      : ["--agent", routing.agent, ...(resolvedPrompt ? [resolvedPrompt] : [])];
+    return {
+      cmd: [cliPath, "run", "--format", "json", ...command],
+    };
+  }
   const readonlyAgent = "cli-agent-readonly";
   const factoryAgent = "cli-agent-factory-actor";
   const permissionArgs = toolProfile === "actor" && !factoryBoundary
@@ -3015,6 +3254,7 @@ type CommandBuilder = (
   toolAllowlist?: string[],
   factoryBoundary?: boolean,
   factoryCwd?: string,
+  opencodeRoute?: OpencodeRoute,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3333,6 +3573,7 @@ export async function runWithRetries(
     sandbox?: SandboxConfig;
     toolAllowlist?: string[];
     factoryBoundary?: boolean;
+    opencodeRoute?: OpencodeRoute;
     requireParseableJson?: boolean;
     retryDelayMs?: number;
   },
@@ -3360,6 +3601,7 @@ export async function runWithRetries(
       opts.toolAllowlist,
       opts.factoryBoundary,
       opts.factoryBoundary ? opts.cwd : undefined,
+      opts.opencodeRoute,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3463,6 +3705,7 @@ function buildInvocationBase(
   slashCommand: string | undefined,
   cwd: string,
   outcome: RunOutcome,
+  route?: OpencodeRoute,
 ): Record<string, unknown> {
   const { result, usage, providerError, extractedText } = outcome;
   const outputTokensPerSecond = usage.output && result.durationMs > 0
@@ -3477,6 +3720,9 @@ function buildInvocationBase(
     promptTruncated: args.prompt.length > 500,
     promptHash,
     slashCommand,
+    agent: route?.agent,
+    variant: route?.variant,
+    routingSource: route?.source,
     cwd,
     exitCode: result.code,
     // A provider error (quota/rate-limit) is a failure even when the CLI
@@ -3644,6 +3890,8 @@ export async function launchCallerInvocation<T>(
   const consistent = i.invocationId === claim.invocationId &&
     t.invocationId === claim.invocationId && i.provider === claim.provider &&
     i.model === claim.model && i.cwd === claim.cwd &&
+    i.agent === claim.agent && i.variant === claim.variant &&
+    i.routingSource === claim.routingSource &&
     i.promptHash === claim.promptHash &&
     stableValue(normalizeTags(i.tags)) === stableValue(claim.tags) &&
     i.prompt === t.prompt.slice(0, 500) &&
@@ -3807,6 +4055,9 @@ export const InvokeArgsSchema = z.object({
     "Override the default model. When omitted, uses the provider's defaultModel " +
       "from PROVIDERS, then global defaultModel.",
   ),
+  opencodeAgent: z.string().trim().min(1).optional().describe(
+    "Machine-global OpenCode agent that fully owns model, variant, prompt, permissions, and tools. Only valid when the resolved provider is opencode. When set, the CLI runs with --agent <name> and without --model, synthetic OPENCODE_CONFIG_CONTENT, or --dangerously-skip-permissions; the actual model/variant are resolved from `opencode debug agent <name>` before launch for truthful records. Rejected when combined with a slash command.",
+  ),
   cwd: z.string().optional().describe(
     "Working directory for the CLI (defaults to Deno.cwd())",
   ),
@@ -3844,6 +4095,31 @@ export const InvokeArgsSchema = z.object({
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
   ),
 }).superRefine((args, ctx) => {
+  if (args.opencodeAgent !== undefined) {
+    if (args.provider !== undefined && args.provider !== "opencode") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["opencodeAgent"],
+        message: "opencodeAgent is only valid when provider is opencode",
+      });
+    }
+    if (args.prompt.startsWith("/")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["opencodeAgent"],
+        message:
+          "opencodeAgent cannot be combined with a slash command (ambiguous routing)",
+      });
+    }
+    if (args.factoryBoundary) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["opencodeAgent"],
+        message:
+          "opencodeAgent cannot be combined with factoryBoundary (the machine-global agent would bypass the factory actor policy)",
+      });
+    }
+  }
   if (
     args.repositoryExpectation !== undefined && args.invocationId === undefined
   ) {
@@ -4857,7 +5133,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.03.1";
+export const CLI_AGENT_VERSION = "2026.09.03.2";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -5075,9 +5351,15 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: CLI_AGENT_VERSION,
+      toVersion: "2026.09.03.1",
       description:
         "Send Codex prompts through stdin so large factory packets do not exceed process argument-vector limits. Execution-only change; no schema or attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Add optional opencodeAgent to invoke/invokeAndParse plus native OpenCode slash-command routing (opencode run --command). A machine-global agent then owns model, variant, prompt, permissions, and tools (no --model, no synthetic OPENCODE_CONFIG_CONTENT, no --dangerously-skip-permissions); the actual agent/model/variant are resolved from `opencode debug config`/`opencode debug agent` before launch and recorded as additive optional fields (agent, variant, routingSource). Additive argument and attribute change; no attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -5468,11 +5750,12 @@ export const model = {
         const callerOwned = args.invocationId !== undefined;
         const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
-        const modelName = resolveModel(
-          provider,
-          args.model,
-          context.globalArgs.defaultModel,
-        );
+        if (args.opencodeAgent !== undefined && provider !== "opencode") {
+          throw new Error(
+            `opencodeAgent is only valid when the resolved provider is opencode (got '${provider}')`,
+          );
+        }
+        const cliPath = cliPathFor(provider, context.globalArgs);
         const requestedCwd = args.cwd || Deno.cwd();
         const cwd = callerOwned || args.repositoryExpectation !== undefined
           ? await canonicalCwd(requestedCwd)
@@ -5487,14 +5770,21 @@ export const model = {
         const toolProfile = args.toolProfile ||
           context.globalArgs.defaultToolProfile;
 
-        const { resolved, slashCommand } = await resolveSlashCommand(
-          args.prompt,
-          commandsDir,
-          commandSubdirs,
-          cwd,
+        const { resolved, slashCommand, opencodeRoute } =
+          await resolvePromptAndRoute(
+            args,
+            provider,
+            cliPath,
+            commandsDir,
+            commandSubdirs,
+            cwd,
+            context.logger,
+          );
+        const modelName = opencodeRoute?.model ??
+          resolveModel(provider, args.model, context.globalArgs.defaultModel);
+        const promptHash = await hashPrompt(
+          opencodeRoute?.source === "native-command" ? args.prompt : resolved,
         );
-        const promptHash = await hashPrompt(resolved);
-        const cliPath = cliPathFor(provider, context.globalArgs);
         const sandbox = sandboxConfigFrom(
           context.globalArgs,
           (fn) => context.extensionFile(fn),
@@ -5525,6 +5815,7 @@ export const model = {
               sandbox,
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
+              opencodeRoute,
             },
             context.logger,
           );
@@ -5536,6 +5827,9 @@ export const model = {
             invocationId,
             provider,
             model: modelName,
+            agent: opencodeRoute?.agent,
+            variant: opencodeRoute?.variant,
+            routingSource: opencodeRoute?.source,
             cwd,
             repositoryExpectation: args.repositoryExpectation,
             promptHash,
@@ -5572,6 +5866,7 @@ export const model = {
           slashCommand,
           cwd,
           outcome,
+          opencodeRoute,
         );
 
         const invocationWrite = await createOnceOrVerify(
@@ -5652,11 +5947,12 @@ export const model = {
         const callerOwned = args.invocationId !== undefined;
         const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
-        const modelName = resolveModel(
-          provider,
-          args.model,
-          context.globalArgs.defaultModel,
-        );
+        if (args.opencodeAgent !== undefined && provider !== "opencode") {
+          throw new Error(
+            `opencodeAgent is only valid when the resolved provider is opencode (got '${provider}')`,
+          );
+        }
+        const cliPath = cliPathFor(provider, context.globalArgs);
         const requestedCwd = args.cwd || Deno.cwd();
         const cwd = callerOwned || args.repositoryExpectation !== undefined
           ? await canonicalCwd(requestedCwd)
@@ -5671,14 +5967,21 @@ export const model = {
         const toolProfile = args.toolProfile ||
           context.globalArgs.defaultToolProfile;
 
-        const { resolved, slashCommand } = await resolveSlashCommand(
-          args.prompt,
-          commandsDir,
-          commandSubdirs,
-          cwd,
+        const { resolved, slashCommand, opencodeRoute } =
+          await resolvePromptAndRoute(
+            args,
+            provider,
+            cliPath,
+            commandsDir,
+            commandSubdirs,
+            cwd,
+            context.logger,
+          );
+        const modelName = opencodeRoute?.model ??
+          resolveModel(provider, args.model, context.globalArgs.defaultModel);
+        const promptHash = await hashPrompt(
+          opencodeRoute?.source === "native-command" ? args.prompt : resolved,
         );
-        const promptHash = await hashPrompt(resolved);
-        const cliPath = cliPathFor(provider, context.globalArgs);
         const sandbox = sandboxConfigFrom(
           context.globalArgs,
           (fn) => context.extensionFile(fn),
@@ -5710,6 +6013,7 @@ export const model = {
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
+              opencodeRoute,
             },
             context.logger,
           );
@@ -5721,6 +6025,9 @@ export const model = {
             invocationId,
             provider,
             model: modelName,
+            agent: opencodeRoute?.agent,
+            variant: opencodeRoute?.variant,
+            routingSource: opencodeRoute?.source,
             cwd,
             repositoryExpectation: args.repositoryExpectation,
             promptHash,
@@ -5762,6 +6069,7 @@ export const model = {
           slashCommand,
           cwd,
           outcome,
+          opencodeRoute,
         );
         const invocation = {
           ...base,
