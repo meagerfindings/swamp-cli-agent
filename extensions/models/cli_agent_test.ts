@@ -23,6 +23,7 @@ import {
   buildAmpCommand,
   buildBwrapArgs,
   buildClaudeCommand,
+  buildCodexCommand,
   buildGrokCommand,
   buildOpencodeCommand,
   buildPiCommand,
@@ -3849,6 +3850,15 @@ Deno.test("buildPiCommand: disables extensions and sends hostile prompts via std
     assertEquals(built.cmd.includes(prompt), false, prompt);
     assertEquals(built.stdin, prompt);
   }
+});
+
+Deno.test("buildCodexCommand: sends large prompts via stdin instead of argv", () => {
+  const prompt = "review this stack\n".repeat(20_000);
+  const built = buildCodexCommand("codex", "gpt-5.5", prompt, "readonly");
+
+  assertEquals(built.cmd.at(-1), "-");
+  assertEquals(built.cmd.includes(prompt), false);
+  assertEquals(built.stdin, prompt);
 });
 
 Deno.test("extractText: pi joins assistant text parts, excludes thinking", () => {

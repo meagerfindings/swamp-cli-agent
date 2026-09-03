@@ -1936,9 +1936,9 @@ const CODEX_SANDBOX_MODE: Record<ToolProfile, string> = {
  * Build the command array for the OpenAI Codex CLI.
  *
  * `codex exec --json` runs non-interactively and emits one JSON event per line
- * (JSONL). The prompt is the final positional argument — codex reads from stdin
- * only when no prompt arg is given, so we must NOT pipe it on stdin. `--color
- * never` keeps ANSI codes out of the captured stream.
+ * (JSONL). Passing `-` makes Codex read the prompt from stdin, keeping large
+ * prompts out of the process argument vector. `--color never` keeps ANSI codes
+ * out of the captured stream.
  *
  * `--skip-git-repo-check` disables codex's per-directory trust gate. Without it,
  * codex refuses to run from any cwd not marked `trust_level = "trusted"` in
@@ -1956,7 +1956,7 @@ const CODEX_SANDBOX_MODE: Record<ToolProfile, string> = {
  * batch/nested invocation) rather than disabling confirmation via
  * `--dangerously-bypass-approvals-and-sandbox`.
  */
-function buildCodexCommand(
+export function buildCodexCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
@@ -1976,8 +1976,9 @@ function buildCodexCommand(
       "approval_policy=never",
       "-m",
       model,
-      resolvedPrompt,
+      "-",
     ],
+    stdin: resolvedPrompt,
   };
 }
 
@@ -4856,7 +4857,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.02.1";
+export const CLI_AGENT_VERSION = "2026.09.03.1";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -5068,9 +5069,15 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: CLI_AGENT_VERSION,
+      toVersion: "2026.09.02.1",
       description:
         "Delegate factory Amp tool decisions to a cwd-bound helper using current shell_command/apply_patch names, restore first-match permission ordering, and prove the real Amp permission engine under bwrap before launch. Execution-only change; no model attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Send Codex prompts through stdin so large factory packets do not exceed process argument-vector limits. Execution-only change; no schema or attribute rewrite needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
