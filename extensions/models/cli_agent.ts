@@ -3172,7 +3172,9 @@ export function resolveModel(
   globalDefault: ModelId,
 ): ModelId {
   // Treat omit / "" / whitespace as "no explicit" (schema also rejects blanks).
-  if (isPresentModelId(explicit)) return explicit.trim();
+  if (isPresentModelId(explicit)) {
+    return validateModelForProvider(provider, explicit.trim());
+  }
   const providerDefault = PROVIDERS[provider].defaultModel;
   if (provider === "pi" && globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL) {
     throw new Error(
@@ -3184,9 +3186,32 @@ export function resolveModel(
     globalDefault === CLAUDE_SCHEMA_DEFAULT_MODEL &&
     providerDefault
   ) {
-    return providerDefault;
+    return validateModelForProvider(provider, providerDefault);
   }
-  return globalDefault;
+  return validateModelForProvider(provider, globalDefault);
+}
+
+/** Prevent OpenCode from routing Anthropic models outside the native Claude CLI. */
+function validateModelForProvider(
+  provider: Provider,
+  modelId: ModelId,
+): ModelId {
+  if (provider !== "opencode") return modelId;
+
+  const normalized = modelId.toLowerCase();
+  const segments = normalized.split("/");
+  const nativeAliases = new Set(["haiku", "sonnet", "opus"]);
+  if (
+    normalized.includes("claude") ||
+    segments.includes("anthropic") ||
+    segments.some((segment) => nativeAliases.has(segment))
+  ) {
+    throw new Error(
+      `opencode cannot use Anthropic/Claude model "${modelId}"; use provider=claude for Anthropic models`,
+    );
+  }
+
+  return modelId;
 }
 
 function cliPathFor(provider: Provider, g: GlobalArgs): string {
