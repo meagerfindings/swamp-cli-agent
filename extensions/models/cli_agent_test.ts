@@ -2827,10 +2827,115 @@ Deno.test("wrapWithSandbox: mode 'seatbelt' + sandbox-exec available produces th
     "CWD=/tmp/wd",
     "-D",
     `HOME=${Deno.env.get("HOME") ?? ""}`,
+    "-D",
+    "CREDENTIAL_FILE_1=/dev/null/swamp-cli-agent-credential-disabled",
+    "-D",
+    "CREDENTIAL_FILE_2=/dev/null/swamp-cli-agent-credential-disabled",
     "claude",
     "--print",
     "hi",
   ]);
+});
+
+Deno.test("wrapWithSandbox: provider mode exposes only the selected OpenCode credential", () => {
+  const home = Deno.env.get("HOME") ?? "";
+  const out = wrapWithSandbox(["opencode"], "/tmp/wd", {
+    mode: "seatbelt",
+    provider: "opencode",
+    credentialAccess: "provider",
+    profilePath: "/profile.sb",
+    required: true,
+  });
+
+  assertEquals(
+    out.includes(`CREDENTIAL_FILE_1=${home}/.local/share/opencode/auth.json`),
+    true,
+  );
+  assertEquals(
+    out.includes(
+      "CREDENTIAL_FILE_2=/dev/null/swamp-cli-agent-credential-disabled",
+    ),
+    true,
+  );
+  assertEquals(out.some((arg) => arg.includes("/.codex/auth.json")), false);
+  assertEquals(
+    out.some((arg) => arg.includes("/.claude/.credentials.json")),
+    false,
+  );
+});
+
+Deno.test("cli_agent.sandbox.sb: provider credential is readable and refreshable while isolated mode denies it", async () => {
+  if (Deno.build.os !== "darwin") return;
+
+  const home = Deno.realPathSync(
+    Deno.makeTempDirSync({ prefix: "cli_agent_seatbelt_auth_" }),
+  );
+  const cwd = Deno.realPathSync(
+    Deno.makeTempDirSync({ prefix: "cli_agent_seatbelt_cwd_" }),
+  );
+  const authDir = `${home}/.local/share/opencode`;
+  const authFile = `${authDir}/auth.json`;
+  const codexAuth = `${home}/.codex/auth.json`;
+  const swampAuth = `${home}/.config/swamp/auth.json`;
+  Deno.mkdirSync(authDir, { recursive: true });
+  Deno.mkdirSync(`${home}/.codex`, { recursive: true });
+  Deno.mkdirSync(`${home}/.config/swamp`, { recursive: true });
+  Deno.writeTextFileSync(authFile, "oauth");
+  Deno.writeTextFileSync(codexAuth, "codex");
+  Deno.writeTextFileSync(swampAuth, "swamp");
+  const run = (profilePath: string, credentialFile: string, target: string) =>
+    new Deno.Command("/usr/bin/sandbox-exec", {
+      args: [
+        "-f",
+        profilePath,
+        "-D",
+        `CWD=${cwd}`,
+        "-D",
+        `HOME=${home}`,
+        "-D",
+        `CREDENTIAL_FILE_1=${credentialFile}`,
+        "-D",
+        "CREDENTIAL_FILE_2=/dev/null/swamp-cli-agent-credential-disabled",
+        "/bin/sh",
+        "-c",
+        'cat "$1" >/dev/null && printf refreshed > "$1"',
+        "sh",
+        target,
+      ],
+    }).output();
+
+  try {
+    for (
+      const profile of [
+        "cli_agent.sandbox.sb",
+        "cli_agent.sandbox.strict.sb",
+      ]
+    ) {
+      const profilePath = new URL(`./${profile}`, import.meta.url).pathname;
+      Deno.writeTextFileSync(authFile, "oauth");
+      assertEquals((await run(profilePath, authFile, authFile)).success, true);
+      assertEquals(Deno.readTextFileSync(authFile), "refreshed");
+      assertEquals(
+        (await run(profilePath, authFile, codexAuth)).success,
+        false,
+      );
+      assertEquals(
+        (await run(profilePath, authFile, swampAuth)).success,
+        false,
+      );
+      assertEquals(
+        (await run(
+          profilePath,
+          "/dev/null/swamp-cli-agent-credential-disabled",
+          authFile,
+        )).success,
+        false,
+      );
+    }
+  } finally {
+    Deno.removeSync(home, { recursive: true });
+    Deno.removeSync(cwd, { recursive: true });
+  }
 });
 
 Deno.test("wrapWithSandbox: cwd defaults to Deno.cwd() when omitted", () => {
@@ -3209,6 +3314,10 @@ Deno.test("wrapWithSandbox: mode 'auto' on darwin resolves to seatbelt and produ
     "CWD=/tmp/wd",
     "-D",
     `HOME=${Deno.env.get("HOME") ?? ""}`,
+    "-D",
+    "CREDENTIAL_FILE_1=/dev/null/swamp-cli-agent-credential-disabled",
+    "-D",
+    "CREDENTIAL_FILE_2=/dev/null/swamp-cli-agent-credential-disabled",
     "claude",
     "--print",
     "hi",
