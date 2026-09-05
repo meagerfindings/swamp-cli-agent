@@ -103,7 +103,7 @@ const SandboxModeEnum = z.enum(["off", "auto", "seatbelt", "bwrap"]);
 const SandboxNetworkEnum = z.enum(["allow", "deny"]);
 
 /**
- * Access policy for provider-managed credential files inside Linux bwrap.
+ * Access policy for provider-managed credential files inside the OS sandbox.
  * "provider" keeps ordinary CLI login usable by exposing only the selected
  * provider's known credential files. "isolated" masks every known credential
  * file, requiring environment-based authentication such as an API key or an
@@ -169,7 +169,7 @@ export const GlobalArgsSchema = z.object({
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.default("provider")
     .describe(
-      "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
+      "OS sandbox credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication.",
     ),
 });
 
@@ -874,7 +874,9 @@ function resolveExecutablePath(command: string, cwd: string): string | null {
  *   Linux / none elsewhere; `"seatbelt"` / `"bwrap"` → that backend, forced):
  *   - effective backend `"seatbelt"`, running on Darwin, with
  *     `/usr/bin/sandbox-exec` present → prefixes `cmd` with
- *     `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>`.
+ *     `sandbox-exec -f <profile> -D CWD=<cwd> -D HOME=<home>` and the selected
+ *     provider's credential-file literals. Isolated mode passes unreachable
+ *     sentinel paths instead.
  *   - effective backend `"bwrap"`, running on Linux, with `bwrap` present →
  *     resolves the provider executable, mounts that exact file when it would
  *     otherwise be hidden, and prefixes `cmd` with the
@@ -941,6 +943,19 @@ export function wrapWithSandbox(
         cmd,
       );
     }
+    const credentialFiles = sandbox.credentialAccess === "provider"
+      ? PROVIDER_CREDENTIAL_FILES[sandbox.provider] ?? []
+      : [];
+    if (credentialFiles.length > 2) {
+      throw new Error(
+        "Seatbelt supports at most two provider credential files",
+      );
+    }
+    const disabledCredential = "/dev/null/swamp-cli-agent-credential-disabled";
+    const credentialPath = (index: number): string => {
+      const relativePath = credentialFiles[index];
+      return relativePath ? `${home}/${relativePath}` : disabledCredential;
+    };
     return [
       sandboxExecPath,
       "-f",
@@ -949,6 +964,10 @@ export function wrapWithSandbox(
       `CWD=${resolvedCwd}`,
       "-D",
       `HOME=${home}`,
+      "-D",
+      `CREDENTIAL_FILE_1=${credentialPath(0)}`,
+      "-D",
+      `CREDENTIAL_FILE_2=${credentialPath(1)}`,
       ...cmd,
     ];
   }
@@ -3841,7 +3860,7 @@ export const InvokeArgsSchema = z.object({
     "Override the global sandboxNetwork for this invocation: 'allow' (default; permissive base profile) or 'deny' (hardened profile — no network egress, per-repo .swamp/secrets vault denied). Set 'deny' only for flows running an LLM on untrusted input.",
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
-    "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+    "Override OS sandbox credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication).",
   ),
 }).superRefine((args, ctx) => {
   if (
