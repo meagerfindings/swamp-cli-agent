@@ -5556,6 +5556,13 @@ export const model = {
           "Return exactly READY. Do not use tools or modify files.";
         const promptHash = await hashPrompt(prompt);
         const cliPath = cliPathFor(provider, context.globalArgs);
+        if (!cliPath.startsWith("/")) {
+          throw new Error(
+            `preflight requires an absolute configured ${provider}Path; received ${
+              JSON.stringify(cliPath)
+            }`,
+          );
+        }
         const sandbox = sandboxConfigFrom(
           context.globalArgs,
           (fn) => context.extensionFile(fn),
