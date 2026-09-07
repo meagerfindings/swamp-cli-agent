@@ -58,6 +58,7 @@ import {
   readGlobalAmpMcpServers,
   RepositoryExpectationSchema,
   repositoryStateHash,
+  resolveCodexExecutionOptions,
   resolveEffectiveBackend,
   resolveInvocationId,
   resolveInvocationTimeouts,
@@ -3859,6 +3860,59 @@ Deno.test("buildCodexCommand: sends large prompts via stdin instead of argv", ()
   assertEquals(built.cmd.at(-1), "-");
   assertEquals(built.cmd.includes(prompt), false);
   assertEquals(built.stdin, prompt);
+});
+
+Deno.test("Codex execution options: high effort and ephemeral bind to the stdin transport", () => {
+  const built = buildCodexCommand(
+    "/opt/codex",
+    "gpt-5.6-luna",
+    "Return exactly READY.",
+    "readonly",
+    undefined,
+    undefined,
+    undefined,
+    { reasoningEffort: "high", ephemeral: true },
+  );
+  assertEquals(built.stdin, "Return exactly READY.");
+  assertEquals(built.cmd, [
+    "/opt/codex",
+    "exec",
+    "--json",
+    "--color",
+    "never",
+    "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
+    "-c",
+    "approval_policy=never",
+    "--ephemeral",
+    "-c",
+    'model_reasoning_effort="high"',
+    "-m",
+    "gpt-5.6-luna",
+    "-",
+  ]);
+});
+
+Deno.test("Codex execution options: per-call overrides global defaults and reject non-Codex transport", () => {
+  const global = GlobalArgsSchema.parse({
+    defaultReasoningEffort: "high",
+    defaultEphemeral: true,
+  });
+  assertEquals(
+    resolveCodexExecutionOptions("codex", { ephemeral: false }, global),
+    { reasoningEffort: "high", ephemeral: false },
+  );
+  assertThrows(
+    () =>
+      resolveCodexExecutionOptions(
+        "claude",
+        { reasoningEffort: "high" },
+        global,
+      ),
+    Error,
+    "supported only for provider=codex",
+  );
 });
 
 Deno.test("extractText: pi joins assistant text parts, excludes thinking", () => {

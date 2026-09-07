@@ -77,6 +77,9 @@ export function isProvider(p: string): p is Provider {
  */
 const ToolProfileEnum = z.enum(["readonly", "actor"]);
 
+/** Codex reasoning effort currently supported by this extension. */
+export const ReasoningEffortEnum = z.enum(["high"]);
+
 /**
  * OS-level sandbox engine for the spawned CLI subprocess.
  * "auto" (default) — pick the backend for the current OS: Seatbelt
@@ -127,6 +130,12 @@ export const GlobalArgsSchema = z.object({
   // Prefer PROVIDERS[provider].defaultModel when the invoke omits `model`
   // (avoids defaultProvider=grok silently using Claude's "opus").
   defaultModel: ModelIdSchema.default("opus"),
+  defaultReasoningEffort: ReasoningEffortEnum.optional().describe(
+    "Default Codex reasoning effort. Currently only 'high' is supported.",
+  ),
+  defaultEphemeral: z.boolean().default(false).describe(
+    "Default Codex --ephemeral setting. Ignored unless the effective provider is codex.",
+  ),
   defaultToolProfile: ToolProfileEnum.default("actor"),
   commandsDir: z.string().default(".claude/commands"),
   commandSubdirs: z.array(z.string()).default([]).describe(
@@ -180,6 +189,12 @@ export const InvocationSchema = z.object({
   invocationId: z.string(),
   provider: ProviderEnum,
   model: ModelIdSchema,
+  reasoningEffort: ReasoningEffortEnum.optional().describe(
+    "Effective Codex model reasoning effort. Absent when unset or when provider is not codex.",
+  ),
+  ephemeral: z.boolean().optional().describe(
+    "Effective Codex --ephemeral setting. False for non-Codex providers.",
+  ),
   prompt: z.string(),
   promptTruncated: z.boolean().optional().describe(
     "True when prompt contains only the first 500 characters; absent on records created before this field was added.",
@@ -238,10 +253,12 @@ const TranscriptSchema = z.object({
 
 /** Durable identity of a caller-owned launch, written before provider spawn. */
 export const InvocationLaunchClaimSchema = z.object({
-  operation: z.enum(["invoke", "invokeAndParse"]),
+  operation: z.enum(["invoke", "invokeAndParse", "preflight"]),
   invocationId: InvocationIdSchema,
   provider: ProviderEnum,
   model: ModelIdSchema,
+  reasoningEffort: ReasoningEffortEnum.optional(),
+  ephemeral: z.boolean().default(false),
   cwd: z.string().min(1),
   repositoryExpectation: RepositoryExpectationSchema.optional(),
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -1961,6 +1978,10 @@ export function buildCodexCommand(
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  _toolAllowlist?: string[],
+  _factoryBoundary?: boolean,
+  _factoryCwd?: string,
+  options: CodexExecutionOptions = { ephemeral: false },
 ): { cmd: string[]; stdin?: string } {
   return {
     cmd: [
@@ -1974,6 +1995,13 @@ export function buildCodexCommand(
       CODEX_SANDBOX_MODE[toolProfile],
       "-c",
       "approval_policy=never",
+      ...(options.ephemeral ? ["--ephemeral"] : []),
+      ...(options.reasoningEffort
+        ? [
+          "-c",
+          `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`,
+        ]
+        : []),
       "-m",
       model,
       "-",
@@ -3006,6 +3034,11 @@ type CommandInvocation = {
   cleanupFiles?: readonly string[];
 };
 
+export type CodexExecutionOptions = {
+  reasoningEffort?: "high";
+  ephemeral: boolean;
+};
+
 /** A command-builder for a provider's CLI. */
 type CommandBuilder = (
   cliPath: string,
@@ -3015,6 +3048,7 @@ type CommandBuilder = (
   toolAllowlist?: string[],
   factoryBoundary?: boolean,
   factoryCwd?: string,
+  codex?: CodexExecutionOptions,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3189,6 +3223,23 @@ export function resolveModel(
   return globalDefault;
 }
 
+/** Resolve and validate provider-specific Codex execution options. */
+export function resolveCodexExecutionOptions(
+  provider: Provider,
+  args: Pick<InvokeArgs, "reasoningEffort" | "ephemeral">,
+  globalArgs: Pick<GlobalArgs, "defaultReasoningEffort" | "defaultEphemeral">,
+): CodexExecutionOptions {
+  const reasoningEffort = args.reasoningEffort ??
+    globalArgs.defaultReasoningEffort;
+  const ephemeral = args.ephemeral ?? globalArgs.defaultEphemeral;
+  if (provider !== "codex" && (reasoningEffort !== undefined || ephemeral)) {
+    throw new Error(
+      "reasoningEffort and ephemeral are supported only for provider=codex",
+    );
+  }
+  return { reasoningEffort, ephemeral: provider === "codex" && ephemeral };
+}
+
 function cliPathFor(provider: Provider, g: GlobalArgs): string {
   return PROVIDERS[provider].cliPath(g);
 }
@@ -3335,6 +3386,7 @@ export async function runWithRetries(
     factoryBoundary?: boolean;
     requireParseableJson?: boolean;
     retryDelayMs?: number;
+    codex?: CodexExecutionOptions;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -3360,6 +3412,7 @@ export async function runWithRetries(
       opts.toolAllowlist,
       opts.factoryBoundary,
       opts.factoryBoundary ? opts.cwd : undefined,
+      opts.codex,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3463,6 +3516,7 @@ function buildInvocationBase(
   slashCommand: string | undefined,
   cwd: string,
   outcome: RunOutcome,
+  codex: CodexExecutionOptions,
 ): Record<string, unknown> {
   const { result, usage, providerError, extractedText } = outcome;
   const outputTokensPerSecond = usage.output && result.durationMs > 0
@@ -3473,6 +3527,8 @@ function buildInvocationBase(
     invocationId,
     provider,
     model: modelName,
+    reasoningEffort: provider === "codex" ? codex.reasoningEffort : undefined,
+    ephemeral: codex.ephemeral,
     prompt: args.prompt.slice(0, 500),
     promptTruncated: args.prompt.length > 500,
     promptHash,
@@ -3643,7 +3699,8 @@ export async function launchCallerInvocation<T>(
   const t = transcript.data;
   const consistent = i.invocationId === claim.invocationId &&
     t.invocationId === claim.invocationId && i.provider === claim.provider &&
-    i.model === claim.model && i.cwd === claim.cwd &&
+    i.model === claim.model && i.reasoningEffort === claim.reasoningEffort &&
+    (i.ephemeral ?? false) === claim.ephemeral && i.cwd === claim.cwd &&
     i.promptHash === claim.promptHash &&
     stableValue(normalizeTags(i.tags)) === stableValue(claim.tags) &&
     i.prompt === t.prompt.slice(0, 500) &&
@@ -3807,6 +3864,12 @@ export const InvokeArgsSchema = z.object({
     "Override the default model. When omitted, uses the provider's defaultModel " +
       "from PROVIDERS, then global defaultModel.",
   ),
+  reasoningEffort: ReasoningEffortEnum.optional().describe(
+    "Override the Codex reasoning effort. Currently only 'high' is supported.",
+  ),
+  ephemeral: z.boolean().optional().describe(
+    "Override the Codex --ephemeral setting. Supported only for provider=codex.",
+  ),
   cwd: z.string().optional().describe(
     "Working directory for the CLI (defaults to Deno.cwd())",
   ),
@@ -3924,6 +3987,19 @@ export const FactoryViabilityArgsSchema = z.object({
   repositoryExpectation: RepositoryExpectationSchema,
 });
 type FactoryViabilityArgs = z.infer<typeof FactoryViabilityArgsSchema>;
+
+/** Exact, authenticated provider/model startup probe using the invoke transport. */
+export const PreflightArgsSchema = z.object({
+  invocationId: InvocationIdSchema,
+  provider: z.enum(["claude", "codex"]),
+  model: ModelIdSchema,
+  reasoningEffort: ReasoningEffortEnum.optional(),
+  ephemeral: z.boolean().optional(),
+  cwd: z.string().min(1),
+  wallTimeoutMs: TimeoutMsSchema.optional(),
+  idleTimeoutMs: TimeoutMsSchema.optional(),
+});
+type PreflightArgs = z.infer<typeof PreflightArgsSchema>;
 
 export const FactoryViabilitySchema = z.object({
   schemaVersion: z.literal(1),
@@ -4857,7 +4933,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.03.1";
+export const CLI_AGENT_VERSION = "2026.09.07.1";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -5457,6 +5533,123 @@ export const model = {
       },
     },
 
+    preflight: {
+      description:
+        "Run a bounded authenticated readonly probe through the exact configured Claude or Codex invocation transport, recording the effective model settings before factory startup.",
+      arguments: PreflightArgsSchema,
+      execute: async (
+        args: PreflightArgs,
+        context: MethodContext,
+      ): Promise<{ dataHandles: Record<string, unknown>[] }> => {
+        const provider = args.provider;
+        const cwd = await canonicalCwd(args.cwd);
+        const codex = resolveCodexExecutionOptions(
+          provider,
+          args,
+          context.globalArgs,
+        );
+        const { idleTimeoutMs, wallTimeoutMs } = resolveInvocationTimeouts(
+          args,
+          context.globalArgs,
+        );
+        const prompt =
+          "Return exactly READY. Do not use tools or modify files.";
+        const promptHash = await hashPrompt(prompt);
+        const cliPath = cliPathFor(provider, context.globalArgs);
+        const sandbox = sandboxConfigFrom(
+          context.globalArgs,
+          (fn) => context.extensionFile(fn),
+          { provider },
+        );
+        const launch = () =>
+          runWithRetries(
+            provider,
+            cliPath,
+            args.model,
+            prompt,
+            "readonly",
+            {
+              cwd,
+              wallTimeoutMs,
+              idleTimeoutMs,
+              maxRetries: 0,
+              sandbox,
+              codex,
+            },
+            context.logger,
+          );
+        const claimed = await launchCallerInvocation(context, {
+          operation: "preflight",
+          invocationId: args.invocationId,
+          provider,
+          model: args.model,
+          reasoningEffort: codex.reasoningEffort,
+          ephemeral: codex.ephemeral,
+          cwd,
+          promptHash,
+          tags: { purpose: "provider-preflight" },
+          definition: {
+            id: context.definition.id,
+            name: context.definition.name,
+            version: context.definition.version,
+            tags: normalizeTags(context.definition.tags),
+          },
+          methodName: context.methodName,
+          cliPath,
+          idleTimeoutMs,
+          wallTimeoutMs,
+          maxRetries: 0,
+          toolProfile: "readonly",
+          sandbox,
+        }, launch);
+        if (claimed.replayed) return { dataHandles: [] };
+        const invocation = buildInvocationBase(
+          args.invocationId,
+          provider,
+          args.model,
+          { prompt, tags: { purpose: "provider-preflight" } },
+          promptHash,
+          undefined,
+          cwd,
+          claimed.value,
+          codex,
+        );
+        const invocationWrite = await createOnceOrVerify(
+          context,
+          "invocation",
+          `invocation-${args.invocationId}`,
+          invocation,
+        );
+        const transcriptWrite = await createOnceOrVerify(
+          context,
+          "transcript",
+          `transcript-${args.invocationId}`,
+          {
+            invocationId: args.invocationId,
+            prompt,
+            output: claimed.value.extractedText,
+          },
+        );
+        if (!claimed.value.ok) {
+          const { result, providerError } = claimed.value;
+          throw new Error(
+            providerError
+              ? `${provider} provider error: ${
+                providerError.message.slice(0, 300)
+              }`
+              : `${provider} CLI failed (exit ${result.code}): ${
+                result.stderr.slice(0, 200)
+              }`,
+          );
+        }
+        return {
+          dataHandles: [invocationWrite.handle, transcriptWrite.handle].filter(
+            (handle): handle is Record<string, unknown> => handle !== undefined,
+          ),
+        };
+      },
+    },
+
     invoke: {
       description:
         "Run a CLI agent tool (claude, opencode, amp, gemini, codex, grok, pi) with a prompt and record structured results",
@@ -5472,6 +5665,11 @@ export const model = {
           provider,
           args.model,
           context.globalArgs.defaultModel,
+        );
+        const codex = resolveCodexExecutionOptions(
+          provider,
+          args,
+          context.globalArgs,
         );
         const requestedCwd = args.cwd || Deno.cwd();
         const cwd = callerOwned || args.repositoryExpectation !== undefined
@@ -5525,6 +5723,7 @@ export const model = {
               sandbox,
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
+              codex,
             },
             context.logger,
           );
@@ -5536,6 +5735,8 @@ export const model = {
             invocationId,
             provider,
             model: modelName,
+            reasoningEffort: codex.reasoningEffort,
+            ephemeral: codex.ephemeral,
             cwd,
             repositoryExpectation: args.repositoryExpectation,
             promptHash,
@@ -5572,6 +5773,7 @@ export const model = {
           slashCommand,
           cwd,
           outcome,
+          codex,
         );
 
         const invocationWrite = await createOnceOrVerify(
@@ -5657,6 +5859,11 @@ export const model = {
           args.model,
           context.globalArgs.defaultModel,
         );
+        const codex = resolveCodexExecutionOptions(
+          provider,
+          args,
+          context.globalArgs,
+        );
         const requestedCwd = args.cwd || Deno.cwd();
         const cwd = callerOwned || args.repositoryExpectation !== undefined
           ? await canonicalCwd(requestedCwd)
@@ -5710,6 +5917,7 @@ export const model = {
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
+              codex,
             },
             context.logger,
           );
@@ -5721,6 +5929,8 @@ export const model = {
             invocationId,
             provider,
             model: modelName,
+            reasoningEffort: codex.reasoningEffort,
+            ephemeral: codex.ephemeral,
             cwd,
             repositoryExpectation: args.repositoryExpectation,
             promptHash,
@@ -5762,6 +5972,7 @@ export const model = {
           slashCommand,
           cwd,
           outcome,
+          codex,
         );
         const invocation = {
           ...base,
