@@ -3229,15 +3229,25 @@ export function resolveCodexExecutionOptions(
   args: Pick<InvokeArgs, "reasoningEffort" | "ephemeral">,
   globalArgs: Pick<GlobalArgs, "defaultReasoningEffort" | "defaultEphemeral">,
 ): CodexExecutionOptions {
+  if (provider !== "codex") {
+    if (args.reasoningEffort !== undefined || args.ephemeral !== undefined) {
+      throw new Error(
+        "reasoningEffort and ephemeral are supported only for provider=codex",
+      );
+    }
+    // Instance defaults are Codex-specific and intentionally do not change
+    // another provider's transport. Explicit per-call values remain invalid.
+    return { ephemeral: false };
+  }
   const reasoningEffort = args.reasoningEffort ??
     globalArgs.defaultReasoningEffort;
   const ephemeral = args.ephemeral ?? globalArgs.defaultEphemeral;
-  if (provider !== "codex" && (reasoningEffort !== undefined || ephemeral)) {
+  if (reasoningEffort !== undefined && reasoningEffort !== "high") {
     throw new Error(
-      "reasoningEffort and ephemeral are supported only for provider=codex",
+      "reasoningEffort must be high",
     );
   }
-  return { reasoningEffort, ephemeral: provider === "codex" && ephemeral };
+  return { reasoningEffort, ephemeral };
 }
 
 function cliPathFor(provider: Provider, g: GlobalArgs): string {

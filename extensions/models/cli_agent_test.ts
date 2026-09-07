@@ -56,6 +56,7 @@ import {
   PROVIDER_CHILD_ENV_DENYLIST,
   PROVIDERS,
   readGlobalAmpMcpServers,
+  ReplayedInvocationError,
   RepositoryExpectationSchema,
   repositoryStateHash,
   resolveCodexExecutionOptions,
@@ -915,7 +916,7 @@ function resourceContext(
 }
 
 async function claim(
-  operation: "invoke" | "invokeAndParse" = "invoke",
+  operation: "invoke" | "invokeAndParse" | "preflight" = "invoke",
   overrides: Record<string, unknown> = {},
 ) {
   return InvocationLaunchClaimSchema.parse({
@@ -1128,6 +1129,39 @@ Deno.test("matching failed replay does not spawn and preserves failure class", a
   );
   assertEquals(
     (error as { failureClass?: string }).failureClass,
+    "infrastructure",
+  );
+  assertEquals(spawns, 0);
+});
+
+Deno.test("preflight replay rejects persisted failed invocation evidence", async () => {
+  const c = await claim("preflight", {
+    toolProfile: "readonly",
+    reasoningEffort: "high",
+    ephemeral: true,
+  });
+  const failedInvocation = {
+    ...terminal(c, false),
+    reasoningEffort: "high",
+    ephemeral: true,
+  };
+  const stored: Stored = new Map<string, Record<string, unknown>>([
+    ["launch-claim-owned-1", c],
+    ["invocation-owned-1", failedInvocation],
+    ["transcript-owned-1", {
+      invocationId: "owned-1",
+      prompt: "prompt",
+      output: "ok",
+    }],
+  ]);
+  let spawns = 0;
+  await assertRejects(
+    () =>
+      launchCallerInvocation(resourceContext(stored).context, c, () => {
+        spawns++;
+        return Promise.resolve("unexpected");
+      }),
+    ReplayedInvocationError,
     "infrastructure",
   );
   assertEquals(spawns, 0);
@@ -3912,6 +3946,10 @@ Deno.test("Codex execution options: per-call overrides global defaults and rejec
       ),
     Error,
     "supported only for provider=codex",
+  );
+  assertEquals(
+    resolveCodexExecutionOptions("claude", {}, global),
+    { ephemeral: false },
   );
 });
 
