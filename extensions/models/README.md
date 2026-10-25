@@ -36,6 +36,7 @@ models:
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
       maxRetries: 2               # retry count for transient failures
       sandboxCredentialAccess: provider # provider (normal CLI login) | isolated
+      extraBinds: []              # extra paths mounted into the Linux bwrap sandbox
 ```
 
 CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
@@ -56,6 +57,46 @@ as an API key or Claude's official `CLAUDE_CODE_OAUTH_TOKEN` generated with
 `claude setup-token`. This setting controls Linux bwrap only. On macOS, the
 existing static Seatbelt policy is unchanged: Claude Code can use its normal
 Keychain-backed login while known file-backed credentials remain masked.
+
+**Toolchains under `$HOME` (Linux bwrap):** the sandbox hides `$HOME` except the
+workspace and a fixed set of state directories, so toolchains installed there
+(mise, asdf, `~/go`, `~/.cargo/bin`) are invisible and an `actor` run can edit code
+but not build or test it. List them in `extraBinds` (global argument, or a
+per-invocation override on `invoke`/`invokeAndParse` that replaces the global
+list; `preflight` and `checkFactoryViability` use only the global list). Each
+entry is `{ path, mode }`; `path` must be absolute or start with `~/`, and
+`mode` is `ro` (default) or `rw`. Paths are resolved (symlinks, `..`, `//`)
+before they are checked; the checks run on both the normalized path and the
+resolved target. A symlinked path is mounted at its named path, with the
+resolved target as the source. Paths that do not exist are skipped. A bind is
+refused if it is `/`, equals or contains `$HOME`, overlaps a sandbox state
+directory (`~/.cache`, `~/.claude`, `~/.local/state`, ...) or
+`$CLAUDE_CONFIG_DIR` inside home, overlaps a secret path (`~/.config/swamp`,
+`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.kube`, `~/.npmrc`,
+`~/.cargo/credentials*`, `~/.git-credentials` and others: the
+`EXTRA_BIND_DENIED_PATHS` list in `cli_agent.ts` plus the credential files),
+overlaps `/run/user` or the Docker socket (`/run/docker.sock`,
+`/var/run/docker.sock`), or is a file inside another bound directory (bind the
+directory instead). A file under `$HOME` (for example `~/.gitconfig`) may be
+bound too. With a curl-installed mise (`~/.local/bin/mise`) the shims also need
+`~/.local/bin` bound. `extraBinds` is applied on Linux bwrap only; on macOS
+Seatbelt it is ignored with a warning.
+
+The denylist is best-effort, not a guarantee: bind the narrowest directories you
+need (for example `~/.cargo/bin` and `~/.rustup`, not `~/.cargo`), and check
+that they hold no tokens. Paths outside `$HOME` are not checked beyond
+`/run/user` (ssh-agent and gpg-agent sockets) and the Docker socket
+(root-equivalent), so avoid binding other system paths that hold secrets.
+
+```yaml
+    globalArgs:
+      extraBinds:
+        - path: ~/.local/share/mise   # ro (default): mise-managed toolchains
+        - path: ~/go                  # rw: GOPATH build/module cache
+          mode: rw
+        - path: ~/.cargo/bin          # not ~/.cargo: it holds credentials.toml
+        - path: ~/.rustup
+```
 
 On Linux, standard linked Git worktrees are supported under bwrap. The linked
 worktree remains the only writable repository path; its external common `.git`
@@ -128,6 +169,7 @@ Arguments:
 | `wallTimeoutMs` | number   | no       | Override wall timeout in milliseconds         |
 | `idleTimeoutMs` | number   | no       | Override idle timeout independently           |
 | `sandboxCredentialAccess` | enum | no | `provider` for selected-provider CLI login (default), or `isolated` to mask all known credential files |
+| `extraBinds` | array | no | Override the global `extraBinds` (`{ path, mode: ro\|rw }`) for this invocation; Linux bwrap only |
 
 ### `invokeAndParse`
 

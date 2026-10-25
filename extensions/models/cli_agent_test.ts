@@ -3506,6 +3506,428 @@ Deno.test("buildBwrapArgs: cwd bind is placed after --remount-ro home (not shado
   assertEquals(argv[bindIdx + 2], "/home/agent/tmp/work");
 });
 
+// --- extraBinds (issue #23) -------------------------------------------------
+
+type FakeFs = {
+  exists?: (p: string) => boolean;
+  links?: Record<string, string>;
+  files?: string[];
+};
+
+// Pure stand-ins for realPathSync/statSync: `links` maps a path to its
+// symlink target, `..`, `.` and `//` are normalized like the real thing.
+const fakeRealPath = (fs: FakeFs) => (p: string): string => {
+  const parts: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  let out = "/" + parts.join("/");
+  out = fs.links?.[out] ?? out;
+  if (!(fs.exists ?? (() => true))(out)) throw new Error("ENOENT");
+  return out;
+};
+
+const bwrapWithExtraBinds = (
+  extraBinds: { path: string; mode?: "ro" | "rw" }[],
+  fs: FakeFs = {},
+  cwd = "/home/agent/work",
+  claudeConfigDir: string | undefined = undefined,
+) =>
+  buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    cwd,
+    "/home/agent",
+    () => true,
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    extraBinds,
+    fakeRealPath(fs),
+    (p) => !(fs.files ?? []).includes(p),
+    claudeConfigDir,
+  );
+
+Deno.test("buildBwrapArgs: extraBinds emits --ro-bind by default and --bind for rw", () => {
+  const argv = bwrapWithExtraBinds([
+    { path: "/opt/toolchain" },
+    { path: "/opt/cache", mode: "rw" },
+  ]);
+  const roIdx = argv.indexOf("/opt/toolchain");
+  assertEquals(argv.slice(roIdx - 1, roIdx + 2), [
+    "--ro-bind",
+    "/opt/toolchain",
+    "/opt/toolchain",
+  ]);
+  const rwIdx = argv.indexOf("/opt/cache");
+  assertEquals(argv.slice(rwIdx - 1, rwIdx + 2), [
+    "--bind",
+    "/opt/cache",
+    "/opt/cache",
+  ]);
+});
+
+Deno.test("buildBwrapArgs: extraBinds come after --remount-ro home and before the cwd bind", () => {
+  const argv = bwrapWithExtraBinds([{ path: "/home/agent/go", mode: "rw" }]);
+  const remountIdx = argv.indexOf("--remount-ro");
+  const extraIdx = argv.indexOf("/home/agent/go", remountIdx);
+  const cwdIdx = argv.indexOf("/home/agent/work", remountIdx);
+  assertEquals(remountIdx > -1 && extraIdx > remountIdx, true);
+  assertEquals(extraIdx < cwdIdx, true);
+  // The mount point is created on the tmpfs while home is still writable.
+  const dirIdx = argv.indexOf("/home/agent/go");
+  assertEquals(argv[dirIdx - 1], "--dir");
+  assertEquals(dirIdx < remountIdx, true);
+});
+
+Deno.test("buildBwrapArgs: extraBinds skips paths that do not exist", () => {
+  const argv = bwrapWithExtraBinds(
+    [{ path: "/opt/missing" }],
+    { exists: (p) => p !== "/opt/missing" },
+  );
+  assertEquals(argv.includes("/opt/missing"), false);
+});
+
+Deno.test("buildBwrapArgs: extraBinds expands a leading ~/ against home", () => {
+  const argv = bwrapWithExtraBinds([{ path: "~/.local/share/mise" }]);
+  const idx = argv.indexOf("--ro-bind", argv.indexOf("--remount-ro"));
+  assertEquals(argv.slice(idx, idx + 3), [
+    "--ro-bind",
+    "/home/agent/.local/share/mise",
+    "/home/agent/.local/share/mise",
+  ]);
+  assertEquals(argv.includes("~/.local/share/mise"), false);
+});
+
+Deno.test("buildBwrapArgs: extraBinds rejects relative paths", () => {
+  assertThrows(
+    () => bwrapWithExtraBinds([{ path: "relative/dir" }]),
+    Error,
+    "absolute",
+  );
+  assertEquals(
+    GlobalArgsSchema.safeParse({ extraBinds: [{ path: "relative/dir" }] })
+      .success,
+    false,
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses paths equal to or containing a credential file, home or /", () => {
+  for (
+    const path of [
+      "/home/agent/.claude/.credentials.json",
+      "/home/agent/.claude",
+      "~/.codex/",
+      "/home/agent",
+      "/home",
+      "/",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path, mode: "rw" }]),
+      Error,
+      "refused",
+      path,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses .., ., // and symlink routes to protected paths", () => {
+  const links = { "/opt/innocent": "/home/agent/.claude" };
+  for (
+    const path of [
+      "~/.claude/..",
+      "~/./.claude",
+      "~//.claude",
+      "/home/agent/.claude/../.claude/.credentials.json",
+      "/opt/innocent",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }], { links }),
+      Error,
+      "refused",
+      path,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses secrets hidden by omission", () => {
+  for (
+    const path of [
+      "~/.config",
+      "~/.config/swamp",
+      "~/.config/swamp/auth.json",
+      "~/.config/gh",
+      "~/.config/amp",
+      "~/.ssh",
+      "~/.aws",
+      "~/.gnupg",
+      "~/.netrc",
+      "~/.docker",
+      "~/.docker/config.json",
+      "~/.kube",
+    ]
+  ) {
+    for (const mode of ["ro", "rw"] as const) {
+      assertThrows(
+        () => bwrapWithExtraBinds([{ path, mode }]),
+        Error,
+        "refused",
+        `${path} ${mode}`,
+      );
+    }
+  }
+  // Siblings that merely share a prefix are fine.
+  assertEquals(
+    bwrapWithExtraBinds([{ path: "~/.config/mise" }]).includes(
+      "/home/agent/.config/mise",
+    ),
+    true,
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses binds that shadow writable state", () => {
+  for (
+    const path of [
+      "~/.cache",
+      "~/.local",
+      "~/.config/opencode",
+      "~/.local/state",
+      "~/.deno",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }]),
+      Error,
+      "refused",
+      path,
+    );
+  }
+  assertThrows(
+    () =>
+      bwrapWithExtraBinds(
+        [{ path: "~/.config/claude-alt" }],
+        {},
+        "/home/agent/work",
+        "/home/agent/.config/claude-alt",
+      ),
+    Error,
+    "refused",
+  );
+  // Outside home the caller's config dir is not our concern.
+  bwrapWithExtraBinds(
+    [{ path: "/opt/tools" }],
+    {},
+    "/home/agent/work",
+    "/srv/claude",
+  );
+});
+
+Deno.test("buildBwrapArgs: a symlinked bind keeps its named destination and mounts the resolved source", () => {
+  const links = { "/home/agent/tools": "/home/agent/real/tools" };
+  const argv = bwrapWithExtraBinds([{ path: "~/tools" }], { links });
+  const idx = argv.indexOf("/home/agent/real/tools");
+  assertEquals(argv.slice(idx - 1, idx + 2), [
+    "--ro-bind",
+    "/home/agent/real/tools",
+    "/home/agent/tools",
+  ]);
+  // The mount point is created under its named path, not the target.
+  const dirIdx = argv.indexOf("/home/agent/tools");
+  assertEquals(argv[dirIdx - 1], "--dir");
+});
+
+Deno.test("buildBwrapArgs: a bind under a symlinked $HOME keeps its named destination", () => {
+  const links = { "/home/agent": "/data/agent" };
+  const argv = bwrapWithExtraBinds([{ path: "~/go" }], {
+    links: { ...links, "/home/agent/go": "/data/agent/go" },
+  });
+  const idx = argv.indexOf("/data/agent/go");
+  assertEquals(argv.slice(idx - 1, idx + 2), [
+    "--ro-bind",
+    "/data/agent/go",
+    "/home/agent/go",
+  ]);
+});
+
+Deno.test("buildBwrapArgs: extraBinds checks the normalized path, so .. segments collapse first", () => {
+  const argv = bwrapWithExtraBinds([{ path: "~/.config/swamp/../mise" }]);
+  assertEquals(argv.includes("/home/agent/.config/mise"), true);
+  assertThrows(
+    () => bwrapWithExtraBinds([{ path: "~/.config/mise/../swamp" }]),
+    Error,
+    "refused",
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses extra credential files, /run/user and Docker sockets", () => {
+  for (
+    const path of [
+      "~/.cargo",
+      "~/.cargo/credentials.toml",
+      "~/.cargo/credentials",
+      "~/.git-credentials",
+      "~/.m2/settings.xml",
+      "~/.gradle/gradle.properties",
+      "~/.gem/credentials",
+      "~/.terraform.d",
+      "~/.azure",
+      "~/.password-store",
+      "~/.npmrc",
+      "~/.pypirc",
+      "/run/user",
+      "/run/user/1000",
+      "/run/user/1000/gnupg/S.gpg-agent",
+      "/run",
+      "/var/run/docker.sock",
+      "/run/docker.sock",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }]),
+      Error,
+      "refused",
+      path,
+    );
+  }
+  assertEquals(
+    bwrapWithExtraBinds([{ path: "~/.cargo/bin" }]).includes(
+      "/home/agent/.cargo/bin",
+    ),
+    true,
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses a file bind inside another bound directory", () => {
+  assertThrows(
+    () =>
+      bwrapWithExtraBinds(
+        [{ path: "~/.local/share/mise" }, {
+          path: "~/.local/share/mise/settings.toml",
+          mode: "rw",
+        }],
+        { files: ["/home/agent/.local/share/mise/settings.toml"] },
+      ),
+    Error,
+    "inside bound directory",
+  );
+  // A file next to a directory bind is fine.
+  bwrapWithExtraBinds(
+    [{ path: "~/.local/share/mise" }, { path: "~/.gitconfig" }],
+    { files: ["/home/agent/.gitconfig"] },
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses sources and mount points inside writable state dirs", () => {
+  const links = { "/opt/tools": "/home/agent/.cache/tools" };
+  for (const path of ["/opt/tools", "~/.cache/tools", "~/.local/state/x"]) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }], { links }),
+      Error,
+      "refused",
+      path,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs: a bind that is a parent of the cwd leaves the cwd writable", () => {
+  const argv = bwrapWithExtraBinds(
+    [{ path: "/srv", mode: "ro" }],
+    {},
+    "/srv/project",
+  );
+  const parentIdx = argv.indexOf("/srv");
+  assertEquals(argv[parentIdx - 1], "--ro-bind");
+  const cwdIdx = argv.lastIndexOf("/srv/project");
+  assertEquals(argv[cwdIdx - 2], "--bind");
+  assertEquals(cwdIdx > parentIdx, true);
+});
+
+Deno.test("buildBwrapArgs: extraBinds under home use --dir for directories only", () => {
+  const argv = bwrapWithExtraBinds([{ path: "~/go" }]);
+  assertEquals(argv.includes("--dir"), true);
+  const dirIdx = argv.indexOf("/home/agent/go");
+  assertEquals(argv[dirIdx - 1], "--dir");
+});
+
+Deno.test("buildBwrapArgs: a file under home is bound before --remount-ro with no --dir for the file", () => {
+  const argv = bwrapWithExtraBinds(
+    [{ path: "~/.gitconfig" }, {
+      path: "~/.config/mise/config.toml",
+      mode: "rw",
+    }],
+    {
+      files: ["/home/agent/.gitconfig", "/home/agent/.config/mise/config.toml"],
+    },
+  );
+  const remountIdx = argv.indexOf("--remount-ro");
+  const gitIdx = argv.indexOf("/home/agent/.gitconfig");
+  assertEquals(argv.slice(gitIdx - 1, gitIdx + 2), [
+    "--ro-bind",
+    "/home/agent/.gitconfig",
+    "/home/agent/.gitconfig",
+  ]);
+  assertEquals(gitIdx < remountIdx, true);
+  assertEquals(argv.lastIndexOf("/home/agent/.gitconfig") < remountIdx, true);
+  const miseIdx = argv.indexOf("/home/agent/.config/mise/config.toml");
+  assertEquals(argv[miseIdx - 1], "--bind");
+  assertEquals(miseIdx < remountIdx, true);
+  // The parent directory is created; the file path itself never is.
+  const parentIdx = argv.indexOf("/home/agent/.config/mise");
+  assertEquals(argv[parentIdx - 1], "--dir");
+  assertEquals(
+    argv.some((a, i) =>
+      a === "/home/agent/.gitconfig" && argv[i - 1] === "--dir"
+    ),
+    false,
+  );
+});
+
+Deno.test("buildBwrapArgs: empty extraBinds leaves argv unchanged", () => {
+  const base = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/home/agent/work",
+    "/home/agent",
+    () => true,
+    null,
+    "claude",
+    "provider",
+  );
+  assertEquals(bwrapWithExtraBinds([]), base);
+});
+
+Deno.test("sandboxConfigFrom: per-invocation extraBinds replace the global list", () => {
+  const g = GlobalArgsSchema.parse({ extraBinds: [{ path: "/opt/a" }] });
+  assertEquals(
+    sandboxConfigFrom(g, () => "").extraBinds,
+    [{ path: "/opt/a", mode: "ro" }],
+  );
+  assertEquals(
+    sandboxConfigFrom(g, () => "", { extraBinds: [{ path: "/opt/b" }] })
+      .extraBinds,
+    [{ path: "/opt/b", mode: "ro" }],
+  );
+});
+
+Deno.test("sandboxConfigFrom: output stays valid for InvocationLaunchClaimSchema with and without extraBinds", () => {
+  const withoutBinds = sandboxConfigFrom(GlobalArgsSchema.parse({}), () => "");
+  assertEquals("extraBinds" in withoutBinds, false);
+  const withBinds = sandboxConfigFrom(
+    GlobalArgsSchema.parse({ extraBinds: [{ path: "/opt/a", mode: "rw" }] }),
+    () => "",
+  );
+  for (const sandbox of [withoutBinds, withBinds]) {
+    const parsed = InvocationLaunchClaimSchema.shape.sandbox.parse(sandbox);
+    assertEquals(parsed.extraBinds, sandbox.extraBinds);
+  }
+});
+
 Deno.test("buildBwrapArgs: exposes linked-worktree Git metadata read-only after the home remount", () => {
   const gitMetadata = "/home/agent/repo/.git";
   const argv = buildBwrapArgs(
