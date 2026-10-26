@@ -288,6 +288,64 @@ already present in these native-client stores. Do **not** add cli-agent
    terminal `turn.completed` event. Grok headless output currently reports
    neither tokens nor cost.
 
+## Isolated Claude config (`claudeConfigDir`)
+
+By default a sandboxed `claude` run loads the invoking user's whole Claude Code
+config (personal `CLAUDE.md`, skills, plugins, hooks, MCP servers) from
+`~/.claude` or `$CLAUDE_CONFIG_DIR`, and on Linux bwrap those directories are
+mounted read-write. Set `claudeConfigDir` (global arg, or a per-invocation
+override on `invoke`/`invokeAndParse`) to make headless runs predictable and to
+keep them from changing config your own sessions use. It applies only to
+`provider: claude`; other providers ignore it with a warning. Unset keeps the
+existing behaviour.
+
+- An **absolute path** (a leading `~/` expands against the sandbox home), used
+  as `CLAUDE_CONFIG_DIR`. Created if missing, never removed. Relative paths are
+  rejected, as is `/`, your home directory or any parent of it, and any path
+  equal to or a parent of `~/.claude` or the swamp process's own
+  `CLAUDE_CONFIG_DIR`. A directory _inside_ either of those is allowed.
+- **`ephemeral`** — a fresh empty directory (`mkdtemp`, mode 0700, honours
+  `TMPDIR`) per invocation, removed afterwards.
+
+When set, the child gets `CLAUDE_CONFIG_DIR=<dir>`, `--strict-mcp-config` (no
+MCP servers load) and a `--settings` `claudeMdExcludes` for `~/CLAUDE.md` and
+`~/.claude/CLAUDE.md`. The exclude is needed because Claude Code discovers
+`CLAUDE.md` files by walking up from the working directory, independently of
+`CLAUDE_CONFIG_DIR`: for a repo under your home directory that walk reaches
+`~/.claude/CLAUDE.md` and would load your own instructions as project memory. On Linux bwrap the directory is bound read-write and the
+user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, only if it lies under a
+directory the sandbox already exposes, such as `~/.local/state/...`; a config
+dir elsewhere stays hidden) are re-mounted read-only; `~/.claude.json` (which
+holds user-scope MCP servers) and the `.credentials.json` / `.claude.json` of
+both config dirs are masked with `/dev/null`. The directory is also checked
+after following symlinks, so a link to (or above) your home, `~/.claude` or
+`$CLAUDE_CONFIG_DIR` is rejected. macOS Seatbelt gets the env var and flag but
+no read-only re-mounting or masking. Its static profile denies writes under
+`$HOME` except the cwd, `~/.cache`, `~/.deno`, `~/.claude`, `~/.codex` and the
+opencode directories, so a persistent directory elsewhere under the home is not
+writable there (a warning is logged); paths outside the home, such as `/tmp`,
+stay writable.
+
+**Authentication.** User credential files are not copied. Log in once per
+directory with `CLAUDE_CONFIG_DIR=<dir> claude` then `/login`, or run
+`claude setup-token` and pass `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)
+in the environment, which already passes through to the child. `ephemeral`
+therefore needs environment authentication.
+
+A persistent directory can carry a purpose-built `CLAUDE.md`, skills, and
+settings, so actor runs start from instructions you chose rather than your
+personal ones. It is not a complete lockdown:
+
+- The target repo's own `CLAUDE.md`, `.claude/settings*.json` (including hooks),
+  skills, agents and commands still load. `--strict-mcp-config` does block its
+  `.mcp.json`.
+- Managed settings under `/etc/claude-code` still apply.
+- The caller's environment passes through (`ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_*`, and so on).
+- Only the swamp process's own `CLAUDE_CONFIG_DIR` is protected. If you
+  relocate your config that way, run swamp from the same environment as your
+  interactive sessions.
+
 ## Invocation Resource Schema
 
 Each invocation is persisted with these fields:

@@ -123,6 +123,9 @@ export const RepositoryExpectationSchema = z.object({
 }).strict();
 export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
 
+const CLAUDE_CONFIG_DIR_DESCRIPTION =
+  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config, and excludes ~/CLAUDE.md and ~/.claude/CLAUDE.md, which CLAUDE.md discovery would otherwise pick up when walking up from a repo under the home directory. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR (when under a directory the sandbox already exposes) are re-mounted read-only, and ~/.claude.json and the credential files of both are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt writes under the home directory are denied except the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex and the opencode dirs, so a persistent directory under the home directory elsewhere is not writable (paths outside the home, such as /tmp, are). Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -180,6 +183,9 @@ export const GlobalArgsSchema = z.object({
     .describe(
       "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
     ),
+  claudeConfigDir: z.string().optional().describe(
+    CLAUDE_CONFIG_DIR_DESCRIPTION,
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -677,6 +683,8 @@ export function buildBwrapArgs(
   executableDirectoryPath: string | null = null,
   gitMetadataPath: string | null = null,
   readOnlyInputFiles: readonly string[] = [],
+  claudeConfigDir: string | null = null,
+  userClaudeConfigDir: string | null = null,
 ): string[] {
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
@@ -761,16 +769,58 @@ export function buildBwrapArgs(
   const providerStateDirs = credentialAccess === "provider"
     ? PROVIDER_STATE_DIRS[provider] ?? []
     : [];
+  const boundStateDirs: string[] = [];
   for (const rel of [...STATE_DIRS, ...providerStateDirs]) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
+      boundStateDirs.push(normalizeAbsolutePath(abs));
     }
   }
 
-  const permittedCredentialFiles = credentialAccess === "provider"
-    ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
-    : new Set<string>();
+  // Isolated claude config (see resolveClaudeConfigDir): re-mount the user's
+  // own Claude config read-only so the sandboxed run cannot change what their
+  // normal sessions load, THEN bind the isolated dir read-write. The order
+  // matters twice: the ro-binds must follow the STATE_DIRS binds above to win,
+  // and the rw bind must follow them so an isolated dir nested inside
+  // ~/.claude is not made read-only again. The caller creates `claudeConfigDir`
+  // beforehand, so it is bound unconditionally. A relocated caller config dir
+  // is only re-mounted when the loop above actually bound it (it lies under a
+  // bound state dir): otherwise it is hidden already and re-mounting it would
+  // EXPOSE it. Its credential files are masked, as the isolated child never
+  // needs them.
+  if (claudeConfigDir) {
+    const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+    const callerDir = userClaudeConfigDir?.startsWith("/")
+      ? normalizeAbsolutePath(userClaudeConfigDir)
+      : null;
+    const isBound = (abs: string) =>
+      boundStateDirs.some((dir) => abs === dir || abs.startsWith(dir + "/"));
+    const userConfigDirs = new Set([
+      `${normalizedHome}/.claude`,
+      ...(callerDir && isBound(callerDir) ? [callerDir] : []),
+    ]);
+    for (const abs of userConfigDirs) {
+      if (abs !== claudeConfigDir && pathExists(abs)) {
+        args.push("--ro-bind", abs, abs);
+        if (abs === callerDir) {
+          for (const file of [".credentials.json", ".claude.json"]) {
+            if (pathExists(`${abs}/${file}`)) {
+              args.push("--ro-bind", "/dev/null", `${abs}/${file}`);
+            }
+          }
+        }
+      }
+    }
+    args.push("--bind", claudeConfigDir, claudeConfigDir);
+  }
+
+  // An isolated claude never needs ~/.claude.json (user-scope mcpServers) or
+  // ~/.claude/.credentials.json, so permit none: both are masked below.
+  const permittedCredentialFiles =
+    credentialAccess === "provider" && !claudeConfigDir
+      ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
+      : new Set<string>();
   for (const rel of CREDENTIAL_FILES) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
@@ -873,6 +923,49 @@ function resolveExecutablePath(command: string, cwd: string): string | null {
 }
 
 /**
+ * Flags an isolated claude run adds after the binary. `--strict-mcp-config`
+ * loads only MCP servers passed explicitly (none are). `claudeMdExcludes`
+ * is needed because CLAUDE.md discovery walks up from the working directory
+ * independently of CLAUDE_CONFIG_DIR: for a repo under the home directory it
+ * reaches `~/.claude/CLAUDE.md` (and `~/CLAUDE.md`) and loads the user's own
+ * instructions as if they were project memory.
+ */
+export function claudeIsolationArgs(home: string): string[] {
+  const args = ["--strict-mcp-config"];
+  const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+  if (normalizedHome) {
+    args.push(
+      "--settings",
+      JSON.stringify({
+        claudeMdExcludes: [
+          `${normalizedHome}/CLAUDE.md`,
+          `${normalizedHome}/.claude/CLAUDE.md`,
+        ],
+      }),
+    );
+  }
+  return args;
+}
+
+/**
+ * The caller's own `CLAUDE_CONFIG_DIR` as {@link buildBwrapArgs} should see
+ * it: its real path, because bwrap cannot mount onto a symlink destination
+ * (a symlinked config dir inside a bound state dir would otherwise fail every
+ * isolated run). Falls back to the given path when it cannot be resolved.
+ */
+export function resolveCallerClaudeConfigDir(
+  dir: string | null,
+  realPath: (path: string) => string = Deno.realPathSync,
+): string | null {
+  if (!dir) return null;
+  try {
+    return realPath(dir);
+  } catch {
+    return dir;
+  }
+}
+
+/**
  * Wrap `cmd` in an OS-level sandbox (`sandbox-exec` on macOS, `bwrap` on
  * Linux), or return it unchanged.
  *
@@ -923,6 +1016,7 @@ export function wrapWithSandbox(
   sandboxExecPath = "/usr/bin/sandbox-exec",
   bwrapPath = BWRAP_PATH,
   readOnlyInputFiles: readonly string[] = [],
+  claudeConfigDir: string | null = null,
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
@@ -937,7 +1031,10 @@ export function wrapWithSandbox(
   const isDarwin = Deno.build.os === "darwin";
   const isLinux = Deno.build.os === "linux";
   const resolvedCwd = cwd ?? Deno.cwd();
-  const home = Deno.env.get("HOME") ?? "";
+  const rawHome = Deno.env.get("HOME") ?? "";
+  const home = rawHome.startsWith("/")
+    ? normalizeAbsolutePath(rawHome)
+    : rawHome;
 
   const backend = resolveEffectiveBackend(sandbox.mode, Deno.build.os);
 
@@ -956,6 +1053,30 @@ export function wrapWithSandbox(
         sandbox,
         logger,
         cmd,
+      );
+    }
+    // Seatbelt: CLAUDE_CONFIG_DIR and --strict-mcp-config are provider-level
+    // (set by the caller). The read-only re-mounting and masking of the
+    // user's own Claude config is bwrap-only; the static .sb profile is not
+    // parameterised per invocation: it denies writes under $HOME and then
+    // re-allows only these roots. Paths outside $HOME stay writable.
+    if (
+      claudeConfigDir && home && claudeConfigDir.startsWith(home + "/") &&
+      ![
+        resolvedCwd,
+        `${home}/.cache`,
+        `${home}/.deno`,
+        `${home}/.claude`,
+        `${home}/.codex`,
+        `${home}/.config/opencode`,
+        `${home}/.local/share/opencode`,
+      ]
+        .some((root) =>
+          claudeConfigDir === root || claudeConfigDir.startsWith(root + "/")
+        )
+    ) {
+      logger?.warning(
+        `claudeConfigDir ${claudeConfigDir} is under the home directory but outside the home paths the seatbelt profile lets claude write (cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs); claude will not be able to write its state there`,
       );
     }
     return [
@@ -1030,6 +1151,12 @@ export function wrapWithSandbox(
         executableDirectoryPath,
         gitMetadataPath,
         readOnlyInputFiles,
+        claudeConfigDir,
+        claudeConfigDir
+          ? resolveCallerClaudeConfigDir(
+            Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+          )
+          : null,
       ),
     ];
   }
@@ -1199,6 +1326,7 @@ export async function runCli(
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
     sandboxReadOnlyInputFiles?: readonly string[];
+    sandboxClaudeConfigDir?: string;
     logger?: MethodContext["logger"];
   },
 ): Promise<CmdResult> {
@@ -1211,6 +1339,7 @@ export async function runCli(
       undefined,
       undefined,
       opts.sandboxReadOnlyInputFiles,
+      opts.sandboxClaudeConfigDir ?? null,
     )
     : cmd;
   const start = performance.now();
@@ -3366,6 +3495,127 @@ export function parseJsonResponse(
   }
 }
 
+/** Collapse `//`, `.` and `..` segments and trailing slashes of an absolute path. */
+function normalizeAbsolutePath(path: string): string {
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return "/" + out.join("/");
+}
+
+/** True when `child` equals `parent` or lies inside it (both normalized). */
+function pathContains(parent: string, child: string): boolean {
+  return parent === "/" || child === parent || child.startsWith(parent + "/");
+}
+
+/**
+ * Symlink-aware counterpart of the text checks in
+ * {@link resolveClaudeConfigDir}: the dir (which must exist) is rejected when
+ * its real path equals or contains the real path of the home directory,
+ * `~/.claude` or the caller's config dir (those that exist). A dir inside them
+ * is allowed, as in the text check. Throws before the run launches.
+ */
+export function assertClaudeConfigDirRealPath(
+  dir: string,
+  home: string,
+  callerConfigDir: string | null,
+  realPath: (p: string) => string = Deno.realPathSync,
+): void {
+  const real = (p: string): string | null => {
+    try {
+      return realPath(p);
+    } catch {
+      return null;
+    }
+  };
+  const realDir = real(dir);
+  if (!realDir) return;
+  const protectedDirs = [
+    ...(home.startsWith("/")
+      ? [normalizeAbsolutePath(home), `${normalizeAbsolutePath(home)}/.claude`]
+      : []),
+    ...(callerConfigDir?.startsWith("/")
+      ? [normalizeAbsolutePath(callerConfigDir)]
+      : []),
+  ];
+  for (const p of protectedDirs) {
+    const realProtected = real(p);
+    if (realProtected && pathContains(realDir, realProtected)) {
+      throw new Error(
+        `claudeConfigDir ${dir} resolves to ${realDir}, which must not be, or contain, ${p} (${realProtected}) once symlinks are followed`,
+      );
+    }
+  }
+}
+
+/**
+ * Resolve the effective `claudeConfigDir` for one invocation: an absolute
+ * path (leading `~/` expanded against `home`, the same home the sandbox
+ * uses), the literal `"ephemeral"`, or `undefined` (unset, or ignored because
+ * the provider is not claude, which logs a warning). Relative paths throw:
+ * the child's cwd is the target repo, so a relative dir would silently land
+ * inside it.
+ */
+export function resolveClaudeConfigDir(
+  value: string | undefined,
+  provider: Provider,
+  home: string,
+  logger?: MethodContext["logger"],
+  callerConfigDir: string | null = Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "ephemeral") {
+    const expanded = value.startsWith("~/") && home
+      ? `${home}${value.slice(1)}`
+      : value;
+    if (!expanded.startsWith("/")) {
+      throw new Error(
+        `claudeConfigDir must be an absolute path, "~/..." or "ephemeral" (got ${
+          JSON.stringify(value)
+        })`,
+      );
+    }
+    value = normalizeAbsolutePath(expanded);
+    // bwrap binds this dir read-write, so it must not be (or contain) the
+    // real home, nor the user's own Claude config, which would defeat the
+    // isolation. A dir INSIDE ~/.claude or the caller's config dir is fine:
+    // the ro re-mounts come first and the rw bind after them.
+    const contains = pathContains;
+    const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+    if (normalizedHome && contains(value, normalizedHome)) {
+      throw new Error(
+        `claudeConfigDir ${value} must not be the home directory or one of its parents`,
+      );
+    }
+    if (value === "/") {
+      throw new Error("claudeConfigDir must not be /");
+    }
+    const protectedDirs = [
+      ...(normalizedHome ? [`${normalizedHome}/.claude`] : []),
+      ...(callerConfigDir?.startsWith("/")
+        ? [normalizeAbsolutePath(callerConfigDir)]
+        : []),
+    ];
+    for (const dir of protectedDirs) {
+      if (contains(value, dir)) {
+        throw new Error(
+          `claudeConfigDir ${value} must not be, or contain, the Claude config dir ${dir}`,
+        );
+      }
+    }
+  }
+  if (provider !== "claude") {
+    logger?.warning(
+      `claudeConfigDir is only supported for provider=claude; ignoring it for ${provider}`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
 /**
  * Run a provider CLI with retries, then detect provider-reported errors.
  *
@@ -3397,6 +3647,8 @@ export async function runWithRetries(
     requireParseableJson?: boolean;
     retryDelayMs?: number;
     codex?: CodexExecutionOptions;
+    /** Resolved by {@link resolveClaudeConfigDir}; claude provider only. */
+    claudeConfigDir?: string;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -3430,21 +3682,51 @@ export async function runWithRetries(
     const piConfigDir = provider === "pi" && opts.sandbox?.mode !== "off"
       ? `/tmp/swamp-cli-agent-pi-${crypto.randomUUID()}`
       : undefined;
+    // An isolated claude config dir is created before launch (bwrap needs the
+    // bind source to exist) and "ephemeral" ones are removed with the run,
+    // like piConfigDir below.
+    const claudeConfigDirEphemeral = provider === "claude" &&
+      opts.claudeConfigDir === "ephemeral";
+    let claudeConfigDir: string | undefined;
     try {
+      if (provider === "claude" && opts.claudeConfigDir) {
+        claudeConfigDir = claudeConfigDirEphemeral
+          ? await Deno.makeTempDir({ prefix: "swamp-cli-agent-claude-" })
+          : opts.claudeConfigDir;
+        await Deno.mkdir(claudeConfigDir, { recursive: true });
+        if (!claudeConfigDirEphemeral) {
+          assertClaudeConfigDirRealPath(
+            claudeConfigDir,
+            Deno.env.get("HOME") ?? "",
+            Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+          );
+        }
+        // Right after the binary, so the prompt stays last.
+        cmd.splice(1, 0, ...claudeIsolationArgs(Deno.env.get("HOME") ?? ""));
+      }
       lastResult = await runCli(cmd, {
         cwd: opts.cwd,
         stdin,
         env: {
           ...env,
           ...(piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : {}),
+          ...(claudeConfigDir ? { CLAUDE_CONFIG_DIR: claudeConfigDir } : {}),
         },
         wallTimeoutMs: opts.wallTimeoutMs,
         idleTimeoutMs: opts.idleTimeoutMs,
         sandbox: opts.sandbox,
         sandboxReadOnlyInputFiles,
+        sandboxClaudeConfigDir: claudeConfigDir,
         logger,
       });
     } finally {
+      if (claudeConfigDir && claudeConfigDirEphemeral) {
+        await Deno.remove(claudeConfigDir, { recursive: true }).catch(
+          (error) => {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          },
+        );
+      }
       if (piConfigDir) {
         await Deno.remove(piConfigDir, { recursive: true }).catch((error) => {
           if (!(error instanceof Deno.errors.NotFound)) throw error;
@@ -3915,6 +4197,10 @@ export const InvokeArgsSchema = z.object({
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+  ),
+  claudeConfigDir: z.string().optional().describe(
+    "Override the global claudeConfigDir for this invocation. " +
+      CLAUDE_CONFIG_DIR_DESCRIPTION,
   ),
 }).superRefine((args, ctx) => {
   if (
@@ -5721,6 +6007,12 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const claudeConfigDir = resolveClaudeConfigDir(
+          args.claudeConfigDir ?? context.globalArgs.claudeConfigDir,
+          provider,
+          Deno.env.get("HOME") ?? "",
+          context.logger,
+        );
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -5741,6 +6033,7 @@ export const model = {
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
               codex,
+              claudeConfigDir,
             },
             context.logger,
           );
@@ -5914,6 +6207,12 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const claudeConfigDir = resolveClaudeConfigDir(
+          args.claudeConfigDir ?? context.globalArgs.claudeConfigDir,
+          provider,
+          Deno.env.get("HOME") ?? "",
+          context.logger,
+        );
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -5935,6 +6234,7 @@ export const model = {
               factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
               codex,
+              claudeConfigDir,
             },
             context.logger,
           );
