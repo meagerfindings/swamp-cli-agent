@@ -184,6 +184,11 @@ export const GlobalArgsSchema = z.object({
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
+/** Lowercase hex SHA-256 of a canonical JSON Schema encoding. */
+const OutputSchemaDigestSchema = z.string().regex(/^[0-9a-f]{64}$/);
+/** Extraction mode recorded for native structured-output invocations. */
+const ExtractionModeSchema = z.literal("structured_output");
+
 /** Schema for a structured invocation record persisted as a swamp resource. */
 export const InvocationSchema = z.object({
   invocationId: z.string(),
@@ -238,6 +243,12 @@ export const InvocationSchema = z.object({
   parsedResponse: z.unknown().optional().describe(
     "Parsed JSON response from the agent output. Only populated by invokeAndParse.",
   ),
+  outputSchemaDigest: OutputSchemaDigestSchema.optional().describe(
+    "SHA-256 of the canonical JSON encoding of the invokeAndParse jsonSchema. Present only for structured-output invocations.",
+  ),
+  extractionMode: ExtractionModeSchema.optional().describe(
+    "How parsedResponse was extracted. 'structured_output' means Claude's native --json-schema result; absent for text parsing.",
+  ),
 });
 
 /**
@@ -262,6 +273,8 @@ export const InvocationLaunchClaimSchema = z.object({
   cwd: z.string().min(1),
   repositoryExpectation: RepositoryExpectationSchema.optional(),
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
+  outputSchemaDigest: OutputSchemaDigestSchema.optional(),
+  extractionMode: ExtractionModeSchema.optional(),
   tags: z.record(z.string(), z.string()),
   definition: z.object({
     id: z.string(),
@@ -332,6 +345,65 @@ export async function hashPrompt(prompt: string): Promise<string> {
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/**
+ * Canonical JSON encoding used for {@link hashOutputSchema}: object keys sorted
+ * by UTF-16 code unit order, undefined object members omitted, no whitespace.
+ * Consumers compute the same digest independently, so this must not change.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const o = value as Record<string, unknown>;
+  return `{${
+    Object.keys(o).filter((k) => o[k] !== undefined).sort((a, b) =>
+      a < b ? -1 : a > b ? 1 : 0
+    ).map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")
+  }}`;
+}
+
+/** Lowercase SHA-256 of the UTF-8 canonical JSON encoding of a JSON Schema. */
+export async function hashOutputSchema(
+  schema: Record<string, unknown>,
+): Promise<string> {
+  return await hashPrompt(canonicalJson(schema));
+}
+
+/** Structured-output contract for one invocation (absent fields = text mode). */
+export type StructuredOutputContract = {
+  jsonSchema?: Record<string, unknown>;
+  outputSchemaDigest?: string;
+  extractionMode?: "structured_output";
+};
+
+/**
+ * Validate a requested `jsonSchema` before any launch claim or spawn. Only
+ * invokeAndParse with provider=claude honours it; anything else throws so the
+ * schema is never silently ignored. Without a schema, returns an empty contract.
+ */
+export async function resolveStructuredOutputContract(
+  operation: "invoke" | "invokeAndParse",
+  provider: Provider,
+  jsonSchema: Record<string, unknown> | undefined,
+): Promise<StructuredOutputContract> {
+  if (jsonSchema === undefined) return {};
+  if (operation !== "invokeAndParse") {
+    throw new Error(
+      "jsonSchema is supported only by invokeAndParse, not invoke",
+    );
+  }
+  if (provider !== "claude") {
+    throw new Error(
+      `jsonSchema is supported only for provider=claude (got ${provider})`,
+    );
+  }
+  return {
+    jsonSchema,
+    outputSchemaDigest: await hashOutputSchema(jsonSchema),
+    extractionMode: "structured_output",
+  };
 }
 
 /** Generate a v4 UUID. */
@@ -1511,12 +1583,23 @@ const CLAUDE_ALLOWED_TOOLS: Record<ToolProfile, string> = {
  * past it to grab the next argv entry. Verified manually: the equals-form
  * both delivers the prompt AND enforces the allowlist (a disallowed Write
  * call was denied under `--allowedTools="Read Grep Glob"`).
+ *
+ * When `jsonSchema` is supplied (invokeAndParse structured-output mode), it is
+ * passed as `--json-schema <JSON>` (two argv entries) before the positional
+ * prompt. The stream-json output format is unchanged so the idle watchdog
+ * still sees progress; the validated object arrives as `structured_output` on
+ * the terminal `result` event. Without a schema the argv is unchanged.
  */
 export function buildClaudeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  _toolAllowlist?: string[],
+  _factoryBoundary?: boolean,
+  _factoryCwd?: string,
+  _codex?: CodexExecutionOptions,
+  jsonSchema?: Record<string, unknown>,
 ): { cmd: string[]; stdin?: string } {
   const cmd = [
     cliPath,
@@ -1530,6 +1613,9 @@ export function buildClaudeCommand(
     "dontAsk",
     "--allowedTools=" + CLAUDE_ALLOWED_TOOLS[toolProfile],
   ];
+  if (jsonSchema !== undefined) {
+    cmd.push("--json-schema", JSON.stringify(jsonSchema));
+  }
   cmd.push(resolvedPrompt);
   return { cmd };
 }
@@ -3049,6 +3135,7 @@ type CommandBuilder = (
   factoryBoundary?: boolean,
   factoryCwd?: string,
   codex?: CodexExecutionOptions,
+  jsonSchema?: Record<string, unknown>,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3321,7 +3408,42 @@ type RunOutcome = {
   usage: UsageData;
   /** True when the CLI exited cleanly AND no provider error was reported. */
   ok: boolean;
+  /**
+   * Structured-output mode only (`jsonSchema` supplied): the terminal result's
+   * `structured_output` object, or null when missing/invalid. Absent otherwise.
+   */
+  structuredOutput?: Record<string, unknown> | null;
 };
+
+/**
+ * Read Claude's native `--json-schema` result: the `structured_output` of the
+ * terminal stream-json `result` event. Returns it only when it is a non-null,
+ * non-array object; otherwise null. Deliberately never falls back to the
+ * `result` text, stdout, fenced JSON, or a balanced-object scan.
+ */
+export function extractClaudeStructuredOutput(
+  rawOutput: string,
+): Record<string, unknown> | null {
+  for (const line of rawOutput.split("\n").reverse()) {
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      event === null || typeof event !== "object" || Array.isArray(event) ||
+      (event as { type?: unknown }).type !== "result"
+    ) continue;
+    const structured = (event as { structured_output?: unknown })
+      .structured_output;
+    return structured !== null && typeof structured === "object" &&
+        !Array.isArray(structured)
+      ? structured as Record<string, unknown>
+      : null;
+  }
+  return null;
+}
 
 /** Parse the object payload accepted by invokeAndParse from agent text. */
 export function parseJsonResponse(
@@ -3375,7 +3497,11 @@ export function parseJsonResponse(
  *   quota / overloaded / 429), which the CLI itself does not retry and which
  *   typically exits non-transiently (e.g. 1) with zero assistant text.
  * - a clean response that violates invokeAndParse's JSON contract, when
- *   `requireParseableJson` is enabled.
+ *   `requireParseableJson` is enabled and no `jsonSchema` is supplied.
+ *
+ * With `jsonSchema` (Claude only), Claude enforces the schema natively and a
+ * missing/invalid `structured_output` is a terminal contract failure: it is
+ * never retried and never triggers the JSON repair prompt.
  *
  * The second is the case that previously slipped through as a silent success:
  * the subprocess "succeeded" enough to exit, but the model never answered.
@@ -3397,9 +3523,15 @@ export async function runWithRetries(
     requireParseableJson?: boolean;
     retryDelayMs?: number;
     codex?: CodexExecutionOptions;
+    jsonSchema?: Record<string, unknown>;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
+  if (opts.jsonSchema !== undefined && provider !== "claude") {
+    throw new Error(
+      `jsonSchema is supported only for provider=claude (got ${provider})`,
+    );
+  }
   const caps = PROVIDERS[provider];
   const buildCommand = caps.buildCommand;
   let lastResult: CmdResult | undefined;
@@ -3423,6 +3555,7 @@ export async function runWithRetries(
       opts.factoryBoundary,
       opts.factoryBoundary ? opts.cwd : undefined,
       opts.codex,
+      opts.jsonSchema,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3471,7 +3604,8 @@ export async function runWithRetries(
       : lastResult.stdout;
     const attemptText = caps.extractText(attemptTextSource);
     const contractViolation = opts.requireParseableJson === true &&
-      lastResult.success && providerError === null &&
+      opts.jsonSchema === undefined && lastResult.success &&
+      providerError === null &&
       parseJsonResponse(attemptText) === null;
 
     if (!transientExit && !retryableProviderError && !contractViolation) break;
@@ -3505,6 +3639,13 @@ export async function runWithRetries(
     ? [result.stdout, result.stderr].filter(Boolean).join("\n")
     : result.stdout;
   let extractedText = caps.extractText(textSource);
+  let structuredOutput: Record<string, unknown> | null | undefined;
+  if (opts.jsonSchema !== undefined) {
+    structuredOutput = extractClaudeStructuredOutput(result.stdout);
+    if (structuredOutput !== null) {
+      extractedText = JSON.stringify(structuredOutput);
+    }
+  }
   // When a provider error was detected but extractors left an empty preview,
   // surface the human message for transcripts/outputPreview.
   if (providerError && !extractedText.trim()) {
@@ -3513,7 +3654,15 @@ export async function runWithRetries(
   const usage = caps.extractUsage(result.stdout);
   const ok = result.success && providerError === null;
 
-  return { result, retries, providerError, extractedText, usage, ok };
+  return {
+    result,
+    retries,
+    providerError,
+    extractedText,
+    usage,
+    ok,
+    ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+  };
 }
 
 /** Build the common invocation record fields shared by invoke/invokeAndParse. */
@@ -3712,6 +3861,8 @@ export async function launchCallerInvocation<T>(
     i.model === claim.model && i.reasoningEffort === claim.reasoningEffort &&
     (i.ephemeral ?? false) === claim.ephemeral && i.cwd === claim.cwd &&
     i.promptHash === claim.promptHash &&
+    i.outputSchemaDigest === claim.outputSchemaDigest &&
+    i.extractionMode === claim.extractionMode &&
     stableValue(normalizeTags(i.tags)) === stableValue(claim.tags) &&
     i.prompt === t.prompt.slice(0, 500) &&
     i.promptTruncated === (t.prompt.length > 500) &&
@@ -3915,6 +4066,9 @@ export const InvokeArgsSchema = z.object({
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+  ),
+  jsonSchema: z.record(z.string(), z.unknown()).optional().describe(
+    "invokeAndParse only, provider=claude only: a draft-07 JSON Schema object passed to Claude's --json-schema. parsedResponse is taken solely from the terminal result's structured_output and fails closed (no retry, no text fallback) when it is missing or not an object. invoke and other providers reject it before launch.",
   ),
 }).superRefine((args, ctx) => {
   if (
@@ -4943,7 +5097,7 @@ export async function collectAmpUsageWithCache(
   };
 }
 
-export const CLI_AGENT_VERSION = "2026.09.07.1";
+export const CLI_AGENT_VERSION = "2026.10.30.1";
 
 export const model = {
   type: "@mgreten/cli-agent",
@@ -5161,9 +5315,15 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: CLI_AGENT_VERSION,
+      toVersion: "2026.09.07.1",
       description:
         "Send Codex prompts through stdin so large factory packets do not exceed process argument-vector limits. Execution-only change; no schema or attribute rewrite needed.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: CLI_AGENT_VERSION,
+      description:
+        "Add optional Claude-only jsonSchema structured output to invokeAndParse: Claude enforces the schema via --json-schema, parsedResponse comes only from the terminal result's structured_output (fail-closed, never retried), and invocation records and launch claims carry optional outputSchemaDigest and extractionMode provenance. Additive optional fields; existing records parse unchanged and no attribute rewrite is needed.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -5678,6 +5838,12 @@ export const model = {
         const callerOwned = args.invocationId !== undefined;
         const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
+        // invoke never honours jsonSchema; reject it before any claim/spawn.
+        await resolveStructuredOutputContract(
+          "invoke",
+          provider,
+          args.jsonSchema,
+        );
         const modelName = resolveModel(
           provider,
           args.model,
@@ -5871,6 +6037,11 @@ export const model = {
         const callerOwned = args.invocationId !== undefined;
         const invocationId = resolveInvocationId(args.invocationId);
         const provider = args.provider ?? context.globalArgs.defaultProvider;
+        const structured = await resolveStructuredOutputContract(
+          "invokeAndParse",
+          provider,
+          args.jsonSchema,
+        );
         const modelName = resolveModel(
           provider,
           args.model,
@@ -5935,6 +6106,9 @@ export const model = {
               factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
               codex,
+              ...(structured.jsonSchema !== undefined
+                ? { jsonSchema: structured.jsonSchema }
+                : {}),
             },
             context.logger,
           );
@@ -5951,6 +6125,12 @@ export const model = {
             cwd,
             repositoryExpectation: args.repositoryExpectation,
             promptHash,
+            ...(structured.extractionMode !== undefined
+              ? {
+                outputSchemaDigest: structured.outputSchemaDigest,
+                extractionMode: structured.extractionMode,
+              }
+              : {}),
             tags: normalizeTags(args.tags),
             definition: {
               id: context.definition.id,
@@ -5974,7 +6154,11 @@ export const model = {
         }
         const { result, extractedText, providerError } = outcome;
 
-        const parsedJson = parseJsonResponse(extractedText);
+        // Structured-output mode reads ONLY Claude's native structured_output
+        // (never the result text); text mode keeps the historical parser.
+        const parsedJson = structured.extractionMode === "structured_output"
+          ? outcome.structuredOutput ?? null
+          : parseJsonResponse(extractedText);
 
         // invokeAndParse additionally requires a parseable JSON payload. A run
         // that otherwise succeeded but produced no valid JSON is a
@@ -6003,6 +6187,12 @@ export const model = {
             contractViolation: parseFailedOnOtherwiseOkRun,
           }),
           parsedResponse: parsedJson,
+          ...(structured.extractionMode !== undefined
+            ? {
+              outputSchemaDigest: structured.outputSchemaDigest,
+              extractionMode: structured.extractionMode,
+            }
+            : {}),
         };
 
         const invocationWrite = await createOnceOrVerify(
@@ -6033,6 +6223,11 @@ export const model = {
           }
           throw new Error(
             `CLI failed (exit ${result.code}): ${result.stderr.slice(0, 200)}`,
+          );
+        }
+        if (!parsedJson && structured.extractionMode === "structured_output") {
+          throw new Error(
+            `${provider} structured_output missing or not an object (jsonSchema contract violation; result text is not used)`,
           );
         }
         if (!parsedJson) {

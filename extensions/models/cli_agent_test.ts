@@ -34,12 +34,14 @@ import {
   CollectLocalUsageArgsSchema,
   combineDailyUsage,
   createOnceOrVerify,
+  extractClaudeStructuredOutput,
   extractError,
   extractTextFromOutput,
   extractUsage,
   factoryActorCommandAllowed,
   filterProviderChildEnv,
   GlobalArgsSchema,
+  hashOutputSchema,
   hashPrompt,
   InvocationIdSchema,
   InvocationLaunchClaimSchema,
@@ -66,6 +68,7 @@ import {
   resolveLinkedWorktreeGitMetadata,
   resolveLocalUsageDay,
   resolveModel,
+  resolveStructuredOutputContract,
   runCli,
   runWithRetries,
   SANDBOX_PROFILE_FILENAME,
@@ -5054,4 +5057,477 @@ Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools",
     else Deno.env.set("HOME", prevHome);
     await Deno.remove(tmpHome, { recursive: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// invokeAndParse jsonSchema (Claude-native structured output)
+// ---------------------------------------------------------------------------
+
+const STRUCTURED_SCHEMA = {
+  type: "object",
+  required: ["b", "a"],
+  properties: { b: { type: "string" }, a: { type: "integer" } },
+  additionalProperties: false,
+};
+// Independently computed with:
+// printf '%s' '{"additionalProperties":false,"properties":{"a":{"type":"integer"},"b":{"type":"string"}},"required":["b","a"],"type":"object"}' | shasum -a 256
+const STRUCTURED_SCHEMA_DIGEST =
+  "0e15d437648914895e7e20360d876afbe230d86a7b9d206cd71a9200b367a5f5";
+
+type ExecuteContext = Parameters<
+  typeof model.methods.invokeAndParse.execute
+>[1];
+
+/**
+ * Run `test` against a fake claude CLI that prints `lines` (one JSON event
+ * per line) and records each attempt's argv (one entry per line, `---` after
+ * each attempt) so tests can assert the exact command and attempt count.
+ */
+async function withClaudeFixture(
+  lines: unknown[],
+  test: (fixture: {
+    cwd: string;
+    script: string;
+    attempts: () => Promise<string[][]>;
+  }) => Promise<void>,
+): Promise<void> {
+  const cwd = await canonicalCwd(await Deno.makeTempDir());
+  const script = `${cwd}/claude-fixture`;
+  const out = `${cwd}/out.jsonl`;
+  const argvFile = `${cwd}/argv`;
+  await Deno.writeTextFile(
+    out,
+    lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
+  );
+  await Deno.writeTextFile(
+    script,
+    `#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a" >> ${JSON.stringify(argvFile)}; done
+printf '%s\\n' '---' >> ${JSON.stringify(argvFile)}
+cat ${JSON.stringify(out)}
+`,
+  );
+  await Deno.chmod(script, 0o700);
+  try {
+    await test({
+      cwd,
+      script,
+      attempts: async () => {
+        const text = await Deno.readTextFile(argvFile).catch(() => "");
+        return text.split("---\n").slice(0, -1).map((attempt) =>
+          attempt.split("\n").slice(0, -1)
+        );
+      },
+    });
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+}
+
+function methodContext(
+  script: string,
+  stored: Stored,
+  methodName: "invoke" | "invokeAndParse",
+  events: string[] = [],
+): ExecuteContext {
+  return {
+    globalArgs: GlobalArgsSchema.parse({
+      claudePath: script,
+      sandboxMode: "off",
+      maxRetries: 2,
+    }),
+    definition: { id: "def-1", name: "agent", version: 1, tags: {} },
+    methodName,
+    logger: { info: () => {}, warning: () => {}, error: () => {} },
+    ...resourceContext(stored, events).context,
+    extensionFile: (filename: string) => filename,
+  };
+}
+
+Deno.test("buildClaudeCommand: jsonSchema adds --json-schema before the prompt and keeps stream-json", () => {
+  const { cmd, stdin } = buildClaudeCommand(
+    "claude",
+    "sonnet",
+    "Return the answer",
+    "readonly",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    STRUCTURED_SCHEMA,
+  );
+  assertEquals(cmd, [
+    "claude",
+    "--model",
+    "sonnet",
+    "--print",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools=Read Grep Glob",
+    "--json-schema",
+    JSON.stringify(STRUCTURED_SCHEMA),
+    "Return the answer",
+  ]);
+  assertEquals(stdin, undefined);
+  // Without a schema, the argv is exactly the historical one.
+  assertEquals(
+    buildClaudeCommand("claude", "sonnet", "Return the answer", "readonly")
+      .cmd,
+    cmd.filter((_, i) => i !== 10 && i !== 11),
+  );
+});
+
+Deno.test("extractClaudeStructuredOutput: reads only an object structured_output from the terminal result", () => {
+  const stream = (result: Record<string, unknown>) =>
+    [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "result", ...result }),
+    ].join("\n");
+  assertEquals(
+    extractClaudeStructuredOutput(
+      stream({ result: "prose", structured_output: { a: 1, b: "x" } }),
+    ),
+    { a: 1, b: "x" },
+  );
+  // A result whose text is perfectly valid JSON must not be used.
+  for (
+    const structured of [undefined, null, [{ a: 1 }], '{"a":1}', 7, true]
+  ) {
+    const result: Record<string, unknown> = { result: '{"a":1,"b":"x"}' };
+    if (structured !== undefined) result.structured_output = structured;
+    assertEquals(extractClaudeStructuredOutput(stream(result)), null);
+  }
+  assertEquals(extractClaudeStructuredOutput('{"a":1,"b":"x"}'), null);
+  assertEquals(extractClaudeStructuredOutput(""), null);
+});
+
+Deno.test("hashOutputSchema: digest is canonical, key-order independent, and matches an independent SHA-256", async () => {
+  const reordered = {
+    additionalProperties: false,
+    properties: { a: { type: "integer" }, b: { type: "string" } },
+    required: ["b", "a"],
+    type: "object",
+  };
+  assertEquals(
+    await hashOutputSchema(STRUCTURED_SCHEMA),
+    STRUCTURED_SCHEMA_DIGEST,
+  );
+  assertEquals(await hashOutputSchema(reordered), STRUCTURED_SCHEMA_DIGEST);
+  // Array order is significant.
+  assertEquals(
+    (await hashOutputSchema({ ...reordered, required: ["a", "b"] })) ===
+      STRUCTURED_SCHEMA_DIGEST,
+    false,
+  );
+});
+
+Deno.test("resolveStructuredOutputContract: only invokeAndParse with claude accepts jsonSchema", async () => {
+  assertEquals(
+    await resolveStructuredOutputContract("invokeAndParse", "codex", undefined),
+    {},
+  );
+  assertEquals(
+    await resolveStructuredOutputContract(
+      "invokeAndParse",
+      "claude",
+      STRUCTURED_SCHEMA,
+    ),
+    {
+      jsonSchema: STRUCTURED_SCHEMA,
+      outputSchemaDigest: STRUCTURED_SCHEMA_DIGEST,
+      extractionMode: "structured_output",
+    },
+  );
+  await assertRejects(
+    () =>
+      resolveStructuredOutputContract("invoke", "claude", STRUCTURED_SCHEMA),
+    Error,
+    "only by invokeAndParse",
+  );
+  await assertRejects(
+    () =>
+      resolveStructuredOutputContract(
+        "invokeAndParse",
+        "amp",
+        STRUCTURED_SCHEMA,
+      ),
+    Error,
+    "only for provider=claude",
+  );
+});
+
+Deno.test("jsonSchema: invoke and non-claude invokeAndParse reject before any claim or launch", async () => {
+  await withClaudeFixture([], async ({ cwd, script, attempts }) => {
+    for (
+      const [methodName, provider] of [
+        ["invoke", "claude"],
+        ["invokeAndParse", "amp"],
+        ["invokeAndParse", "codex"],
+      ] as const
+    ) {
+      const stored: Stored = new Map();
+      const events: string[] = [];
+      await assertRejects(
+        () =>
+          model.methods[methodName].execute(
+            InvokeArgsSchema.parse({
+              prompt: "Return JSON",
+              invocationId: "schema-reject",
+              provider,
+              cwd,
+              jsonSchema: STRUCTURED_SCHEMA,
+            }),
+            methodContext(script, stored, methodName, events),
+          ),
+        Error,
+        "jsonSchema is supported only",
+      );
+      assertEquals(events, []);
+      assertEquals(stored.size, 0);
+    }
+    assertEquals(await attempts(), []);
+  });
+});
+
+Deno.test("invokeAndParse jsonSchema: parsedResponse and preview come from structured_output, with provenance", async () => {
+  const structured = { b: "from-structured", a: 2 };
+  await withClaudeFixture([
+    { type: "system", subtype: "init" },
+    {
+      type: "result",
+      result: '{"a":1,"b":"from-result-text"}',
+      structured_output: structured,
+    },
+  ], async ({ cwd, script, attempts }) => {
+    const stored: Stored = new Map();
+    await model.methods.invokeAndParse.execute(
+      InvokeArgsSchema.parse({
+        prompt: "Return JSON",
+        invocationId: "schema-1",
+        provider: "claude",
+        model: "sonnet",
+        cwd,
+        jsonSchema: STRUCTURED_SCHEMA,
+      }),
+      methodContext(script, stored, "invokeAndParse"),
+    );
+    const argv = await attempts();
+    assertEquals(argv.length, 1);
+    const flag = argv[0].indexOf("--json-schema");
+    assertEquals(argv[0][flag + 1], JSON.stringify(STRUCTURED_SCHEMA));
+    assertEquals(argv[0][flag + 2], "Return JSON");
+    assertEquals(argv[0].length, flag + 3);
+
+    const invocation = InvocationSchema.parse(
+      stored.get("invocation-schema-1"),
+    );
+    assertEquals(invocation.success, true);
+    assertEquals(invocation.parsedResponse, structured);
+    assertEquals(invocation.outputPreview, JSON.stringify(structured));
+    assertEquals(invocation.outputSchemaDigest, STRUCTURED_SCHEMA_DIGEST);
+    assertEquals(invocation.extractionMode, "structured_output");
+    assertEquals(
+      stored.get("transcript-schema-1")?.output,
+      JSON.stringify(structured),
+    );
+    const launchClaim = InvocationLaunchClaimSchema.parse(
+      stored.get("launch-claim-schema-1"),
+    );
+    assertEquals(launchClaim.outputSchemaDigest, STRUCTURED_SCHEMA_DIGEST);
+    assertEquals(launchClaim.extractionMode, "structured_output");
+  });
+});
+
+Deno.test("invokeAndParse jsonSchema: missing, null, or array structured_output fails closed without retry", async () => {
+  for (const structured of [undefined, null, [{ a: 1, b: "x" }]]) {
+    const result: Record<string, unknown> = {
+      type: "result",
+      result: '{"a":1,"b":"valid-json-in-result"}',
+    };
+    if (structured !== undefined) result.structured_output = structured;
+    await withClaudeFixture([result], async ({ cwd, script, attempts }) => {
+      const stored: Stored = new Map();
+      await assertRejects(
+        () =>
+          model.methods.invokeAndParse.execute(
+            InvokeArgsSchema.parse({
+              prompt: "Return JSON",
+              invocationId: "schema-missing",
+              provider: "claude",
+              cwd,
+              jsonSchema: STRUCTURED_SCHEMA,
+            }),
+            methodContext(script, stored, "invokeAndParse"),
+          ),
+        Error,
+        "structured_output missing or not an object",
+      );
+      const argv = await attempts();
+      // One attempt, and no repair prompt appended.
+      assertEquals(argv.length, 1);
+      assertEquals(argv[0][argv[0].length - 1], "Return JSON");
+      const invocation = InvocationSchema.parse(
+        stored.get("invocation-schema-missing"),
+      );
+      assertEquals(invocation.success, false);
+      assertEquals(invocation.retries, 0);
+      assertEquals(invocation.failureClass, "contract-violation");
+      assertEquals(invocation.parsedResponse, null);
+      assertEquals(invocation.extractionMode, "structured_output");
+      assertEquals(invocation.outputSchemaDigest, STRUCTURED_SCHEMA_DIGEST);
+    });
+  }
+});
+
+Deno.test("invokeAndParse without jsonSchema keeps the historical argv and records", async () => {
+  await withClaudeFixture(
+    [{ type: "result", result: '{"ok":true}' }],
+    async ({ cwd, script, attempts }) => {
+      const stored: Stored = new Map();
+      await model.methods.invokeAndParse.execute(
+        InvokeArgsSchema.parse({
+          prompt: "Return JSON",
+          invocationId: "text-1",
+          provider: "claude",
+          model: "sonnet",
+          cwd,
+        }),
+        methodContext(script, stored, "invokeAndParse"),
+      );
+      assertEquals(await attempts(), [[
+        "--model",
+        "sonnet",
+        "--print",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools=Read Grep Glob Edit Write Bash",
+        "Return JSON",
+      ]]);
+      const invocation = stored.get("invocation-text-1")!;
+      assertEquals(invocation.parsedResponse, { ok: true });
+      assertEquals(invocation.outputPreview, '{"ok":true}');
+      assertEquals("outputSchemaDigest" in invocation, false);
+      assertEquals("extractionMode" in invocation, false);
+      const launchClaim = stored.get("launch-claim-text-1")!;
+      assertEquals("outputSchemaDigest" in launchClaim, false);
+      assertEquals("extractionMode" in launchClaim, false);
+    },
+  );
+});
+
+Deno.test("launch claim: a changed or added/removed output schema conflicts for the same invocationId", async () => {
+  const plain = await claim("invokeAndParse");
+  const withSchema = await claim("invokeAndParse", {
+    outputSchemaDigest: STRUCTURED_SCHEMA_DIGEST,
+    extractionMode: "structured_output",
+  });
+  const otherSchema = await claim("invokeAndParse", {
+    outputSchemaDigest: "f".repeat(64),
+    extractionMode: "structured_output",
+  });
+  for (
+    const [existing, requested] of [
+      [plain, withSchema],
+      [withSchema, plain],
+      [withSchema, otherSchema],
+    ]
+  ) {
+    const stored: Stored = new Map([["launch-claim-owned-1", existing]]);
+    let launches = 0;
+    await assertRejects(
+      () =>
+        launchCallerInvocation(
+          resourceContext(stored).context,
+          requested,
+          () => Promise.resolve(launches++),
+        ),
+      Error,
+      "Conflicting durable resource",
+    );
+    assertEquals(launches, 0);
+  }
+});
+
+Deno.test("structured-output replay requires matching provenance on terminal evidence", async () => {
+  const c = await claim("invokeAndParse", {
+    outputSchemaDigest: STRUCTURED_SCHEMA_DIGEST,
+    extractionMode: "structured_output",
+  });
+  const transcript = {
+    invocationId: "owned-1",
+    prompt: "prompt",
+    output: "ok",
+  };
+  const matching = {
+    ...terminal(c),
+    parsedResponse: { ok: true },
+    outputSchemaDigest: STRUCTURED_SCHEMA_DIGEST,
+    extractionMode: "structured_output",
+  };
+  assertEquals(
+    await launchCallerInvocation(
+      resourceContext(
+        new Map<string, Record<string, unknown>>([
+          ["launch-claim-owned-1", c],
+          ["invocation-owned-1", matching],
+          ["transcript-owned-1", transcript],
+        ]),
+      ).context,
+      c,
+      () => Promise.resolve("no"),
+    ),
+    { replayed: true },
+  );
+  const { outputSchemaDigest: _d, extractionMode: _m, ...withoutProvenance } =
+    matching;
+  await assertRejects(
+    () =>
+      launchCallerInvocation(
+        resourceContext(
+          new Map<string, Record<string, unknown>>([
+            ["launch-claim-owned-1", c],
+            ["invocation-owned-1", withoutProvenance],
+            ["transcript-owned-1", transcript],
+          ]),
+        ).context,
+        c,
+        () => Promise.resolve("no"),
+      ),
+    Error,
+    "Conflicting terminal evidence",
+  );
+});
+
+Deno.test("schemas: records without structured-output provenance still parse; malformed provenance is rejected", async () => {
+  const legacyClaim = await claim("invokeAndParse");
+  assertEquals(legacyClaim.outputSchemaDigest, undefined);
+  assertEquals(legacyClaim.extractionMode, undefined);
+  const legacyInvocation = InvocationSchema.parse(BASE_INVOCATION);
+  assertEquals(legacyInvocation.outputSchemaDigest, undefined);
+  assertEquals(legacyInvocation.extractionMode, undefined);
+  assertEquals(
+    InvocationSchema.safeParse({
+      ...BASE_INVOCATION,
+      outputSchemaDigest: "ABC",
+    }).success,
+    false,
+  );
+  assertEquals(
+    InvocationSchema.safeParse({ ...BASE_INVOCATION, extractionMode: "text" })
+      .success,
+    false,
+  );
+  assertEquals(
+    InvocationLaunchClaimSchema.safeParse({
+      ...legacyClaim,
+      outputSchemaDigest: "0".repeat(63),
+    }).success,
+    false,
+  );
 });

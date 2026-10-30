@@ -143,7 +143,44 @@ swamp model method run my-agent invokeAndParse \
   --args '{"prompt": "Return a JSON object with keys: status, summary", "provider": "claude"}'
 ```
 
-Takes the same arguments as `invoke`.
+Takes the same arguments as `invoke`, plus an optional `jsonSchema`.
+
+#### Structured output with `jsonSchema` (Claude only)
+
+`jsonSchema` is an optional draft-07 JSON Schema object. It is honoured only by
+`invokeAndParse` with `provider: "claude"`; `invoke` or any other provider
+rejects it before launch (and before any launch claim is written), so it is
+never silently ignored.
+
+```sh
+swamp model method run my-agent invokeAndParse \
+  --args '{"prompt": "Summarize the change", "provider": "claude",
+           "jsonSchema": {"type": "object", "required": ["status", "summary"],
+             "properties": {"status": {"type": "string"}, "summary": {"type": "string"}}}}'
+```
+
+- Claude enforces the schema natively: the argv gains
+  `--json-schema <JSON.stringify(schema)>` before the prompt. The output format
+  stays `--output-format stream-json --verbose`, so the idle watchdog still sees
+  progress.
+- Extraction is fail-closed. `parsedResponse` is exactly the `structured_output`
+  object of the terminal stream-json `result` event, and `outputPreview` and the
+  transcript `output` are its `JSON.stringify`. If `structured_output` is
+  missing, null, an array, or a primitive, the invocation fails as a
+  `contract-violation` ("structured_output missing or not an object"). The
+  `result` text, stdout, fenced JSON, and balanced-object scanning are never
+  used as a fallback, and this failure is not retried and gets no repair prompt.
+  Provider errors (`is_error` results), timeouts, and exits keep their existing
+  handling and retries.
+- Provenance: the invocation record and the launch claim carry
+  `outputSchemaDigest` (lowercase hex SHA-256 of the canonical JSON of the
+  schema: object keys sorted, undefined members dropped, no whitespace) and
+  `extractionMode: "structured_output"`. Both are absent without a schema, and
+  older records parse unchanged. For a caller-owned `invocationId`, reusing the
+  identity with a different schema, or with a schema added or removed, is a
+  claim conflict.
+
+Without `jsonSchema`, `invokeAndParse` behaves exactly as before.
 
 When `invocationId` is supplied, a durable claim is written before launch. Reuse
 with different execution inputs fails; consistent terminal records replay without
@@ -307,6 +344,8 @@ Each invocation is persisted with these fields:
 | `outputPreview`   | string  | First 1000 chars of extracted text       |
 | `retries`         | number  | How many retries were needed             |
 | `failureClass`    | enum    | Typed failure taxonomy; absent on success |
+| `outputSchemaDigest` | string | SHA-256 of the canonical `jsonSchema`; only with `jsonSchema` |
+| `extractionMode`  | enum    | `structured_output` when `jsonSchema` was used; otherwise absent |
 | `tokens`          | object  | Token counts (input, output, cache, etc) |
 | `costUsd`         | number  | Estimated cost in USD                    |
 | `tags`            | object  | User-supplied key-value tags             |
